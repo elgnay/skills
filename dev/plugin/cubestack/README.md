@@ -17,7 +17,7 @@ A Claude Code skill for installing a single- or multi-node **CubeStack** cluster
 | **Topology** | Single-node (`cubestack<N>`) or multi-node (`VirtualMachinePool` `cubestack<N>` with `replicas` = node count → VMs `cubestack<N>-0/-1/…`) |
 | **Execution** | Subagent-per-phase; the orchestrator only collects prerequisites, spawns subagents, relays results, and reports progress |
 | **Cleanup** | The bootstrap pod is **ephemeral** — auto-deleted once Step 7 verifies the cluster is healthy |
-| **Storage** | Optional **external Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS / RGW. Opt-in, off by default |
+| **Storage** | Optional **external Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Opt-in, off by default |
 
 ---
 
@@ -67,16 +67,22 @@ mon/osd/mgr itself:
 | Setting | Value | Meaning |
 |---------|-------|---------|
 | `CEPH_ENABLED` | `false` | No Ceph storage base is deployed in this cluster |
-| `CEPH_CSI_ENABLED` | `true` | Enable the Ceph CSI drivers (RBD / CephFS / RGW) |
+| `CEPH_CSI_ENABLED` | `true` | The module's **gate** — enable the CSI drivers (RBD / CephFS) |
 | `CEPH_MODE` | `external` | Consume an external Provider, not an in-cluster Ceph |
 
-You supply the Provider's coordinates — mon endpoints, RBD pool + CephX user, CephFS
-filesystem + metadata/data pools + user, and the RGW endpoint — plus its keyrings.
-Step 7 then verifies `STATE=Connected` / `HEALTH=HEALTH_OK`, the `ceph-rbd` and `cephfs`
-StorageClasses, and the RGW admin secret.
+Only **two** values are required: the Provider's mon endpoints and a CephX keyring. The
+RBD pool/user and the CephFS filesystem/data pool are optional — **setting `CEPHFS_FS` is
+what turns CephFS on**, and it then also requires `CEPHFS_DATA_POOL`.
 
-> **Keyrings are real secrets.** They travel in the values file and are never committed —
-> not to this repo, and not into the skill. Only placeholders appear in the docs.
+Give it a user with *provisioning* caps: the installer wires one key to **both** the CSI
+node and provisioner secrets, so a read-only user (Rook's `client.healthchecker`)
+configures cleanly and then fails every PVC. Step 7 verifies the `CephConnection` +
+`ClientProfile`, the `ceph-rbd` / `cephfs` StorageClasses, and the CSI secrets' `userID`.
+
+> **RGW / object storage is not part of this.** The installer creates a CephObjectStore
+> only in *internal* mode; an external Provider's RGW is consumed directly at its own
+> endpoint. **Keyrings are real secrets** — they travel in the values file and are never
+> committed, not to this repo and not into the skill. Only placeholders appear in the docs.
 
 The verified Provider coordinates live in the skill's Cluster facts table. They are
 Provider-specific: reconfirm them with the external cluster's owner before a run.
@@ -142,7 +148,7 @@ cp dev/plugin/cubestack/cubestack-install.md ~/.claude/skills/cubestack-install/
 | SSH password | `ubuntu` |
 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
-| External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the external Provider's mon / pool / fs / RGW coordinates and keyrings |
+| External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the external Provider's mon + keyring (RBD pool/user and CephFS fs/data pool optional) |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
 

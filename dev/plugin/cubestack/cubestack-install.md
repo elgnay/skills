@@ -139,7 +139,7 @@ the run (Steps 1–7).
 | 7 | Service expose mode | `nodeport` (skips MetalLB; no pool needed). Use `metallb` only for a fixed VIP — then ask for the pool IP range |
 | 8 | Node roles (multi-node) | `cubestack<N>-0` = master; `cubestack<N>-1…` = workers (pool ordinal order) |
 | 9 | VM names | Single-node: **one VM `cubestack<N>`**. Multi-node: **a `VirtualMachinePool` named `cubestack<N>`** with `replicas` = node count (it creates VMs `cubestack<N>-0`, `cubestack<N>-1`, …). N = first free index — no existing VM **or pool** named `cubestack<N>` |
-| 10 | External Ceph CSI | **Disabled (opt-in).** When the user asks for Ceph-backed storage, set `CEPH_CSI_ENABLED=true` + `CEPH_ENABLED=false` + `CEPH_MODE=external` and collect the external Provider's coordinates + credentials (Step 4). This imports an **existing external Ceph** via Rook external mode — it never deploys a Ceph cluster here |
+| 10 | External Ceph CSI | **Disabled (opt-in).** When the user asks for Ceph-backed storage, set `CEPH_CSI_ENABLED=true` + `CEPH_ENABLED=false` + `CEPH_MODE=external` and collect the external Provider's mon + keyring (RBD pool/user optional; CephFS fs + data pool optional) (Step 4). This imports an **existing external Ceph** via Rook external mode — it never deploys a Ceph cluster here. Object storage is *not* part of it: the installer creates RGW only in internal mode |
 
 Companion defaults: SSH user `ubuntu`; golden image `ubuntu-22.04-server-amd64-img`;
 VM pool `replicas` = node count.
@@ -437,9 +437,10 @@ cat > /tmp/cubestack-apply-conf.sh <<'SCRIPT'
 #   NODES_MASTER='master,<hostname>,<ip>,ubuntu,-'           (required)
 #   NODES_WORKERS='worker,<hostname>,<ip>,ubuntu,-'          (one per worker, joined by | )
 #   METALLB_POOL='<start>-<end>'                             (ONLY if SERVICE_EXPOSE_MODE=metallb)
-#   CEPH_MODE=external plus CEPH_MONITORS, CEPH_POOL, CEPH_USER, CEPH_KEYRING,
-#   CEPHFS_FS, CEPHFS_META_POOL, CEPHFS_DATA_POOL, CEPHFS_USER, CEPHFS_KEYRING,
-#   CEPH_RGW_EXTERNAL_ENDPOINT                               (ONLY for external Ceph — all required)
+#   CEPH_MODE=external plus CEPH_MONITORS + CEPH_KEYRING   (ONLY for external Ceph — both required)
+#   CEPH_POOL, CEPH_USER                                   (optional; default rbd / admin)
+#   CEPHFS_FS + CEPHFS_DATA_POOL                           (optional, but BOTH-OR-NEITHER)
+#   CEPHFS_META_POOL, CEPHFS_USER, CEPHFS_KEYRING          (optional; user/key fall back to CEPH_USER/CEPH_KEYRING)
 set -euo pipefail
 set -a; source "$1"; set +a   # export sourced vars so python (os.environ) sees them
 cd /opt/cubestack-installer
@@ -448,17 +449,22 @@ import os, re, sys
 p = sys.argv[1]
 s = open(p).read()
 
-def subst(key, value, block=False):
+def subst(key, value, block=False, append=False):
     global s
     if block:
         pat = re.compile(rf"^{key}=\(.*?^\)", flags=re.M | re.S)
         if not pat.search(s):
             raise SystemExit(f"block {key} not found - installer format changed; grep the example for {key} and adapt")
         s = pat.sub(lambda m: value.rstrip(), s, count=1)
-    else:
-        if not re.search(rf"^{key}=", s, flags=re.M):
-            raise SystemExit(f"field {key} not found - installer format changed; grep the example for {key} and adapt")
+    elif re.search(rf"^{key}=", s, flags=re.M):
         s = re.sub(rf"^{key}=.+$", lambda m: f'{key}="{value}"', s, flags=re.M)
+    elif append:
+        # The key exists ONLY inside the example's *commented* block (all CEPHFS_* fields are
+        # like this - the example's live section has no CEPHFS_FS= line). Append at EOF so the
+        # assignment still wins: cluster.conf is bash-sourced top-down, last assignment wins.
+        s = s.rstrip("\n") + f'\n{key}="{value}"\n'
+    else:
+        raise SystemExit(f"field {key} not found - installer format changed; grep the example for {key} and adapt")
 
 vals = {
     "SSH_DEFAULT_PASSWORD": "SSH_PW",   # config key -> values-file variable
@@ -483,28 +489,48 @@ if os.environ.get("METALLB_POOL"):
     subst("METALLB_POOL", os.environ["METALLB_POOL"])
 
 # External Ceph CSI -- opt-in: runs ONLY when the values file sets CEPH_MODE.
+#
+# Installer contract (03_addon/03_ceph_csi.sh + lib-common.sh ceph_installable_check):
+#   * CEPH_CSI_ENABLED=true is the gate - the module exits 0 immediately without it;
+#     CEPH_MODE=external is what lets it run with CEPH_ENABLED=false.
+#   * Required: CEPH_MONITORS + CEPH_KEYRING (the precheck fails without BOTH).
+#   * CEPH_POOL / CEPH_USER default to rbd / admin.
+#   * CEPHFS_FS is ITSELF the external-CephFS switch (EXT_CEPHFS_ENABLED="${CEPHFS_FS:-}").
+#     Setting it makes CEPHFS_DATA_POOL required; the module hard-fails mid-deploy if it is
+#     empty, so reject that here instead of 12 minutes into the deploy.
+#   * CephFS reuses CEPHFS_USER/CEPHFS_KEYRING, falling back to CEPH_USER/CEPH_KEYRING.
+#   * RGW is internal-mode ONLY (`_CEPH_EXTERNAL = "0"` guard). An external Provider's RGW is
+#     used directly and is NOT configured here - CEPH_RGW_EXTERNAL_ENDPOINT is written by the
+#     provider-side export tool (tools/k8s/ceph-expose-external.sh), never consumed here.
 if os.environ.get("CEPH_MODE"):
-    ceph = {
-        "CEPH_ENABLED":               "false",  # literal: never deploy a Ceph base here
-        "CEPH_CSI_ENABLED":           "true",   # literal: do enable the CSI drivers
-        "CEPH_MODE":                  "CEPH_MODE",
-        "CEPH_MONITORS":              "CEPH_MONITORS",
-        "CEPH_POOL":                  "CEPH_POOL",
-        "CEPH_USER":                  "CEPH_USER",
-        "CEPH_KEYRING":               "CEPH_KEYRING",      # secret
-        "CEPHFS_FS":                  "CEPHFS_FS",
-        "CEPHFS_META_POOL":           "CEPHFS_META_POOL",
-        "CEPHFS_DATA_POOL":           "CEPHFS_DATA_POOL",
-        "CEPHFS_USER":                "CEPHFS_USER",
-        "CEPHFS_KEYRING":             "CEPHFS_KEYRING",    # secret
-        "CEPH_RGW_EXTERNAL_ENDPOINT": "CEPH_RGW_EXTERNAL_ENDPOINT",
+    live = {                                   # real assignments in cluster.conf.example
+        "CEPH_ENABLED":     "false",  # literal: never deploy a Ceph base here
+        "CEPH_CSI_ENABLED": "true",   # literal: this is the module's gate
+        "CEPH_MODE":        "CEPH_MODE",
+        "CEPH_MONITORS":    "CEPH_MONITORS",   # required
+        "CEPH_POOL":        "CEPH_POOL",
+        "CEPH_USER":        "CEPH_USER",
+        "CEPH_KEYRING":     "CEPH_KEYRING",    # secret; required
     }
-    missing = [k for k, src in ceph.items()
+    cephfs = {                                 # only in the example's COMMENTED block -> append
+        "CEPHFS_FS":        "CEPHFS_FS",
+        "CEPHFS_META_POOL": "CEPHFS_META_POOL",   # informational on the consumer side
+        "CEPHFS_DATA_POOL": "CEPHFS_DATA_POOL",
+        "CEPHFS_USER":      "CEPHFS_USER",
+        "CEPHFS_KEYRING":   "CEPHFS_KEYRING",     # secret
+    }
+    missing = [k for k, src in live.items()
                if src not in ("true", "false") and not os.environ.get(src)]
     if missing:
         raise SystemExit("CEPH_MODE is set but the values file is missing: " + ", ".join(missing))
-    for k, src in ceph.items():
+    if os.environ.get("CEPHFS_FS") and not os.environ.get("CEPHFS_DATA_POOL"):
+        raise SystemExit("CEPHFS_FS is set but CEPHFS_DATA_POOL is empty - external CephFS needs both")
+    for k, src in live.items():
         subst(k, src if src in ("true", "false") else os.environ[src])
+    if os.environ.get("CEPHFS_FS"):            # CephFS block is all-or-nothing on CEPHFS_FS
+        for k, src in cephfs.items():
+            if os.environ.get(src):
+                subst(k, os.environ[src], append=True)
 
 open(p, "w").write(s)
 PYEOF
@@ -571,7 +597,7 @@ Provider. Three settings drive it:
 | Setting | Value | Meaning |
 |---------|-------|---------|
 | `CEPH_ENABLED` | `false` | Do **not** deploy a Ceph storage base inside this cluster |
-| `CEPH_CSI_ENABLED` | `true` | Do enable the Ceph CSI drivers (RBD / RGW / CephFS) |
+| `CEPH_CSI_ENABLED` | `true` | The module's **gate** — it exits immediately unless this is `true` |
 | `CEPH_MODE` | `external` | Consume an external Provider rather than an in-cluster Ceph |
 
 Everything else comes from the external Provider. Put it in the **values file** — never
@@ -579,17 +605,35 @@ inline, because the keyrings are secrets:
 
 ```bash
 CEPH_MODE='external'
-CEPH_MONITORS='10.66.3.46:6789'                 # Provider mon(s), comma-separated host:port
-CEPH_POOL='rbd-pool'                            # RBD pool backing the RBD StorageClass
-CEPH_USER='client.cubestack-ext-rbd'            # CephX user for RBD
-CEPH_KEYRING='<provider keyring>'
-CEPHFS_FS='cephfs'                              # CephFS filesystem name
-CEPHFS_META_POOL='cephfs-metadata'
-CEPHFS_DATA_POOL='cephfs-data0'
-CEPHFS_USER='client.cubestack-ext-cephfs'
-CEPHFS_KEYRING='<provider keyring>'
-CEPH_RGW_EXTERNAL_ENDPOINT='10.66.3.47:80'      # Provider RGW — S3 over HTTP
+CEPH_MONITORS='10.66.3.46:6789'                 # REQUIRED — Provider mon(s), comma-separated host:port
+CEPH_KEYRING='<provider keyring>'               # REQUIRED — secret
+CEPH_POOL='rbd-pool'                            # optional; RBD pool for the StorageClasses (default rbd)
+CEPH_USER='client.csi-rbd-provisioner'          # optional; CephX user for RBD (default admin)
+CEPHFS_FS='cephfs'                              # enables CephFS — setting it IS the switch
+CEPHFS_DATA_POOL='cephfs-data0'                 # REQUIRED once CEPHFS_FS is set
+CEPHFS_META_POOL='cephfs-metadata'              # optional (informational on the consumer side)
+CEPHFS_USER='client.csi-cephfs-provisioner'     # optional; falls back to CEPH_USER
+CEPHFS_KEYRING='<provider keyring>'             # optional; falls back to CEPH_KEYRING — secret
 ```
+
+Only **two** fields are required (`CEPH_MONITORS`, `CEPH_KEYRING`); CephFS is
+both-or-neither on `CEPHFS_FS` + `CEPHFS_DATA_POOL`. Both of those are enforced by the
+rewriter *before* the deploy starts — the installer itself would otherwise hard-fail
+mid-deploy (12+ minutes in) on a missing `CEPHFS_DATA_POOL`.
+
+> ⚠️ **Use a CephX user with *provisioning* caps, not the health-check user.** The
+> installer points **both** `rook-csi-rbd-provisioner` and `rook-csi-rbd-node` at this one
+> `CEPH_USER`/`CEPH_KEYRING` (likewise `rook-csi-cephfs-node`/`-provisioner` at
+> `CEPHFS_USER`/`CEPHFS_KEYRING`). So a read-only user such as Rook's external-import
+> `client.healthchecker` (mon `allow r` / osd `allow r`) accepts the config, then fails
+> every PVC at provisioning time. Use the Provider's CSI users — the keys its import
+> exported as `CSI_RBD_PROVISIONER_SECRET` / `CSI_CEPHFS_PROVISIONER_SECRET`.
+
+> **RGW / object storage is not configured here.** The installer only creates a
+> CephObjectStore in **internal** mode (`_CEPH_EXTERNAL = "0"` guard in `03_ceph_csi.sh`).
+> An external Provider's RGW is consumed directly via its endpoint using path-style
+> addressing; `CEPH_RGW_EXTERNAL_ENDPOINT` belongs to the provider-side export tool
+> (`tools/k8s/ceph-expose-external.sh`) and is not read on a consumer.
 
 > ⚠️ **Never commit a real keyring, and never write one inline in a tool command.**
 > `CEPH_KEYRING` / `CEPHFS_KEYRING` are CephX secrets: the tool layer redacts
@@ -599,12 +643,12 @@ CEPH_RGW_EXTERNAL_ENDPOINT='10.66.3.47:80'      # Provider RGW — S3 over HTTP
 > from the pod after the run and must never be committed.
 
 The values above are the **verified Provider** from the Cluster facts table. They are
-Provider-specific — reconfirm mon / pool / fs / RGW with the external cluster's owner
-before a run. The team's external-Ceph import guide (`rook-external-import-guide.md`)
-covers the Provider-side export, the external-mode manifests, the PVC smoke test, and
-the RGW / object-store (S3) path.
+Provider-specific — reconfirm mon / pool / fs with the external cluster's owner before a
+run. The team's external-Ceph import guide (`rook-external-import-guide.md`) covers the
+Provider-side export, the external-mode manifests, the PVC smoke test, and the
+RGW / object-store (S3) path.
 
-If `CEPH_MODE` is set but any coordinate is missing, the rewriter **aborts and names the
+If `CEPH_MODE` is set but a required field is missing, the rewriter **aborts and names the
 missing keys** rather than writing a half-configured import.
 
 **Return to orchestrator:** the config diff + byte-verification result, recorded
@@ -772,8 +816,8 @@ after the corrective re-run does the orchestrator stop and report to the user.
 > **Subagent task:** "Verify the deployed CubeStack cluster. Use the admin.conf
 > kubeconfig inside the installer pod. Return: node list with IPs, namespace list,
 > key services (registry, envoy). **If Step 4 configured external Ceph, also return
-> the `rook-ceph` CephCluster state/health, the Ceph StorageClasses, and whether the
-> `rgw-admin-ops-user` secret exists.**"
+> the `rook-ceph` CephConnection + ClientProfile, the Ceph StorageClasses, and the CSI
+> secrets' `userID` values.**"
 
 ```bash
 # Nodes (expect one line per VM, all in the same subnet)
@@ -806,11 +850,24 @@ kubectl exec -n default cubestack-install -- kubectl \
   --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
   -n rook-ceph get sc
 
-# RGW admin secret — exists when the import carried RGW credentials (required for S3 / OBC)
+# CephConnection + ClientProfile — BOTH must exist. The ClientProfile is what makes
+# ceph-csi-operator generate the clusterID→monitors config.json; without it the provisioner
+# fails with `failed-to-fetch-monitor-list` and every PVC hangs Pending forever
+# (the 2026-09-09 incident).
 kubectl exec -n default cubestack-install -- kubectl \
   --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
-  -n rook-ceph get secret rgw-admin-ops-user
+  -n rook-ceph get cephconnection,clientprofile
+
+# CSI secrets carry the Provider user (userID) — the RBD pair and the CephFS pair
+kubectl exec -n default cubestack-install -- kubectl \
+  --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
+  -n rook-ceph get secret rook-csi-rbd-node rook-csi-rbd-provisioner \
+                             rook-csi-cephfs-node rook-csi-cephfs-provisioner
 ```
+
+> **No `rgw-admin-ops-user` here.** The installer creates a CephObjectStore only in
+> *internal* mode; an external import carries no RGW credentials to this cluster. Object
+> storage comes from the Provider's own RGW endpoint instead.
 
 `STATE=Connected` + `HEALTH=HEALTH_OK` + both StorageClasses present is the pass bar — see
 the Troubleshooting table for `Connecting`. A **Bound test PVC** proves the data plane and
@@ -880,12 +937,14 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
 | Step 1 readiness poll never turns green though the VMs are Ready | You matched VMI by `-l owner=<user>` — pool VMIs don't inherit the owner label, so the list looks empty. Match VMI by exact name (VMI name == VM name). Never poll owner-selected VMIs (Step 1) |
 | `cubestack-apply-conf.sh: unbound variable` | You fed the script via a nested heredoc in `kubectl exec` stdin — it doesn't work. Use `kubectl cp` of the script + values file (Step 4) |
 | `cluster.conf` rewriter: field not found | Field names differ in this installer version — read the example (Step 4) and adapt |
-| Rewriter aborts: `CEPH_MODE is set but the values file is missing: …` | External Ceph needs **all** coordinates — add the named keys to the values file (Step 4). Omitting `CEPH_MODE` skips the import entirely |
+| Rewriter aborts: `CEPH_MODE is set but the values file is missing: …` | External Ceph needs at least `CEPH_MONITORS` + `CEPH_KEYRING` — add the named keys to the values file (Step 4). Omitting `CEPH_MODE` skips the import entirely |
+| Rewriter aborts: `CEPHFS_FS is set but CEPHFS_DATA_POOL is empty` | External CephFS is both-or-neither — add `CEPHFS_DATA_POOL`, or drop `CEPHFS_FS` entirely for an RBD-only import. Caught here deliberately: the installer itself hard-fails 12+ min into the deploy on this |
 | External Ceph: `CephCluster` stuck at `STATE=Connecting` | Provider mon unreachable from the new cluster — check `CEPH_MONITORS` and that the path to the Provider permits 6789 (mon) and 6800–7300 (OSD) |
 | External Ceph import rejected / permission errors | Provider and consumer Rook versions must match (v1.20.2); re-verify the CephX user + keyring with the Provider's owner |
+| External-Ceph secrets/SCs apply cleanly but **every PVC stays Pending** | The keyring belongs to a read-only user (e.g. Rook's `client.healthchecker`, mon `allow r` / osd `allow r`). The installer wires one user to both the *provisioner* and *node* CSI secrets, so it needs rw caps — use the Provider's `CSI_RBD_PROVISIONER_SECRET` / `CSI_CEPHFS_PROVISIONER_SECRET` users and re-apply the secrets (Step 4 + Step 7) |
 | `ceph-rbd` / `cephfs` StorageClass absent after a `CEPH_MODE=external` run | The import didn't run, or `CEPH_CSI_ENABLED` wasn't `true` — grep `cluster.conf` for the `CEPH_*` fields and re-run the config step (Step 4) |
 | External-Ceph PVC fails to mount on a kernel ≤ 5.4 node | Drop `fast-diff, object-map, deep-flatten, exclusive-lock` from the import's `imageFeatures` |
-| RGW / S3 unreachable, or `403` on signed requests | Consume via the `rgw-admin-ops-user` secret's keys + `CEPH_RGW_EXTERNAL_ENDPOINT` using **path-style** addressing; the Provider RGW runs host-network, so its IP drifts if that pod reschedules |
+| RGW / S3 unreachable, or `403` on signed requests | Expected in **external** mode: no CephObjectStore is created here, so consume the Provider's RGW endpoint (`10.66.3.47:80`) directly with the `rgw-admin-ops-user` keys and **path-style** addressing. The Provider RGW runs host-network, so its IP drifts if that pod reschedules. (`CEPH_RGW_EXTERNAL_ENDPOINT` is provider-side export only, not read on a consumer) |
 | Kubespray SSH fails | VM not reachable on port 22, or wrong `SSH_DEFAULT_PASSWORD` in config |
 | Kubespray fails mid-install | Check `/tmp/cubestack-cluster-install.log`; may need to re-run or recreate VM |
 | Deploy dies at `local_path`: `未找到 StorageClass local-path` right after a config change | Stale inventory state — `k8s_deploy` was skipped ("已完成,跳过") because the pod was used for a different node set. Verify the target VM has no cluster, then re-run with `--fresh` (Step 6) |
@@ -1008,7 +1067,11 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
     Provider only when the user asked for Ceph-backed storage (Step 0 item 10) — the
     default is no import. This skill never deploys a Ceph base: external mode consumes a
     Provider that lives outside the cluster (`CEPH_ENABLED=false`, `CEPH_CSI_ENABLED=true`,
-    `CEPH_MODE=external`). Real `CEPH_KEYRING` / `CEPHFS_KEYRING` values never go into the
-    repo, the skill, or a committed values file — they follow rule 13's Write-tool →
-    `kubectl cp` → `rm` path like every other credential.
+    `CEPH_MODE=external`). Only `CEPH_MONITORS` + `CEPH_KEYRING` are required; CephFS is
+    both-or-neither on `CEPHFS_FS` + `CEPHFS_DATA_POOL`, and the one user you supply must
+    hold *provisioning* caps because the installer wires it to both the node and
+    provisioner CSI secrets — never hand it Rook's read-only `client.healthchecker`, which
+    configures cleanly and then fails every PVC. Real `CEPH_KEYRING` / `CEPHFS_KEYRING`
+    values never go into the repo, the skill, or a committed values file — they follow
+    rule 13's Write-tool → `kubectl cp` → `rm` path like every other credential.
 
