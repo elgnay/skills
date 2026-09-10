@@ -326,12 +326,22 @@ Notes:
 - **Stateful vs stateless**: putting `dataVolumeTemplates` in the template gives each replica its own persistent
   disk = **stateful**; for **stateless** (no persistence / read-only shared disk), drop `dataVolumeTemplates` and
   point `volumes` at a read-only base disk.
+- ⚠️ **Root-disk base name must be unique per pool.** When a pool is stateful, set
+  `dataVolumeTemplates[].metadata.name` to a **pool-unique base** — prefix it with the pool name, e.g.
+  `<pool>-rootdisk` — and point `volumes[].dataVolume.name` at that same base. The controller appends an ordinal
+  suffix per replica, so the DVs/PVCs come out as `<pool>-rootdisk-0/1/2`. If two pools reuse a generic base
+  (e.g. a bare `rootdisk`), their replicas claim the **same** DV/PVC names (`rootdisk-0/1/2`): the later pool is
+  **not refused** — it silently binds to the earlier pool's already-Bound disks, so both pools' VMs dual-attach to
+  one live OS disk (data-corruption risk). Constraint #2's global-uniqueness rule applies to the pool's base name
+  too, across the whole namespace.
 - ⚠️ **Shrinking deletes at random by default**: when you lower `replicas`, the pool picks replicas to delete
   **randomly** by default (v1.8.4 default `Random` — it may delete a middle one and keep the last). To fix the
   order, configure `scaleInStrategy.proactive.selectionPolicy.sortPolicy`
   (`DescendingOrder` / `AscendingOrder` / `Newest` / `Oldest` / `Random`).
-- The controller **auto-appends ordinal suffixes** to each replica's DV name (`rootdisk` → `rootdisk-0/1/2`) and
-  rewrites `volumes[].dataVolume.name` accordingly — **no** manual uniqueness needed (unlike the §2 manual clone).
+- The controller **auto-appends ordinal suffixes** to each replica's DV name (`<pool>-rootdisk` →
+  `<pool>-rootdisk-0/1/2`) and rewrites `volumes[].dataVolume.name` accordingly — so per-replica names are never
+  needed, **but the base name must still be namespace-unique** (prefix it with the pool name; a bare `rootdisk`
+  collides across pools).
 - **Do not hardcode** `interfaces[].macAddress` or `firmware.uuid` — replica MACs are assigned by kubemacpool;
   hardcoding causes L2 MAC conflicts between replicas.
 - On a subnet, each replica still gets its own Whereabouts IP via `nodeSelector` + NAD.
