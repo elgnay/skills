@@ -17,6 +17,7 @@ A Claude Code skill for installing a single- or multi-node **CubeStack** cluster
 | **Topology** | Single-node (`cubestack<N>`) or multi-node (`VirtualMachinePool` `cubestack<N>` with `replicas` = node count → VMs `cubestack<N>-0/-1/…`) |
 | **Execution** | Subagent-per-phase; the orchestrator only collects prerequisites, spawns subagents, relays results, and reports progress |
 | **Cleanup** | The bootstrap pod is **ephemeral** — auto-deleted once Step 7 verifies the cluster is healthy |
+| **Storage** | Optional **external Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS / RGW. Opt-in, off by default |
 
 ---
 
@@ -53,6 +54,32 @@ Two verified 3-node installs (8 vCPU / 24 GiB per VM), started from a clean stat
 | **Total** | **~24 m 50 s** | **~25 m 42 s** |
 
 **Deploy (S6) dominates at roughly half the wall time.** Run 1's S5 includes a failed fetch plus its recovery; once the Step 5 prerequisite is met the fetch lands first try (run 2).
+
+---
+
+## Optional: external Ceph storage
+
+By default the cluster gets **no** Ceph storage. Ask for it and the installer makes the
+new cluster a **Rook external-mode consumer** — it runs the Rook operator + CSI drivers
+and consumes an **existing Ceph that lives outside the cluster**, without deploying any
+mon/osd/mgr itself:
+
+| Setting | Value | Meaning |
+|---------|-------|---------|
+| `CEPH_ENABLED` | `false` | No Ceph storage base is deployed in this cluster |
+| `CEPH_CSI_ENABLED` | `true` | Enable the Ceph CSI drivers (RBD / CephFS / RGW) |
+| `CEPH_MODE` | `external` | Consume an external Provider, not an in-cluster Ceph |
+
+You supply the Provider's coordinates — mon endpoints, RBD pool + CephX user, CephFS
+filesystem + metadata/data pools + user, and the RGW endpoint — plus its keyrings.
+Step 7 then verifies `STATE=Connected` / `HEALTH=HEALTH_OK`, the `ceph-rbd` and `cephfs`
+StorageClasses, and the RGW admin secret.
+
+> **Keyrings are real secrets.** They travel in the values file and are never committed —
+> not to this repo, and not into the skill. Only placeholders appear in the docs.
+
+The verified Provider coordinates live in the skill's Cluster facts table. They are
+Provider-specific: reconfirm them with the external cluster's owner before a run.
 
 ---
 
@@ -115,6 +142,7 @@ cp dev/plugin/cubestack/cubestack-install.md ~/.claude/skills/cubestack-install/
 | SSH password | `ubuntu` |
 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
+| External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the external Provider's mon / pool / fs / RGW coordinates and keyrings |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
 

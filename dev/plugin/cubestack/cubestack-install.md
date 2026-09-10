@@ -1,6 +1,6 @@
 ---
 name: "cubestack-install"
-description: "Install CubeStack on a KubeVirt VM: VM, pod, MinIO fetch, configure, deploy kubespray. Asks the user once (Step 0 prereqs + one confirm), then runs Steps 1-7 unattended with no further approvals and auto-deletes the bootstrap installer pod once the deploy is verified. Subagents per phase keep context lean."
+description: "Install CubeStack on a KubeVirt VM: VM, pod, MinIO fetch, configure, deploy kubespray, and optionally import an external Ceph cluster (Rook external mode: RBD/CephFS/RGW) via CEPH_CSI_ENABLED + CEPH_MODE=external. Asks the user once (Step 0 prereqs + one confirm), then runs Steps 1-7 unattended with no further approvals and auto-deletes the bootstrap installer pod once the deploy is verified. Subagents per phase keep context lean."
 ---
 
 # CubeStack Installation
@@ -101,6 +101,7 @@ silently burned 8–13 min on healthy state. Hard rule 24.
 | MinIO (offline pkgs) | endpoint http://192.168.16.6:9000, bucket cubestack-installer, dir offline-files; alias: mc alias set minio <endpoint> admin Suanova@123 (verified working 2026-09-07) |
 | Harbor (installer img) | `harbor.isuanova.com` |
 | Installer image | `harbor.isuanova.com/cubestack/cubestack-installer-cli:latest` |
+| External Ceph (optional) | Rook-Ceph **external mode** — CSI only, no mon/osd/mgr in this cluster. Verified Provider: mon `10.66.3.46:6789`, RBD pool `rbd-pool`, CephFS `cephfs` (meta `cephfs-metadata` / data `cephfs-data0`), RGW `10.66.3.47:80` (S3 over HTTP), namespace `rook-ceph`, Rook v1.20.2. **Provider-specific — reconfirm with the external cluster's owner before use.** Enabled per-install in Step 4 |
 
 > **Subnets are dynamic.** The cluster has multiple subnets (e.g. 10.66.2.0/24,
 > 10.66.3.0/24) with one node per subnet or shared. The target VM's subnet determines
@@ -138,13 +139,14 @@ the run (Steps 1–7).
 | 7 | Service expose mode | `nodeport` (skips MetalLB; no pool needed). Use `metallb` only for a fixed VIP — then ask for the pool IP range |
 | 8 | Node roles (multi-node) | `cubestack<N>-0` = master; `cubestack<N>-1…` = workers (pool ordinal order) |
 | 9 | VM names | Single-node: **one VM `cubestack<N>`**. Multi-node: **a `VirtualMachinePool` named `cubestack<N>`** with `replicas` = node count (it creates VMs `cubestack<N>-0`, `cubestack<N>-1`, …). N = first free index — no existing VM **or pool** named `cubestack<N>` |
+| 10 | External Ceph CSI | **Disabled (opt-in).** When the user asks for Ceph-backed storage, set `CEPH_CSI_ENABLED=true` + `CEPH_ENABLED=false` + `CEPH_MODE=external` and collect the external Provider's coordinates + credentials (Step 4). This imports an **existing external Ceph** via Rook external mode — it never deploys a Ceph cluster here |
 
 Companion defaults: SSH user `ubuntu`; golden image `ubuntu-22.04-server-amd64-img`;
 VM pool `replicas` = node count.
 
 Resolution flow:
 
-1. **Collect** — ask the user **once, in a single message**, for any of items 1–9
+1. **Collect** — ask the user **once, in a single message**, for any of items 1–10
    they care about. Silence on an item = use its default. This is the only
    question round of the entire run.
 2. **Resolve** — user-specified value wins; otherwise use the default. For the
@@ -156,8 +158,8 @@ Resolution flow:
    kubectl get vm -n default -o name | grep 'cubestack[0-9]'             # used VM names
    kubectl get virtualmachinepool -n default -o name | grep 'cubestack[0-9]'   # used pool names
    ```
-3. **Confirm** — print the resolved values (mask the MinIO secret and SSH
-   password) and get one "ok". This confirmation is the **green light for the
+3. **Confirm** — print the resolved values (mask the MinIO secret, the SSH
+   password, and the Ceph keyrings) and get one "ok". This confirmation is the **green light for the
    entire unattended run**. If the user changes anything, re-resolve only what
    changed and re-confirm. After "ok", spawn Steps 1 and 2 **together** (they are
    independent — see Orchestration) and drive all steps to completion without
@@ -435,6 +437,9 @@ cat > /tmp/cubestack-apply-conf.sh <<'SCRIPT'
 #   NODES_MASTER='master,<hostname>,<ip>,ubuntu,-'           (required)
 #   NODES_WORKERS='worker,<hostname>,<ip>,ubuntu,-'          (one per worker, joined by | )
 #   METALLB_POOL='<start>-<end>'                             (ONLY if SERVICE_EXPOSE_MODE=metallb)
+#   CEPH_MODE=external plus CEPH_MONITORS, CEPH_POOL, CEPH_USER, CEPH_KEYRING,
+#   CEPHFS_FS, CEPHFS_META_POOL, CEPHFS_DATA_POOL, CEPHFS_USER, CEPHFS_KEYRING,
+#   CEPH_RGW_EXTERNAL_ENDPOINT                               (ONLY for external Ceph — all required)
 set -euo pipefail
 set -a; source "$1"; set +a   # export sourced vars so python (os.environ) sees them
 cd /opt/cubestack-installer
@@ -477,6 +482,30 @@ subst("NODES", "NODES=(\n" + "\n".join(nodes) + "\n)", block=True)
 if os.environ.get("METALLB_POOL"):
     subst("METALLB_POOL", os.environ["METALLB_POOL"])
 
+# External Ceph CSI -- opt-in: runs ONLY when the values file sets CEPH_MODE.
+if os.environ.get("CEPH_MODE"):
+    ceph = {
+        "CEPH_ENABLED":               "false",  # literal: never deploy a Ceph base here
+        "CEPH_CSI_ENABLED":           "true",   # literal: do enable the CSI drivers
+        "CEPH_MODE":                  "CEPH_MODE",
+        "CEPH_MONITORS":              "CEPH_MONITORS",
+        "CEPH_POOL":                  "CEPH_POOL",
+        "CEPH_USER":                  "CEPH_USER",
+        "CEPH_KEYRING":               "CEPH_KEYRING",      # secret
+        "CEPHFS_FS":                  "CEPHFS_FS",
+        "CEPHFS_META_POOL":           "CEPHFS_META_POOL",
+        "CEPHFS_DATA_POOL":           "CEPHFS_DATA_POOL",
+        "CEPHFS_USER":                "CEPHFS_USER",
+        "CEPHFS_KEYRING":             "CEPHFS_KEYRING",    # secret
+        "CEPH_RGW_EXTERNAL_ENDPOINT": "CEPH_RGW_EXTERNAL_ENDPOINT",
+    }
+    missing = [k for k, src in ceph.items()
+               if src not in ("true", "false") and not os.environ.get(src)]
+    if missing:
+        raise SystemExit("CEPH_MODE is set but the values file is missing: " + ", ".join(missing))
+    for k, src in ceph.items():
+        subst(k, src if src in ("true", "false") else os.environ[src])
+
 open(p, "w").write(s)
 PYEOF
 SCRIPT
@@ -495,6 +524,8 @@ NODES_MASTER='master,cubestack-k8s-master01,<master-ip>,ubuntu,-'
 NODES_WORKERS='worker,cubestack-k8s-worker01,<worker1-ip>,ubuntu,-|worker,cubestack-k8s-worker02,<worker2-ip>,ubuntu,-'
 # Single-node: leave NODES_WORKERS empty (or omit it); NODES_MASTER alone = the single master.
 # MetalLB: add METALLB_POOL='<start>-<end>' ONLY when SERVICE_EXPOSE_MODE=metallb; in nodeport mode leave it unset.
+# External Ceph: add the CEPH_* / CEPHFS_* block from the section above ONLY when importing an
+# external Ceph cluster (Step 0 item 10). Omitting CEPH_MODE skips the import entirely.
 VALS
 
 kubectl cp /tmp/cubestack-apply-conf.sh default/cubestack-install:/tmp/cubestack-apply-conf.sh
@@ -514,7 +545,7 @@ holds `***`):
 
 ```bash
 kubectl exec -n default cubestack-install -- bash -c \
-  'grep -E "^(SSH_DEFAULT_PASSWORD|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY)=" /opt/cubestack-installer/deployments/config/cluster.conf | grep -F "***" || echo "OK: no redaction artifacts"'
+  'grep -E "^(SSH_DEFAULT_PASSWORD|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY|CEPH_KEYRING|CEPHFS_KEYRING)=" /opt/cubestack-installer/deployments/config/cluster.conf | grep -F "***" || echo "OK: no redaction artifacts"'
 ```
 
 Expected: `OK: no redaction artifacts`. If any line prints, the value was
@@ -528,6 +559,53 @@ until the gate is green.
 > **Service expose mode:** The installer defaults to `SERVICE_EXPOSE_MODE=nodeport`,
 > which skips MetalLB entirely. Services are exposed via `<node-ip>:<NodePort>`.
 > Switch to `metallb` in `cluster.conf` only if a fixed VIP is required.
+
+### Optional: import an external Ceph cluster (Ceph CSI)
+
+**Off by default — enable only when the user asked for Ceph-backed storage** (Step 0
+item 10). This makes the new cluster a **Rook external-mode consumer**: it runs the Rook
+operator + CSI drivers and consumes an **existing Ceph that lives outside this cluster**.
+It does **not** deploy mon/osd/mgr here — the data plane stays with the external
+Provider. Three settings drive it:
+
+| Setting | Value | Meaning |
+|---------|-------|---------|
+| `CEPH_ENABLED` | `false` | Do **not** deploy a Ceph storage base inside this cluster |
+| `CEPH_CSI_ENABLED` | `true` | Do enable the Ceph CSI drivers (RBD / RGW / CephFS) |
+| `CEPH_MODE` | `external` | Consume an external Provider rather than an in-cluster Ceph |
+
+Everything else comes from the external Provider. Put it in the **values file** — never
+inline, because the keyrings are secrets:
+
+```bash
+CEPH_MODE='external'
+CEPH_MONITORS='10.66.3.46:6789'                 # Provider mon(s), comma-separated host:port
+CEPH_POOL='rbd-pool'                            # RBD pool backing the RBD StorageClass
+CEPH_USER='client.cubestack-ext-rbd'            # CephX user for RBD
+CEPH_KEYRING='<provider keyring>'
+CEPHFS_FS='cephfs'                              # CephFS filesystem name
+CEPHFS_META_POOL='cephfs-metadata'
+CEPHFS_DATA_POOL='cephfs-data0'
+CEPHFS_USER='client.cubestack-ext-cephfs'
+CEPHFS_KEYRING='<provider keyring>'
+CEPH_RGW_EXTERNAL_ENDPOINT='10.66.3.47:80'      # Provider RGW — S3 over HTTP
+```
+
+> ⚠️ **Never commit a real keyring, and never write one inline in a tool command.**
+> `CEPH_KEYRING` / `CEPHFS_KEYRING` are CephX secrets: the tool layer redacts
+> secret-looking strings to `***` exactly as it does for the MinIO secret, which
+> corrupts the config. Write them through the values file (Write tool → `kubectl cp`),
+> and keep real keys out of the repo and out of the skill — the values file is `rm`'d
+> from the pod after the run and must never be committed.
+
+The values above are the **verified Provider** from the Cluster facts table. They are
+Provider-specific — reconfirm mon / pool / fs / RGW with the external cluster's owner
+before a run. The team's external-Ceph import guide (`rook-external-import-guide.md`)
+covers the Provider-side export, the external-mode manifests, the PVC smoke test, and
+the RGW / object-store (S3) path.
+
+If `CEPH_MODE` is set but any coordinate is missing, the rewriter **aborts and names the
+missing keys** rather than writing a half-configured import.
 
 **Return to orchestrator:** the config diff + byte-verification result, recorded
 in the progress log for the user's later review. No user approval is requested —
@@ -693,7 +771,9 @@ after the corrective re-run does the orchestrator stop and report to the user.
 
 > **Subagent task:** "Verify the deployed CubeStack cluster. Use the admin.conf
 > kubeconfig inside the installer pod. Return: node list with IPs, namespace list,
-> key services (registry, envoy)."
+> key services (registry, envoy). **If Step 4 configured external Ceph, also return
+> the `rook-ceph` CephCluster state/health, the Ceph StorageClasses, and whether the
+> `rgw-admin-ops-user` secret exists.**"
 
 ```bash
 # Nodes (expect one line per VM, all in the same subnet)
@@ -712,7 +792,34 @@ kubectl exec -n default cubestack-install -- kubectl \
   get svc -A | grep -E "registry|envoy|NAME"
 ```
 
-**Return to orchestrator:** node list, namespace list, service list.
+**External Ceph only — skip unless Step 4 imported a Provider.** Verify the consumer side
+came up in namespace `rook-ceph` (same `admin.conf`):
+
+```bash
+# External-mode Rook — expect STATE=Connected and HEALTH=HEALTH_OK
+kubectl exec -n default cubestack-install -- kubectl \
+  --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
+  -n rook-ceph get cephcluster
+
+# StorageClasses provisioned from the external Ceph — expect ceph-rbd and cephfs
+kubectl exec -n default cubestack-install -- kubectl \
+  --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
+  -n rook-ceph get sc
+
+# RGW admin secret — exists when the import carried RGW credentials (required for S3 / OBC)
+kubectl exec -n default cubestack-install -- kubectl \
+  --kubeconfig=/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf \
+  -n rook-ceph get secret rgw-admin-ops-user
+```
+
+`STATE=Connected` + `HEALTH=HEALTH_OK` + both StorageClasses present is the pass bar — see
+the Troubleshooting table for `Connecting`. A **Bound test PVC** proves the data plane and
+is the stronger check; the external-Ceph guide (`rook-external-import-guide.md`) gives the
+RBD and CephFS PVC manifests for it. If such a PVC fails to mount on a kernel ≤ 5.4 node,
+the import's `imageFeatures` must drop `fast-diff, object-map, deep-flatten, exclusive-lock`.
+
+**Return to orchestrator:** node list, namespace list, service list, plus the Ceph results
+above when applicable.
 
 **After verification succeeds, the orchestrator deletes the bootstrap installer
 pod (automatic, inline — no approval).** The pod only hosted the deploy tooling;
@@ -773,6 +880,12 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
 | Step 1 readiness poll never turns green though the VMs are Ready | You matched VMI by `-l owner=<user>` — pool VMIs don't inherit the owner label, so the list looks empty. Match VMI by exact name (VMI name == VM name). Never poll owner-selected VMIs (Step 1) |
 | `cubestack-apply-conf.sh: unbound variable` | You fed the script via a nested heredoc in `kubectl exec` stdin — it doesn't work. Use `kubectl cp` of the script + values file (Step 4) |
 | `cluster.conf` rewriter: field not found | Field names differ in this installer version — read the example (Step 4) and adapt |
+| Rewriter aborts: `CEPH_MODE is set but the values file is missing: …` | External Ceph needs **all** coordinates — add the named keys to the values file (Step 4). Omitting `CEPH_MODE` skips the import entirely |
+| External Ceph: `CephCluster` stuck at `STATE=Connecting` | Provider mon unreachable from the new cluster — check `CEPH_MONITORS` and that the path to the Provider permits 6789 (mon) and 6800–7300 (OSD) |
+| External Ceph import rejected / permission errors | Provider and consumer Rook versions must match (v1.20.2); re-verify the CephX user + keyring with the Provider's owner |
+| `ceph-rbd` / `cephfs` StorageClass absent after a `CEPH_MODE=external` run | The import didn't run, or `CEPH_CSI_ENABLED` wasn't `true` — grep `cluster.conf` for the `CEPH_*` fields and re-run the config step (Step 4) |
+| External-Ceph PVC fails to mount on a kernel ≤ 5.4 node | Drop `fast-diff, object-map, deep-flatten, exclusive-lock` from the import's `imageFeatures` |
+| RGW / S3 unreachable, or `403` on signed requests | Consume via the `rgw-admin-ops-user` secret's keys + `CEPH_RGW_EXTERNAL_ENDPOINT` using **path-style** addressing; the Provider RGW runs host-network, so its IP drifts if that pod reschedules |
 | Kubespray SSH fails | VM not reachable on port 22, or wrong `SSH_DEFAULT_PASSWORD` in config |
 | Kubespray fails mid-install | Check `/tmp/cubestack-cluster-install.log`; may need to re-run or recreate VM |
 | Deploy dies at `local_path`: `未找到 StorageClass local-path` right after a config change | Stale inventory state — `k8s_deploy` was skipped ("已完成,跳过") because the pod was used for a different node set. Verify the target VM has no cluster, then re-run with `--fresh` (Step 6) |
@@ -891,4 +1004,11 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
     expires or a step's verbatim poll exceeds its window, report the state and apply
     that step's documented recovery — do not loop again, widen the budget, or invent
     a new completion signal.
+25. **External Ceph is opt-in, and its keyrings are secrets.** Import an external
+    Provider only when the user asked for Ceph-backed storage (Step 0 item 10) — the
+    default is no import. This skill never deploys a Ceph base: external mode consumes a
+    Provider that lives outside the cluster (`CEPH_ENABLED=false`, `CEPH_CSI_ENABLED=true`,
+    `CEPH_MODE=external`). Real `CEPH_KEYRING` / `CEPHFS_KEYRING` values never go into the
+    repo, the skill, or a committed values file — they follow rule 13's Write-tool →
+    `kubectl cp` → `rm` path like every other credential.
 
