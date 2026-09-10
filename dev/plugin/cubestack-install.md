@@ -536,8 +536,47 @@ Step 5.
 
 ## Step 5 — Fetch offline packages (subagent)
 
-> **Subagent task:** "Run the offline package fetch in the installer pod. Verify
-> ~22GiB landed. Return du output + pass/fail."
+> **Subagent task:** "First make sure the pod has `deployments/config/minio.conf`
+> (seed it from the example if missing — see below), then run the offline package
+> fetch. Verify ~22GiB landed. Return du output + pass/fail."
+
+> ⚠️ **Prerequisite: `minio.conf` must exist before fetching — this script does
+> NOT read `cluster.conf`.** `fetch-offline-from-minio.sh` takes the MinIO
+> credentials from `deployments/config/minio.conf`. A freshly created pod ships
+> only `minio.conf.example`, so the fetch exits 1 on a first run **even though
+> `cluster.conf` already holds the correct MinIO credentials** — the failure looks
+> nothing like a credentials problem. Observed on a real run: a failed fetch plus
+> recovery cost ~2.5 min.
+
+Seed it from the example and discover the real field names (never assume them):
+
+```bash
+kubectl exec -n default cubestack-install -- bash -c '
+cd /opt/cubestack-installer
+cp -n deployments/config/minio.conf.example deployments/config/minio.conf
+grep -vE "^[[:space:]]*(#|$)" deployments/config/minio.conf'
+```
+
+`minio.conf` holds the MinIO secret, so it is subject to the same tool-layer
+redaction hazard as `cluster.conf` (Step 4): **never create or edit it with an
+inline `echo`/`sed`/heredoc in a tool command** — the secret lands as a literal
+`***`. Author the file locally with the **Write tool** (keeping every
+non-credential key from the example — bucket, dir, etc.), then `kubectl cp` it in:
+
+```bash
+kubectl cp /tmp/minio.conf default/cubestack-install:/opt/cubestack-installer/deployments/config/minio.conf
+```
+
+Byte-verify the secret actually landed — this is the Step 5 counterpart of Step 4's
+approval gate (any redaction shows up as `***` somewhere in the file):
+
+```bash
+kubectl exec -n default cubestack-install -- bash -c \
+  'grep -F "***" /opt/cubestack-installer/deployments/config/minio.conf || echo "OK: no redaction artifacts"'
+```
+
+Expected: `OK: no redaction artifacts`. If any line prints, redo the file with the
+Write tool before fetching — a redacted secret fails exactly like an absent file.
 
 Run with `--yes` (non-interactive; no TTY in `kubectl exec`):
 
@@ -726,7 +765,8 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
 |---------|-------|
 | Pod stuck in `ContainerCreating` | `kubectl describe pod cubestack-install -n default` — image pull or scheduling |
 | `sshpass: command not found` during deploy | Install it in the pod (Step 3); kubespray needs it for initial SSH |
-| `fetch-offline-from-minio.sh` exits 1 | Missing `--yes` flag (interactive prompt without TTY), or MinIO unreachable |
+| `fetch-offline-from-minio.sh` exits 1 | Three causes, in order of likelihood: (1) **`deployments/config/minio.conf` missing** — a fresh pod ships only `minio.conf.example`, and the script reads `minio.conf`, *not* `cluster.conf` (create it first — Step 5); (2) missing `--yes` flag (interactive prompt without TTY); (3) MinIO unreachable |
+| `fetch-offline-from-minio.sh` exits 1 with correct MinIO credentials in `cluster.conf` | Expected — the script doesn't read `cluster.conf`. Create `deployments/config/minio.conf` from the example (Step 5) |
 | `cluster.conf` contains `***` | Tool-layer redaction corrupted a credential — use the script + values-file rewrite (Step 4) and re-verify bytes before deploying |
 | VM `passwd` hash shows `***` in the applied VM object | Tool-layer redaction hit the cloud-init hash during delegated creation — have the sibling KubeVirt skill (`suanova-dev-vm`) rebuild the VM; never build/rebuild a VM from this skill |
 | VirtualMachinePool apply rejected: `vm pool feature gate not enabled` | Alpha `VMPool` gate is off — external blocker only a cluster admin can clear; the orchestrator stops and reports so the user can enable it. Do not silently fall back to N separate VMs |
@@ -756,7 +796,12 @@ kubectl delete virtualmachinepool <pool> -n default    # multi-node: deletes the
    rebuild of a VM created by *this run* whose password auth failed at Step 3 —
    it is part of the run's automated recovery.
 4. **Trust only `kubectl` output.** Never fabricate cluster state, IPs, or component status.
-5. **`--yes` flag** is required for `fetch-offline-from-minio.sh` in non-interactive mode.
+5. **`--yes` flag *and* a real `minio.conf` are both required for
+   `fetch-offline-from-minio.sh`.** The flag satisfies the non-interactive prompt;
+   the credentials come from `deployments/config/minio.conf` — **not**
+   `cluster.conf` — and a fresh pod ships only `minio.conf.example`. Create
+   `minio.conf` before the first fetch (Step 5), using the Write tool + `kubectl cp`
+   path (it holds the MinIO secret, so inline `echo`/`sed` would write `***`).
 6. **No `hostNetwork`** on the installer pod — the Calico pod network is sufficient.
 7. **Subnets are dynamic** — query the cluster for node labels and NADs; never
    hardcode a specific subnet (2.x or 3.x). The target VM's subnet drives all
