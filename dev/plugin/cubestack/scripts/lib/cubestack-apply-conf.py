@@ -15,7 +15,7 @@ original inline version did.
 Exit codes (mapped to failure codes by scripts/configure):
     0   success
     10  a field or block named in the config does not exist  -> E_CONF_FIELD_MISSING
-    11  CEPH_MODE set but required keys absent               -> E_CONF_VALUES_MISSING
+    11  CEPH_MODE set, HAND-FILLED path, keys absent         -> E_CONF_VALUES_MISSING
     12  CEPHFS_FS set without CEPHFS_DATA_POOL               -> E_CONF_VALUES_MISSING
     13  NODES_MASTER empty                                   -> E_CONF_VALUES_MISSING
     1   anything else                                        -> E_CONF_FIELD_MISSING
@@ -127,22 +127,58 @@ def main():
     # Installer contract (03_addon/03_ceph_csi.sh + lib-common.sh):
     #   * CEPH_CSI_ENABLED=true is the gate - the module exits 0 without it;
     #     CEPH_MODE=external lets it run with CEPH_ENABLED=false.
-    #   * Required: CEPH_MONITORS + CEPH_KEYRING (the precheck fails without BOTH).
+    #   * CEPH_MODE selects external at all. There is NO `CEPH_NODE` key in the
+    #     installer; `CEPH_NODES`/`CEPH_NODE_LABEL` are unrelated (they place
+    #     internal-mode OSDs). Setting CEPH_NODE would silently do nothing.
+    #
+    # TWO import paths, and they need DIFFERENT config. Getting this wrong is
+    # not cosmetic: it is the difference between a run that works and exit 11.
+    #
+    #   OFFICIAL (preferred) - the Provider exports `external-ceph.env`; we
+    #     place it at deployments/config/external-ceph.env and the module
+    #     SOURCES it (`_ext_import_official`, line 178) to create the mon
+    #     secret, mon-endpoints CM, CSI secrets, CephCluster CR and the six
+    #     StorageClasses, after which Rook builds CephConnection/ClientProfile
+    #     and reports STATE=Connected. configure signals this path by exporting
+    #     CS_EXT_CEPH_ENV=1. It needs ONLY the three literals below plus
+    #     CEPH_EXTERNAL_ENV_FILE - and deliberately NOT CEPH_MONITORS or
+    #     CEPH_KEYRING. This rewriter used to demand both unconditionally, which
+    #     made every correct official-path run fail here with "missing:
+    #     CEPH_MONITORS, CEPH_KEYRING" while the env file already carried them.
+    #
+    #   HAND-FILLED (fallback) - no env file. The module then requires
+    #     CEPH_MONITORS + CEPH_KEYRING and takes the rest from config. Kept
+    #     working unchanged.
+    #
     #   * CEPHFS_FS is ITSELF the external-CephFS switch. Setting it makes
     #     CEPHFS_DATA_POOL required; the module hard-fails MID-DEPLOY if it is
     #     empty, so reject that here instead of 12 minutes in.
     #   * RGW is internal-mode ONLY. An external Provider's RGW is used directly
     #     and is NOT configured here.
+    external_env = bool(env("CS_EXT_CEPH_ENV"))
+
     if env("CEPH_MODE"):
         live = {  # real assignments in cluster.conf.example
             "CEPH_ENABLED": "false",   # literal: never deploy a Ceph base here
             "CEPH_CSI_ENABLED": "true",  # literal: this is the module's gate
             "CEPH_MODE": env("CEPH_MODE"),
-            "CEPH_MONITORS": env("CEPH_MONITORS"),
-            "CEPH_POOL": env("CEPH_POOL"),
-            "CEPH_USER": env("CEPH_USER"),
-            "CEPH_KEYRING": env("CEPH_KEYRING"),
         }
+        if external_env:
+            # Absolute, derived from the config path we were handed, so it does
+            # not depend on the module's cwd and repo-root relocation keeps
+            # working. The module also auto-detects this exact default path; set
+            # it explicitly so a moved/absent file fails LOUDLY instead of
+            # silently falling through to the hand-filled path, which would then
+            # fail on the absent CEPH_MONITORS.
+            live["CEPH_EXTERNAL_ENV_FILE"] = "%s/external-ceph.env" % os.path.dirname(
+                os.path.abspath(conf_path)
+            )
+        else:
+            live["CEPH_MONITORS"] = env("CEPH_MONITORS")
+            live["CEPH_POOL"] = env("CEPH_POOL")
+            live["CEPH_USER"] = env("CEPH_USER")
+            live["CEPH_KEYRING"] = env("CEPH_KEYRING")
+
         cephfs = {  # only in the example's COMMENTED block -> append
             "CEPHFS_FS": env("CEPHFS_FS"),
             "CEPHFS_META_POOL": env("CEPHFS_META_POOL"),
@@ -150,10 +186,15 @@ def main():
             "CEPHFS_USER": env("CEPHFS_USER"),
             "CEPHFS_KEYRING": env("CEPHFS_KEYRING"),
         }
-        required = ["CEPH_MONITORS", "CEPH_KEYRING"]
-        missing = [k for k in required if not env(k)]
-        if missing:
-            fail(EXIT_MISSING_KEYS, "CEPH_MODE is set but missing: " + ", ".join(missing))
+        if not external_env:
+            missing = [k for k in ("CEPH_MONITORS", "CEPH_KEYRING") if not env(k)]
+            if missing:
+                fail(
+                    EXIT_MISSING_KEYS,
+                    "CEPH_MODE is set but missing: "
+                    + ", ".join(missing)
+                    + " (pass --external-ceph-env for the official import path, which needs neither)",
+                )
         if env("CEPHFS_FS") and not env("CEPHFS_DATA_POOL"):
             fail(
                 EXIT_CEPHFS_INCOMPLETE,

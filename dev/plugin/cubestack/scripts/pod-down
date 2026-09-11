@@ -82,9 +82,15 @@ fi
 # so that Steps 4 and 5 can run in parallel without deleting each other's file.
 # The bare path is still covered: an older script version may have left one, and
 # this is the last chance to remove it before the pod goes.
+#
+# The Provider's external-ceph.env is here too. `configure` deliberately leaves
+# it in place - the installer sources it mid-deploy - so this is the only place
+# it gets removed. It holds the Provider's CSI secrets and RGW keys; deleting
+# the pod without shredding it would be the one credential left behind.
 if cs_pod_ready "$TARGET"; then
   cs_logged kubectl -n "$CS_NS" exec "$TARGET" -- bash -c \
-    'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf; do
+    'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf \
+              /opt/cubestack-installer/deployments/config/external-ceph.env; do
        [ -f "$f" ] || continue
        shred -u "$f" 2>/dev/null || rm -f "$f"
      done'

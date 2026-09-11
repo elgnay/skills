@@ -33,7 +33,9 @@ verify [options]
   --run ID           the run being verified (default: this run's id)
   --pod NAME         installer pod (default: this run's, <prefix>-<run-id>)
   --expect-nodes N   expected Ready node count (default: run.env NODES)
-  --ceph             also verify the external-Ceph consumer side (rook-ceph)
+  --ceph             force the external-Ceph consumer-side check. Automatic when
+                     the run recorded an external Ceph import; this only matters
+                     for a run dir that has no such record.
   -h, --help         this text
 
 On success writes the verify-ok stamp. Verdict: nodes=, namespaces=, services=,
@@ -153,10 +155,18 @@ $NS_LIST
 EOF
 
 # Is this run an external-Ceph consumer? run.env holds the resolved plan.
+#
+# The run's own record is now sufficient. Requiring --ceph ON TOP of it made the
+# flag a footgun: a run that imported an external Ceph and then omitted it got
+# RESULT: OK having checked nothing about Ceph - a false pass from the one step
+# whose job is to catch a missing import. The intent was recorded at Step 0, so
+# verify reads it instead of asking again. --ceph still forces the check on for
+# a run whose record is missing (an older run dir, or a hand-pointed one).
 CEPH_RUN=0
 [ "$(cs_run_env_get EXTERNAL_CEPH)" = "1" ] && CEPH_RUN=1
 CEPH_CHECK=0
-[ "$WANT_CEPH" = "1" ] && [ "$CEPH_RUN" = "1" ] && CEPH_CHECK=1
+[ "$CEPH_RUN" = "1" ] && CEPH_CHECK=1
+[ "$WANT_CEPH" = "1" ] && CEPH_CHECK=1
 
 NS_WANT="default,kube-system"
 [ "$CEPH_CHECK" = "1" ] && NS_WANT="$NS_WANT,rook-ceph"

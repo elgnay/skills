@@ -15,6 +15,13 @@
 # Idempotent: an existing cluster.conf is regenerated IN PLACE. It is never
 # re-copied from the example, which would wipe Ceph/MetalLB/NODES written by a
 # previous attempt.
+#
+# --external-ceph-env additionally places the Provider's `external-ceph.env` at
+# deployments/config/external-ceph.env, where the installer auto-detects and
+# SOURCES it. That file is placed, not destroyed: unlike the values file it is
+# read again ~12 minutes later, mid-deploy, by the Ceph module. Shredding it
+# here (as the values-file cleanup does) would break the deploy it was placed
+# for; pod-down owns its removal.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/verdict.sh
@@ -27,13 +34,25 @@ CONF_DIR="/opt/cubestack-installer/deployments/config"
 CONF_NAME="cluster.conf"
 POD_ARG=""
 VALUES=""
+EXT_ENV=""
+# Initialised here, not at the placement block far below: the dry run reads both
+# of these, and under `set -u` an unset read is fatal rather than empty.
+EXT_ENV_FLAG=0
+EXT_ENV_POD=""
 DRY_RUN=0
 
 usage() {
   cat <<'USAGE'
 configure --values <file> [--pod NAME] [--run ID] [--conf-name cluster.conf]
+          [--external-ceph-env FILE]
   --values FILE   local shell-assignment file (mode 600). Every line must be
                   KEY='value' with a key from the allow-list; no `***` anywhere.
+  --external-ceph-env FILE
+                  the Provider's exported external-ceph.env. Placed at
+                  deployments/config/external-ceph.env, hash-verified, and left
+                  in place for the deploy to source. Requires CEPH_MODE in the
+                  values file. With this, CEPH_MONITORS and CEPH_KEYRING are
+                  NOT needed - the env file carries the credentials.
   --run ID        the run this config belongs to (default: this run's id)
   --pod NAME      installer pod (default: this run's, <prefix>-<run-id>)
   --conf-name N   config file under deployments/config/ (default cluster.conf)
@@ -51,17 +70,68 @@ while [ $# -gt 0 ]; do
     --run)       cs_run_opt "${2:-}"; shift 2 ;;
     --pod)       POD_ARG="${2:-}"; shift 2 ;;
     --conf-name) CONF_NAME="${2:-}"; shift 2 ;;
+    --external-ceph-env) EXT_ENV="${2:-}"; shift 2 ;;
     --dry-run)   DRY_RUN=1; shift ;;
     -h|--help)   usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
 [ -n "$VALUES" ] || cs_usage_fail "--values is required"
-cs_budget_guard
+
+# Derived HERE, after parsing: the declaration block at the top runs before the
+# argument loop, so $EXT_ENV is still empty up there. Setting the flag only at
+# the placement block (the first attempt) made --dry-run report ext_env=0 for a
+# run that did pass an env file - a wrong answer about whether the official
+# import path is engaged, in the very output meant to be trusted.
+# Fall back to the path preflight recorded, so the official import path is named
+# exactly once per run. Without this, forgetting the flag on this one call
+# silently switches to the hand-filled path and fails on the absent
+# CEPH_MONITORS - a puzzling way to be told "you omitted an argument".
+if [ -z "$EXT_ENV" ]; then
+  EXT_ENV="$(cs_run_env_get EXTERNAL_CEPH_ENV_FILE)"
+fi
+EXT_ENV_FLAG=0
+[ -n "$EXT_ENV" ] && EXT_ENV_FLAG=1
+
 cs_kubeconfig_guard
 
 # --- local validation (before anything crosses the wire) --------------------
 cs_values_lint "$VALUES" SSH_PW NODES_MASTER MINIO_EP MINIO_AK MINIO_SK
+
+# The Provider env file is validated BEFORE the rewrite, not after. It is cheap
+# and local, and a bad one must not cost a cluster.conf that was already made
+# correct — the same "fail before mutating" rule the credential path follows.
+#
+# Deliberately NOT added to CS_VALUES_ALLOWED: that file is ours and must stay
+# KEY='value'. This one is the Provider's export in Rook's own format (a
+# multi-line quoted ARGS block plus bare `export KEY=value` lines), so it gets
+# its own gate: cs_ceph_env_lint.
+CEPH_ENV_DEST="external-ceph.env"
+if [ -n "$EXT_ENV" ]; then
+  cs_ceph_env_lint "$EXT_ENV"
+
+  # An env file with no CEPH_MODE is a silent no-op: the rewriter skips the
+  # whole Ceph block, the file lands, nothing imports it, and the run reports
+  # success having installed no Ceph at all. That is the one failure mode here
+  # that would not show up until verify.
+  case " ${CS_VALUES_KEYS} " in
+    *" CEPH_MODE "*) ;;
+    *) cs_usage_fail "--external-ceph-env requires CEPH_MODE='external' in $VALUES; without it the Ceph block is skipped and the env file is never read" ;;
+  esac
+fi
+
+# --- budget -----------------------------------------------------------------
+# Deliberately AFTER the validation above, for the same reason pod-up validates
+# its subnet first: a rejected input file cannot be fixed by re-invoking, so
+# charging an attempt for it only spends a lifetime retry on a deterministic
+# outcome. It also means the `fix-values:` recovery this lint prescribes can
+# actually be executed, instead of being refused by the budget it just spent.
+#
+# --dry-run is read-only by definition - it exists to be pointed at a live pod
+# without consequences - so it never spends one either.
+if [ "$DRY_RUN" != 1 ]; then
+  cs_budget_guard
+fi
 
 # --- pod --------------------------------------------------------------------
 cs_pod_require "$POD_ARG"
@@ -81,7 +151,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   cs_note "  config     $CONF_DIR/$CONF_NAME ($CONF_STATE)"
   cs_note "  values     $VALUES"
   cs_note "  keys       ${CS_VALUES_KEYS# }"
-  cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD"
+  cs_note "  ext env    ${EXT_ENV:-none}${EXT_ENV:+ -> $CONF_DIR/$CEPH_ENV_DEST}"
+  cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD" \
+        "ext_env=$EXT_ENV_FLAG"
 fi
 
 # Regenerate in place; seed from the example ONLY when absent. Re-copying the
@@ -119,10 +191,42 @@ cs_cleanup() {
   kubectl -n "$CS_NS" exec "$CS_POD" -- rm -f "$POD_VALUES" >/dev/null 2>&1 || true
 }
 
+# --- external Ceph env file (official import path) --------------------------
+# Placed BEFORE the rewrite so a bad copy costs nothing, and deliberately NOT
+# registered with cs_cleanup: the installer sources this file ~12 minutes later,
+# mid-deploy, so removing it on exit would break the very deploy it was staged
+# for. pod-down removes it once the cluster is verified.
+#
+# The hash gate is the point of this block. The lint already rejects an
+# unbalanced-quote file, which is how truncation usually shows up - but a
+# truncation landing on a balanced boundary would pass the lint, and this file
+# is what decides whether the consumer can reach the Provider's mons at all. A
+# digest comparison is the only check that cannot be fooled by that.
+if [ -n "$EXT_ENV" ]; then
+  chmod 600 "$EXT_ENV" 2>/dev/null || true
+  EXT_SHA="$(cs_sha256 "$EXT_ENV")"
+  [ -n "$EXT_SHA" ] || cs_fail E_INTERNAL "file=$EXT_ENV" recover=stop-report:user \
+    hint="cannot hash the env file on this host (needs shasum or sha256sum); refusing to deploy against an unverified copy"
+
+  EXT_ENV_POD="$CONF_DIR/$CEPH_ENV_DEST"
+  cs_logged kubectl -n "$CS_NS" cp "$EXT_ENV" "$CS_NS/$CS_POD:$EXT_ENV_POD" || \
+    cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+    hint="could not copy the external-ceph.env into the pod"
+
+  POD_SHA="$(cs_pod_exec_out "$CS_POD" bash -c "sha256sum $EXT_ENV_POD 2>/dev/null | cut -d' ' -f1" | tail -1)"
+  [ "$POD_SHA" = "$EXT_SHA" ] || cs_fail E_POD_EXEC "pod=$CS_POD" \
+    recover="rerun:pod-up" \
+    hint="the external-ceph.env in the pod does not hash to the local file; refusing to deploy against a truncated copy"
+
+  # Recorded so deploy can re-assert it is still there 12 minutes later, and
+  # pod-down can find it to shred.
+  cs_run_env_set "EXTERNAL_CEPH_ENV=$(cs_q 1)" "EXTERNAL_CEPH_ENV_DEST=$(cs_q "$CEPH_ENV_DEST")"
+fi
+
 # --- rewrite ----------------------------------------------------------------
 out="$(cs_pod_exec "$CS_POD" bash -c "
   set -a; . $POD_VALUES; set +a
-  python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
+  CS_EXT_CEPH_ENV=$EXT_ENV_FLAG python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
 rc=$?
 
 case "$rc" in
@@ -190,10 +294,25 @@ esac
 # model to rerun:deploy, which reproduces it. Absent (older run dir): verify
 # keeps requiring it, so this can only ever remove a false failure, never
 # introduce a false pass.
+CEPHFS_REQ=0
 case " ${CS_VALUES_KEYS} " in
-  *" CEPHFS_FS "*) cs_run_env_set "CEPHFS_REQUESTED=$(cs_q 1)" ;;
-  *)               cs_run_env_set "CEPHFS_REQUESTED=$(cs_q 0)" ;;
+  *" CEPHFS_FS "*) CEPHFS_REQ=1 ;;
 esac
+
+# On the OFFICIAL path there is no CEPHFS_FS in the values file at all - the FS
+# name travels inside the Provider's env file, and the module creates the CephFS
+# StorageClasses when CEPHFS_FS_NAME *and* CEPHFS_POOL_NAME are both non-empty
+# (03_ceph_csi.sh:311). Reading only the values file would therefore report
+# "RBD only" for a cluster that does have CephFS, and `verify --ceph` would skip
+# the very check that exists to catch a missing file system.
+#
+# Name only ever tested for emptiness, never printed.
+if [ "$EXT_ENV_FLAG" = 1 ]; then
+  CEPHFS_ENV_NAME="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?CEPHFS_FS_NAME=(.*)$/\2/p' "$EXT_ENV" \
+    | head -1 | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//")"
+  [ -n "$CEPHFS_ENV_NAME" ] && CEPHFS_REQ=1
+fi
+cs_run_env_set "CEPHFS_REQUESTED=$(cs_q $CEPHFS_REQ)"
 
 # A config change can invalidate the SSH password env-probe already proved.
 cs_stamp_clear env-ok
@@ -201,4 +320,6 @@ cs_stamp_write conf-ok "$CONF_NAME"
 
 cs_note "applied: $applied"
 cs_note "byte-gate: clean (no *** artifacts)"
-cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')"
+[ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
+cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
+      "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ"

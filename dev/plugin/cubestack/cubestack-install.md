@@ -135,7 +135,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 6 | MinIO endpoint + keys | **built-in** — the Cluster facts row above; never ask |
 | 7 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
-| 9 | External Ceph | off unless the user asks to import one |
+| 9 | External Ceph | off unless the user asks to import one — then ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`) |
 
 Then resolve everything with one read-only call and confirm the printed plan:
 
@@ -182,22 +182,59 @@ NODES_WORKERS='worker,<hostname>,<ip>,ubuntu,-|worker,<hostname>,<ip>,ubuntu,-'
 Multi-node: the `NODES_MASTER` line plus that single `NODES_WORKERS` line. Single-node:
 omit `NODES_WORKERS` entirely — `NODES_MASTER` alone is the single master.
 
-**External Ceph** — add these *only* when importing an external Provider, and re-run
-`preflight --external-ceph` so `verify --ceph` knows to check the consumer side:
+**External Ceph** — the Provider exports an `external-ceph.env`. Point `preflight` at it, and
+that is the whole of the setup:
+
+```bash
+"$S/preflight" --nodes 1 --minio-ep http://<host>:9000 \
+  --external-ceph-env /path/to/external-ceph.env
+```
+
+`preflight` validates the file locally, records its path in the run dir, and switches on the
+consumer-side checks in `verify` (`ceph_env=official` in the verdict). `configure`
+then places it at `deployments/config/external-ceph.env` in the pod — where the installer
+auto-detects and **sources** it — and hash-verifies the copy landed intact. The values file
+needs exactly **one** extra line:
 
 ```
 CEPH_MODE='external'
-CEPH_MONITORS='<ip:port,ip:port,ip:port>'            # required with CEPH_MODE
-CEPH_KEYRING='<base64 keyring>'                      # required with CEPH_MODE
+```
+
+Everything else the import needs is already inside the env file: the monitors, the keyring,
+the CSI secrets, the pool and file-system names, the RGW endpoint. So when you pass
+`--external-ceph-env`, **`CEPH_MONITORS`, `CEPH_KEYRING` and the `CEPHFS_*` keys are not
+needed** — the rewriter does not ask for them on that path.
+
+Three things worth knowing before you run it:
+
+- **The key is `CEPH_MODE`, not `CEPH_NODE`.** There is no `CEPH_NODE` key in the installer at
+  all; `CEPH_NODES` and `CEPH_NODE_LABEL` are unrelated (they place *internal*-mode OSDs).
+  Setting `CEPH_NODE` does nothing, silently, and the run installs no Ceph.
+- **The env file is placed, not shredded.** Every other credential path shreds its pod-side
+  copy on exit; this one cannot, because the installer sources the file ~12 minutes later,
+  mid-deploy. `pod-down` removes it, and `deploy` re-checks it is still there before
+  launching (the pod's filesystem is ephemeral — a recreate between the two steps loses it).
+- **The file is `source`d inside the pod**, so `configure` refuses one containing command
+  substitution, a non-assignment line, unbalanced quotes or `***` artifacts, and will not
+  deploy against a copy whose hash does not match the local file.
+
+**Hand-filled fallback.** Without `--external-ceph-env` the installer still supports
+configuring the Provider by hand. Then, and only then, `CEPH_MONITORS` + `CEPH_KEYRING` are
+required — the rewriter refuses the run without both:
+
+```
+CEPH_MONITORS='<ip:port,ip:port,ip:port>'            # hand-filled path only
+CEPH_KEYRING='<base64 keyring>'                      # hand-filled path only
 CEPH_POOL='rbd'          CEPH_USER='admin'           # optional defaults
 CEPHFS_FS='<fs name>'                                # optional; makes DATA_POOL required
 CEPHFS_DATA_POOL='<pool>'                            # BOTH-OR-NEITHER with CEPHFS_FS
 ```
 
-`CEPHFS_FS` is itself the external-CephFS switch; setting it without `CEPHFS_DATA_POOL`
+`CEPHFS_FS` is itself the CephFS switch on that path; setting it without `CEPHFS_DATA_POOL`
 hard-fails *mid-deploy*, so `configure` rejects that combination up front instead of
-12 minutes in. RGW is internal-mode only — an external Provider's RGW is used directly and
-is never configured here.
+12 minutes in. On the official path CephFS is decided by the env file's `CEPHFS_FS_NAME`,
+which `configure` reads to decide whether `verify` should expect a CephFS StorageClass. RGW is
+internal-mode only — an external Provider's RGW is used directly and is never configured here.
 
 ## Step 1 — Provision VMs (delegate; never create VMs here)
 
@@ -288,10 +325,14 @@ It regenerates an existing `cluster.conf` **in place**. It never re-copies
 prior attempt. The rewriter ships as `scripts/lib/cubestack-apply-conf.py`; you neither
 author nor edit it.
 
+When Step 0 was given `--external-ceph-env`, `configure` also places that file — it reads the
+path from the run dir, so **you do not pass it again** — and hash-verifies the copy. It is left
+in place deliberately: the installer sources it mid-deploy. `pod-down` removes it.
+
 > A real run **rewrites the pod's live `cluster.conf`**, replacing whatever credentials it
 > holds with the ones in your values file. To inspect or smoke-test against a live pod
 > without mutating it, add `--dry-run`: it validates and prints the resolved plan, then
-> stops before any write.
+> stops before any write. A dry run is read-only and never spends a retry; the real one does.
 
 > **`configure` invalidates `env-ok`, so `env-probe` must run a second time before Step 6.**
 > The stamp attests the SSH password and VM digest the deploy will actually use, and a
@@ -354,7 +395,7 @@ is the **only** place `--fresh` is ever prescribed.
 ## Step 7 — Verify, then clean up
 
 ```bash
-"$S/verify" --run <run-id> --expect-nodes 3   # add --ceph when an external Ceph was imported
+"$S/verify" --run <run-id> --expect-nodes 3   # external-Ceph checks turn on by themselves for an importing run
 ```
 
 One call replaces ~10 independent `kubectl get`s. It refuses vacuity explicitly — zero

@@ -100,7 +100,8 @@ PRE="$(cs_pod_exec "$CS_POD" bash -c '
   m=$(du -sm "$D/offline-files" 2>/dev/null | cut -f1)
   case "$m" in ""|*[!0-9]*) m=0 ;; esac
   echo "fetch_mb=$m"
-  if command -v sshpass >/dev/null 2>&1; then echo sshpass=1; else echo sshpass=0; fi')"
+  if command -v sshpass >/dev/null 2>&1; then echo sshpass=1; else echo sshpass=0; fi
+  if [ -f "$D/config/external-ceph.env" ]; then echo ceph_env=1; else echo ceph_env=0; fi')"
 
 probe_kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | tail -1; }
 
@@ -108,10 +109,12 @@ CONF_OK="$(probe_kv "$PRE" conf)"
 CONF_REDACTED="$(probe_kv "$PRE" redacted)"
 FETCH_MB="$(probe_kv "$PRE" fetch_mb)"
 SSHPASS="$(probe_kv "$PRE" sshpass)"
+CEPH_ENV_PRESENT="$(probe_kv "$PRE" ceph_env)"
 [ -n "$CONF_OK" ] || CONF_OK=0
 [ -n "$CONF_REDACTED" ] || CONF_REDACTED=0
 [ -n "$FETCH_MB" ] || FETCH_MB=0
 [ -n "$SSHPASS" ] || SSHPASS=0
+[ -n "$CEPH_ENV_PRESENT" ] || CEPH_ENV_PRESENT=0
 
 if [ "$CONF_OK" != "1" ]; then
   cs_fail E_DEPLOY_PRECOND_CONF "pod=$CS_POD" recover="fix-values:cluster.conf:SSH_DEFAULT_PASSWORD,MINIO_SECRET_KEY" \
@@ -133,6 +136,15 @@ fi
 if [ -z "$(cs_stamp_read env-ok)" ]; then
   cs_fail E_DEPLOY_PRECOND_ENV "pod=$CS_POD" recover=rerun:env-probe \
     hint="no env-ok stamp in the run dir; the environment probe has not passed for this run"
+fi
+
+# The Provider's env file is sourced by the Ceph module ~12 minutes in. It lives
+# on the pod's ephemeral filesystem, so it does not survive a pod recreate
+# between configure and here. Checking now turns "the deploy died at ceph_csi"
+# into a 1-second verdict naming the step that must be re-run.
+if [ "$(cs_run_env_get EXTERNAL_CEPH_ENV)" = "1" ] && [ "$CEPH_ENV_PRESENT" != "1" ]; then
+  cs_fail E_DEPLOY_PRECOND_CEPH_ENV "pod=$CS_POD" recover="rerun:configure" \
+    hint="the Provider external-ceph.env is not in the pod; the pod filesystem is ephemeral - re-run configure to place it"
 fi
 
 # --- never launch a second deploy over a live one ---------------------------

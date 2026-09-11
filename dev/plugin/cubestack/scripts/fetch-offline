@@ -54,9 +54,12 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$VALUES" ] || cs_usage_fail "--values is required"
 cs_kv_nonnumeric "$FLOOR_MIB" && cs_usage_fail "--floor must be a number"
-cs_budget_guard
 cs_kubeconfig_guard
 cs_values_lint "$VALUES" MINIO_EP MINIO_AK MINIO_SK
+# AFTER the lint: a values file that fails validation is deterministic, so
+# charging an attempt for it spends a lifetime retry on an outcome that cannot
+# change - and would refuse the `fix-values:` re-invocation the lint prescribes.
+cs_budget_guard
 cs_pod_require "$POD_ARG"
 
 # Script-scoped, NOT the bare /tmp/cubestack-values.conf: the skill documents

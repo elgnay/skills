@@ -263,6 +263,19 @@ cs_join() {  # join remaining args with a comma; used for batching failures
 
 cs_kv_nonnumeric() { case "$1" in ''|*[!0-9]*) return 0 ;; esac; return 1; }
 
+# Host-side sha256, used as an integrity gate on files copied INTO the pod.
+# macOS ships `shasum`, Linux ships `sha256sum`; accepting whichever exists is
+# what keeps this callable from either. Prints the bare hex digest, or nothing
+# if neither tool is present (the caller must treat empty as "cannot verify",
+# never as "matches").
+cs_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}
+
 # --- values-file validation -------------------------------------------------
 # The values file is `source`d INSIDE the pod, so an unrecognised key or an
 # unquoted line is an injection vector, not merely a typo. Requiring
@@ -330,6 +343,106 @@ cs_values_lint() {  # $1 = file, remaining = required keys
   done
 
   CS_VALUES_KEYS="$seen"
+  return 0
+}
+
+# --- external-Ceph env-file validation --------------------------------------
+# The Provider exports `external-ceph.env` and the INSTALLER SOURCES IT
+# (03_ceph_csi.sh:178 — `source "${_env_file}"`). That makes this file
+# executable content inside the bootstrap pod, so the checks below are a
+# security control, not hygiene: a line that is not an assignment runs.
+#
+# Format reality (measured 2026-09-11 against a real Provider export, 39 lines):
+#   line 1  `ARGS="`  opens a quote that CLOSES on line 14, with the provider's
+#           twelve `--namespace=...`-style arguments indented in between;
+#   lines 15-39  twenty-five plain `export KEY=value` lines.
+# So the shape test MUST tolerate a multi-line double-quoted value. A naive
+# "every line is KEY=value" rule rejects a perfectly valid provider file — the
+# exact mistake this comment exists to prevent.
+#
+# Value-free by construction: reports line NUMBERS and key NAMES, never content.
+cs_ceph_env_lint() {  # $1 = path to a provider external-ceph.env
+  local f="$1" out key missing=""
+
+  [ -f "$f" ] || cs_fail E_CEPH_ENV_MISSING "file=$f" recover=stop-report:user \
+    hint="no external-ceph.env at that path; the Provider exports one (ceph-expose-external.sh) - pass its real path"
+
+  # The path rides in recover= and in a k=v below, and the contract forbids
+  # whitespace in either. Same rationale as cs_values_lint.
+  case "$f" in *[[:space:]]*)
+    cs_fail E_USAGE recover=stop-report:user \
+      hint="the external-ceph.env path contains whitespace, which breaks the verdict token grammar; move it somewhere without spaces" ;;
+  esac
+
+  [ -s "$f" ] || cs_fail E_CEPH_ENV_INVALID "file=$f" recover=stop-report:provider \
+    hint="the external-ceph.env is empty; re-export it from the Provider"
+
+  # A real export is ~2 KB. Anything far larger is not one, and does not get
+  # read into a shell on a guess.
+  if [ "$(wc -c < "$f" | tr -d ' ')" -gt 65536 ]; then
+    cs_fail E_CEPH_ENV_INVALID "file=$f" recover=stop-report:provider \
+      hint="far larger than a Provider export; refusing to source it - re-export and pass the real file"
+  fi
+
+  if grep -qF '***' "$f"; then
+    cs_fail E_CEPH_ENV_INVALID "file=$f" recover=stop-report:provider \
+      hint="contains *** redaction artifacts; re-export it from the Provider (never sed/echo/heredoc)"
+  fi
+
+  # The load-bearing control: the installer `source`s this file, so `$(...)` or
+  # a backtick is arbitrary code execution in the bootstrap pod. A Provider
+  # export contains neither.
+  if out="$(grep -nF -e '`' -e '$(' "$f" 2>/dev/null | head -1 | cut -d: -f1)"; then
+    [ -n "$out" ] && cs_fail E_CEPH_ENV_INVALID "file=$f" "line=$out" recover=stop-report:provider \
+      hint="line $out contains command substitution; the installer sources this file, so it would execute as a command"
+  fi
+
+  # Shape + quote balance, one pass. A line is judged by the quote state the
+  # PREVIOUS line left behind: inside an open quote it is a continuation and may
+  # be anything; outside, it must be an assignment or a comment. An unbalanced
+  # quote at EOF is how a truncated copy shows up — the hazard that makes a
+  # half-written file silently sourceable.
+  out="$(awk '
+    BEGIN { inq = ""; bad = ""; esc = 0 }
+    {
+      if (inq == "") {
+        s = $0
+        if (s !~ /^[ \t]*$/ && s !~ /^[ \t]*#/ && \
+            s !~ /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) { if (bad == "") bad = NR }
+      }
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (esc) { esc = 0; continue }
+        if (inq == "\"") { if (c == "\\") esc = 1; else if (c == "\"") inq = "" }
+        else if (inq == "'"'"'") { if (c == "'"'"'") inq = "" }
+        else { if (c == "\"") inq = "\""; else if (c == "'"'"'") inq = "'"'"'" }
+      }
+    }
+    END { if (bad != "") print "BADLINE:" bad; else if (inq != "") print "UNTERMINATED"; else print "OK" }
+  ' "$f" 2>/dev/null)"
+
+  case "$out" in
+    OK) ;;
+    BADLINE:*) cs_fail E_CEPH_ENV_INVALID "file=$f" "line=${out#BADLINE:}" recover=stop-report:provider \
+                 hint="line ${out#BADLINE:} is not an assignment; the installer sources this file, so it would run as a command" ;;
+    UNTERMINATED) cs_fail E_CEPH_ENV_INVALID "file=$f" recover=stop-report:provider \
+                 hint="unbalanced quotes - the file is truncated or corrupt; re-export it from the Provider" ;;
+    *) cs_fail E_CEPH_ENV_INVALID "file=$f" recover=stop-report:provider \
+                 hint="could not parse the external-ceph.env as a shell-assignment file" ;;
+  esac
+
+  # The four the installer itself refuses to proceed without
+  # (03_ceph_csi.sh:182-186). Names only — these are variable names, not secrets.
+  for key in ROOK_EXTERNAL_FSID ROOK_EXTERNAL_CEPH_MON_DATA \
+             ROOK_EXTERNAL_USERNAME ROOK_EXTERNAL_USER_SECRET; do
+    grep -qE "^[ \t]*(export[ \t]+)?$key=" "$f" || missing="$missing${missing:+,}$key"
+  done
+  # Instruction FIRST: cs_fail cuts the hint at 160 chars, and the key list is
+  # already carried in full by the `missing=` field above.
+  [ -n "$missing" ] && cs_fail E_CEPH_ENV_INVALID "file=$f" "missing=$missing" recover=stop-report:provider \
+    hint="re-export it from the Provider - the installer requires these and they are absent: $missing"
+
   return 0
 }
 

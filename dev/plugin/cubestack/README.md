@@ -64,20 +64,41 @@ Omitting `--run` is a **loud failure**, not a fallback: the run dir is not guess
 
 ## Measured timing
 
-Two verified 3-node installs (8 vCPU / 24 GiB per VM), started from a clean state:
+Three verified installs (8 vCPU / 24 GiB per VM), started from a clean state. Run 3 is the
+1-node external-Ceph run; the per-step figures are the scripts' own duration, measured to a
+`timings.tsv` in the run dir.
 
-| Step | Run 1 (10.66.3.0/24) | Run 2 (10.66.2.0/24) |
-|------|----------------------|----------------------|
-| S1 — provision VMs | ~3 m 17 s | ~2 m 03 s |
-| S2 — installer pod | ~32 s | ~27 s |
-| S3 — verify env | ~1 m 00 s | ~47 s |
-| S4 — `cluster.conf` | ~1 m 12 s | ~2 m 25 s |
-| S5 — fetch offline | ~4 m 19 s | ~1 m 57 s |
-| S6 — deploy | ~12 m 26 s | ~13 m 04 s |
-| S7 — verify + cleanup | ~11 s | ~10 s |
-| **Total** | **~24 m 50 s** | **~25 m 42 s** |
+| Step | Run 1 (3 nodes, 10.66.3.0/24) | Run 2 (3 nodes, 10.66.2.0/24) | Run 3 (1 node + external Ceph) |
+|------|----------------------|----------------------|----------------------|
+| S1 — provision VMs | ~3 m 17 s | ~2 m 03 s | 31 s |
+| S2 — installer pod | ~32 s | ~27 s | 5 s |
+| S3 — verify env | ~1 m 00 s | ~47 s | 9 s *(two probes)* |
+| S4 — `cluster.conf` | ~1 m 12 s | ~2 m 25 s | 6 s |
+| S5 — fetch offline | ~4 m 19 s | ~1 m 57 s | 1 m 22 s |
+| S6 — deploy | ~12 m 26 s | ~13 m 04 s | 15 m 54 s |
+| S7 — verify | ~11 s | ~10 s | 52 s |
+| S8 — cleanup | *(same call)* | *(same call)* | 43 s |
+| **Total** | **~24 m 50 s** | **~25 m 42 s** | **~19 m 42 s** |
 
 **Deploy (S6) dominates at roughly half the wall time.** Run 1's S5 includes a failed fetch plus its recovery; once the Step 5 prerequisite is met the fetch lands first try (run 2).
+
+Three things in run 3 worth reading rather than skimming:
+
+- **Deploy got *slower* on one node than on three** (15 m 54 s vs ~13 m). The external Ceph
+  import is the reason: the Rook operator, the CSI drivers, the `CephConnection` /
+  `ClientProfile` and the seven StorageClasses are all real work that scales with the
+  *import*, not with the node count. A single-node cluster is not a cheaper Ceph consumer.
+- **S3 runs twice.** `configure` deliberately invalidates the `env-ok` stamp (a config change
+  can move the SSH password the stamp attests), so the probe is re-run before the deploy.
+  9 s here is the two probes together.
+- **S7 + S8 are lopsided against runs 1–2** because they were a single hand-run call there.
+  `verify` spends a 30 s node-settling re-pass — kubelet is routinely not `Ready` in the
+  seconds after the deploy exits, and failing on that would be a false negative.
+
+**Script time is not wall time.** Run 3's wall clock was 29 m 45 s against 19 m 42 s of
+script time; the ~10 m gap was model-side analysis of the installer while *writing* the
+external-Ceph support. On a normal run the two are much closer — the scripts are what the
+model waits on.
 
 ---
 
@@ -94,22 +115,43 @@ mon/osd/mgr itself:
 | `CEPH_CSI_ENABLED` | `true` | The module's **gate** — enable the CSI drivers (RBD / CephFS) |
 | `CEPH_MODE` | `external` | Consume an external Provider, not an in-cluster Ceph |
 
-Only **two** values are required: the Provider's mon endpoints and a CephX keyring. The
-RBD pool/user and the CephFS filesystem/data pool are optional — **setting `CEPHFS_FS` is
-what turns CephFS on**, and it then also requires `CEPHFS_DATA_POOL`.
+**The recommended path is the official one: point `preflight` at the Provider's exported
+`external-ceph.env`.**
 
-Give it a user with *provisioning* caps: the installer wires one key to **both** the CSI
+```bash
+"$S/preflight" --nodes 1 --minio-ep http://<host>:9000 \
+  --external-ceph-env /path/to/external-ceph.env
+```
+
+The env file already carries the monitors, the CephX keyring, the CSI secrets, the pool and
+file-system names and the RGW endpoint, so the only thing the values file needs is
+`CEPH_MODE='external'`. `configure` places the file at
+`deployments/config/external-ceph.env` in the pod — where the installer auto-detects and
+**sources** it — hash-verifies the copy, and leaves it there for the deploy to read.
+
+> The key is `CEPH_MODE`, **not** `CEPH_NODE` — there is no `CEPH_NODE` key in the installer,
+> and setting it does nothing, silently. `CEPH_NODES` / `CEPH_NODE_LABEL` are unrelated
+> (internal-mode OSD placement).
+
+**Hand-filled fallback.** Without an env file the Provider can still be configured by hand,
+and then `CEPH_MONITORS` + `CEPH_KEYRING` are required. The RBD pool/user and the CephFS
+filesystem/data pool are optional — on that path **setting `CEPHFS_FS` is what turns CephFS
+on**, and it then also requires `CEPHFS_DATA_POOL`.
+
+Give the user *provisioning* caps either way: the installer wires one key to **both** the CSI
 node and provisioner secrets, so a read-only user (Rook's `client.healthchecker`)
 configures cleanly and then fails every PVC. Step 7 verifies the `CephConnection` +
-`ClientProfile`, the `ceph-rbd` / `cephfs` StorageClasses, and the CSI secrets' `userID`.
+`ClientProfile`, the CephCluster reaching `Connected`, the RBD / CephFS StorageClasses, and
+the CSI secrets' `userID`. These checks switch on automatically for a run that recorded an
+import — you do not have to remember a flag.
 
-> **RGW / object storage is not part of this.** The installer creates a CephObjectStore
-> only in *internal* mode; an external Provider's RGW is consumed directly at its own
-> endpoint. **Keyrings are real secrets** — they travel in the values file and are never
+> **RGW / object storage.** In *internal* mode the installer creates a CephObjectStore. On
+> the **official external path** it additionally consumes the Provider's RGW at its own
+> endpoint, creating the bucket StorageClass and the Model-repository ObjectBucketClaim when
+> the env file carries RGW keys. An external Provider's RGW is never *configured* here.
+>
+> **Keyrings and CSI secrets are real secrets** — the env file and the values file are never
 > committed, not to this repo and not into the skill. Only placeholders appear in the docs.
-
-The verified Provider coordinates live in the skill's Cluster facts table. They are
-Provider-specific: reconfirm them with the external cluster's owner before a run.
 
 ---
 
@@ -181,7 +223,7 @@ cp -R dev/plugin/cubestack/scripts ~/.claude/skills/cubestack-install/scripts
 | SSH password | `ubuntu` |
 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
-| External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the external Provider's mon + keyring (RBD pool/user and CephFS fs/data pool optional) |
+| External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the path to the Provider's exported `external-ceph.env` (the hand-filled mon + keyring route still works but is no longer the recommended one) |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
 

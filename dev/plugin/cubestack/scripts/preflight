@@ -40,6 +40,12 @@ preflight [options]
   --harbor FQDN    Harbor endpoint (default harbor.isuanova.com)
   --minio-ep URL   MinIO endpoint for the offline fetch
   --external-ceph  mark the run as importing an external Ceph Provider
+  --external-ceph-env FILE
+                   the Provider's exported external-ceph.env (implies
+                   --external-ceph). Checked for shape and for the four
+                   variables the installer requires, then recorded in run.env
+                   so `configure` picks it up without being told again. That
+                   path stays in the run dir, never in the repo.
   --run ID         pin the run id instead of deriving it from the target
                    (default: cubestack<N>, the resolved target). Every other
                    script takes the same flag; pass it on, or two installs
@@ -62,6 +68,7 @@ INDEX=""
 HARBOR="$CS_HARBOR_DEFAULT"
 MINIO_EP=""
 EXTERNAL_CEPH=0
+EXTERNAL_CEPH_ENV=""
 RUN_ID=""
 
 while [ $# -gt 0 ]; do
@@ -80,6 +87,7 @@ while [ $# -gt 0 ]; do
     --harbor)  HARBOR="${2:-}"; shift 2 ;;
     --minio-ep) MINIO_EP="${2:-}"; shift 2 ;;
     --external-ceph) EXTERNAL_CEPH=1; shift ;;
+    --external-ceph-env) EXTERNAL_CEPH_ENV="${2:-}"; shift 2 ;;
     --run)     RUN_ID="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
@@ -94,6 +102,18 @@ done
 case "$EXPOSE" in nodeport|metallb) ;; *) cs_usage_fail "--expose must be nodeport or metallb" ;; esac
 if [ "$EXPOSE" = "metallb" ] && [ -z "$POOL_RANGE" ]; then
   cs_usage_fail "--expose metallb needs --pool-range <start>-<end>"
+fi
+
+# Passing the Provider's env file IS an external Ceph import, so the flag is
+# derived rather than required - a caller cannot ask for the official path and
+# forget to ask for the import, which would silently install no Ceph at all.
+#
+# Validated here as well as in configure. Both are local, cheap, and read-only;
+# catching a malformed Provider export at Step 0 costs one answer, catching it
+# at Step 4 costs a resolved run.
+if [ -n "$EXTERNAL_CEPH_ENV" ]; then
+  EXTERNAL_CEPH=1
+  cs_ceph_env_lint "$EXTERNAL_CEPH_ENV"
 fi
 
 # The budget is consumed AFTER the run id is known (below), so preflight's
@@ -218,6 +238,7 @@ cs_run_env_set \
   "HARBOR=$(cs_q "$HARBOR")" \
   "MINIO_EP=$(cs_q "$MINIO_EP")" \
   "EXTERNAL_CEPH=$(cs_q "$EXTERNAL_CEPH")" \
+  "EXTERNAL_CEPH_ENV_FILE=$(cs_q "$EXTERNAL_CEPH_ENV")" \
   "POOL=$(cs_q "$POOL")" \
   "VM_NAMES=$(cs_q "$VM_NAMES")"
 
@@ -232,7 +253,7 @@ CONFIRM — resolved prerequisites (nothing has been created yet)
   expose        $EXPOSE${POOL_RANGE:+   (pool $POOL_RANGE)}
   Harbor        $HARBOR
   MinIO         ${MINIO_EP:-<not set — required before fetch-offline>}
-  external Ceph $([ "$EXTERNAL_CEPH" = "1" ] && echo yes || echo no)
+  external Ceph $([ "$EXTERNAL_CEPH" = "1" ] && echo yes || echo no)${EXTERNAL_CEPH_ENV:+   (official import: $(basename "$EXTERNAL_CEPH_ENV"))}
 
   run id        $RUN_ID        (--run $RUN_ID on every later step)
   run dir       $(cs_run_dir)
@@ -243,4 +264,5 @@ never stored in the run dir — they arrive through the Write -> configure path.
 EOF
 
 cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" "nad=$NAD" \
-      "vms=$VM_NAMES" "run_dir=$(cs_run_dir)"
+      "vms=$VM_NAMES" "ceph_env=$([ -n "$EXTERNAL_CEPH_ENV" ] && echo official || echo none)" \
+      "run_dir=$(cs_run_dir)"
