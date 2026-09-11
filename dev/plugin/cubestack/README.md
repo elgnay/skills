@@ -2,7 +2,8 @@
 
 A Claude Code skill for installing a single- or multi-node **CubeStack** cluster onto KubeVirt VMs in the SUANOVA cluster. The installer runs inside a bootstrap **pod** and SSHes into the target VMs to run kubespray.
 
-> Core file: `cubestack-install.md` (SKILL.md).
+> Core file: `cubestack-install.md` (SKILL.md), driven by the deterministic scripts in
+> `scripts/`. Both must be installed (see [Installation](#installation)).
 
 **Scope boundary**: this skill installs a CubeStack *cluster* end to end, but it does **not** create VMs. All VM/pool mechanics belong to the sibling [`suanova-dev-vm`](../kubevirt/suanova-dev-vm.md) skill, which this one delegates to.
 
@@ -15,26 +16,49 @@ A Claude Code skill for installing a single- or multi-node **CubeStack** cluster
 | **Interaction** | Asks the user **exactly once** (Step 0: prerequisites + one confirmation), then runs Steps 1–7 **unattended** — no per-step approvals |
 | **Recovery** | Failed steps apply their documented, automated recovery instead of prompting. It stops and reports only for an external blocker (e.g. a feature gate only an admin can enable) |
 | **Topology** | Single-node (`cubestack<N>`) or multi-node (`VirtualMachinePool` `cubestack<N>` with `replicas` = node count → VMs `cubestack<N>-0/-1/…`) |
-| **Execution** | Subagent-per-phase; the orchestrator only collects prerequisites, spawns subagents, relays results, and reports progress |
+| **Execution** | One script call per step. No subagents — spawning one to make a single call costs more than the call. ~10–12 model round-trips per run |
+| **Failure handling** | Each script emits one machine-readable verdict line with a `recover=` verb from a closed set of six; the model executes the verb rather than diagnosing from prose |
 | **Cleanup** | The bootstrap pod is **ephemeral** — auto-deleted once Step 7 verifies the cluster is healthy |
+| **Run identity** | A run is scoped to what it installs (`--run cubestack<N>`): its own run dir, stamps, retry counters, **and its own bootstrap pod name**. Two installs can therefore run at the same time without applying to, reusing, or deleting each other's pod |
 | **Storage** | Optional **external Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Opt-in, off by default |
 
 ---
 
 ## How it works
 
-| Step | What happens |
-|------|--------------|
-| **Step 0** | The only user interaction — resolve prerequisites, then one confirmation |
-| **Step 1** | Provision VMs via the sibling `suanova-dev-vm` skill |
-| **Step 2** | Create the installer pod *(runs concurrently with Step 1)* |
-| **Step 3** | Verify the environment from the pod — VM SSH, MinIO, Harbor, `sshpass` |
-| **Step 4** | Generate and byte-verify `cluster.conf` |
-| **Step 5** | Fetch the ~22GiB offline package set from MinIO |
-| **Step 6** | Deploy — kubespray plus the enabled addon modules |
-| **Step 7** | Verify cluster health, then auto-delete the installer pod |
+| Step | What happens | Script |
+|------|--------------|--------|
+| **Step 0** | The only user interaction — resolve prerequisites, then one confirmation | `preflight` |
+| **Step 1** | Provision VMs via the sibling `suanova-dev-vm` skill, then confirm by exact name | `vm-ready` |
+| **Step 2** | Create the installer pod, named for this run *(runs concurrently with Step 1)* | `pod-up` |
+| **Step 3** | Verify the environment from the pod — VM SSH, MinIO, Harbor, `sshpass` | `env-probe` |
+| **Step 4** | Generate and byte-verify `cluster.conf` | `configure` |
+| **Step 5** | Fetch the ~22GiB offline package set from MinIO | `fetch-offline` |
+| **Step 6** | Deploy — kubespray plus the enabled addon modules, then wait | `deploy` + `deploy-wait` |
+| **Step 7** | Verify cluster health, then auto-delete the installer pod | `verify` + `pod-down` |
 
-Steps 1 and 2 are independent (the pod only needs the target **subnet label**, not the VMs), so they run concurrently and join at Step 3.
+Steps 1 and 2 are independent (the pod only needs the target **subnet label**, not the VMs), so they run concurrently and join at Step 3. `diagnose <CODE>` produces a bounded excerpt when something fails.
+
+Two mechanical details worth knowing: `deploy-wait` must run as a **background task** (a deploy outlasts the 600 s foreground ceiling), and completion is **process exit, never the `✅` banner** — the banner is cosmetic and is the first thing lost if a deploy is killed at the end.
+
+---
+
+## Concurrent installs
+
+Every script takes `--run <run-id>`, and `preflight` mints that id from the resolved target — `cubestack3` for the first free `cubestack<N>` index. One id scopes everything the run owns:
+
+```
+--run cubestack3  →  ~/.cubestack/runs/cubestack3/     run.env, stamps, attempts, verdicts, logs
+                  →  pod cubestack-install-cubestack3   the bootstrap host
+```
+
+Two installs started at the same time resolve different indices, so they get different run dirs and different pod names, and neither can reach the other's state.
+
+**There is no fixed pod name and no shared default run dir.** Both were removed deliberately. With a fixed name, the second run's `kubectl apply` targets the first run's pod, and because `kubevirt.io/subnet` is immutable that path *deletes and recreates* it — discarding the ~22 GiB offline fetch and the `cluster.conf` the first run had already paid for. Discovery had the same problem from the other side: "newest pod matching the prefix" cannot tell one run's pod from another's.
+
+Reuse still works, and still skips the fetch — *within* a run, where the name is stable, a re-invocation finds its own pod (`reused=1 fetch=present`) and takes it as-is. To point a run at a pod it did not name, pass `--pod <name>` explicitly; the name is then recorded in `run.env` so later steps follow it.
+
+Omitting `--run` is a **loud failure**, not a fallback: the run dir is not guessed and another run's state is never adopted.
 
 ---
 
@@ -111,7 +135,14 @@ cd suanova-skills
 # 2. Create the entry in ~/.claude/skills/ (skill name = directory name)
 mkdir -p ~/.claude/skills/cubestack-install
 ln -s "$PWD/dev/plugin/cubestack/cubestack-install.md" ~/.claude/skills/cubestack-install/SKILL.md
+# 3. Link the scripts too — the skill is script-backed and cannot run without them
+ln -s "$PWD/dev/plugin/cubestack/scripts" ~/.claude/skills/cubestack-install/scripts
 ```
+
+> **Both symlinks are required.** The skill drives deterministic scripts that live in
+> `scripts/` beside the markdown. Only `SKILL.md` is loaded as the skill body, so without
+> the second symlink the scripts are not reachable at the path the skill invokes them by
+> (`<skill-base>/scripts/<name>`) and every step fails immediately.
 
 After installing via symlink, edits to the skill file take effect on the **next message** — no restart needed.
 
@@ -120,7 +151,9 @@ After installing via symlink, edits to the skill file take effect on the **next 
 ```bash
 mkdir -p ~/.claude/skills/cubestack-install
 cp dev/plugin/cubestack/cubestack-install.md ~/.claude/skills/cubestack-install/SKILL.md
+cp -R dev/plugin/cubestack/scripts ~/.claude/skills/cubestack-install/scripts
 ```
+(Unlike the symlink form, a copy must be repeated after every change to the scripts.)
 
 ---
 

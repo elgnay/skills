@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# configure — write cluster.conf in the installer pod from a local values file.
+#
+# This is the credential path, and the script owns every hazard in it:
+#   validate locally  -> refuse `***` artifacts BEFORE anything crosses the wire
+#   chmod 600         -> the values file never lands world-readable
+#   kubectl cp        -> the ONLY sanctioned way to move a secret into the pod
+#   remove on exit    -> an EXIT trap shreds the pod-side copy even on failure
+#   byte-gate         -> re-read the config from disk and refuse if `***` landed
+#
+# The model never writes a credential with sed/echo/heredoc (the tool layer
+# redacts those to `***`), never authors the rewriter (it is a repo file now),
+# and never has to read the ~39 KB cluster.conf.example.
+#
+# Idempotent: an existing cluster.conf is regenerated IN PLACE. It is never
+# re-copied from the example, which would wipe Ceph/MetalLB/NODES written by a
+# previous attempt.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CONF_DIR="/opt/cubestack-installer/deployments/config"
+CONF_NAME="cluster.conf"
+POD_ARG=""
+VALUES=""
+DRY_RUN=0
+
+usage() {
+  cat <<'USAGE'
+configure --values <file> [--pod NAME] [--run ID] [--conf-name cluster.conf]
+  --values FILE   local shell-assignment file (mode 600). Every line must be
+                  KEY='value' with a key from the allow-list; no `***` anywhere.
+  --run ID        the run this config belongs to (default: this run's id)
+  --pod NAME      installer pod (default: this run's, <prefix>-<run-id>)
+  --conf-name N   config file under deployments/config/ (default cluster.conf)
+  --dry-run       validate and print the resolved plan, then stop WITHOUT
+                  writing cluster.conf. Use this to exercise the script against
+                  a live pod: a real run rewrites the pod's config in place and
+                  will clobber real credentials with whatever the values file
+                  carries.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --values)    VALUES="${2:-}"; shift 2 ;;
+    --run)       cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)       POD_ARG="${2:-}"; shift 2 ;;
+    --conf-name) CONF_NAME="${2:-}"; shift 2 ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+[ -n "$VALUES" ] || cs_usage_fail "--values is required"
+cs_budget_guard
+cs_kubeconfig_guard
+
+# --- local validation (before anything crosses the wire) --------------------
+cs_values_lint "$VALUES" SSH_PW NODES_MASTER MINIO_EP MINIO_AK MINIO_SK
+
+# --- pod --------------------------------------------------------------------
+cs_pod_require "$POD_ARG"
+
+# --- dry run ----------------------------------------------------------------
+# Stops BEFORE anything mutates the pod: no example-seeding, no cp, no rewrite.
+# Deliberately placed after the pod lookup so it still proves the pod and the
+# values file are usable, which is what makes it useful against a live pod.
+if [ "$DRY_RUN" -eq 1 ]; then
+  if cs_pod_exec "$CS_POD" bash -c "test -f $CONF_DIR/$CONF_NAME" >/dev/null 2>&1; then
+    CONF_STATE=present
+  else
+    CONF_STATE=absent
+  fi
+  cs_note "dry run — nothing will be written"
+  cs_note "  pod        $CS_POD"
+  cs_note "  config     $CONF_DIR/$CONF_NAME ($CONF_STATE)"
+  cs_note "  values     $VALUES"
+  cs_note "  keys       ${CS_VALUES_KEYS# }"
+  cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD"
+fi
+
+# Regenerate in place; seed from the example ONLY when absent. Re-copying the
+# example over an existing config would silently discard Ceph/MetalLB/NODES.
+if ! cs_pod_exec "$CS_POD" bash -c "test -f $CONF_DIR/$CONF_NAME" >/dev/null 2>&1; then
+  if ! cs_logged kubectl -n "$CS_NS" exec "$CS_POD" -- \
+       bash -c "cp $CONF_DIR/${CONF_NAME}.example $CONF_DIR/$CONF_NAME"; then
+    cs_fail E_CONF_FIELD_MISSING "conf=$CONF_NAME" recover=stop-report:user \
+      hint="neither $CONF_NAME nor its .example exists in the pod"
+  fi
+fi
+
+# The rewriter is re-copied UNCONDITIONALLY. A stale copy left by an older run
+# must never be able to execute — the pod's /tmp does not survive a recreate.
+cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/cubestack-apply-conf.py" \
+  "$CS_NS/$CS_POD:/tmp/cubestack-apply-conf.py" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the rewriter into the pod"
+
+# Script-scoped, NOT the bare /tmp/cubestack-values.conf. The skill documents
+# Steps 4 and 5 as parallel, and fetch-offline copies its own values file into
+# the same pod: on one shared path each script's cleanup `rm -f` deletes the file
+# the other is about to `source`, and a half-written copy is sourceable as a
+# truncated one — a wrong secret rather than a visible error. pod-down shreds the
+# whole family.
+POD_VALUES="/tmp/cubestack-values.$CS_SCRIPT.conf"
+cs_logged kubectl -n "$CS_NS" cp "$VALUES" \
+  "$CS_NS/$CS_POD:$POD_VALUES" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the values file into the pod"
+
+# Shred the pod-side values file on ANY exit path, including failure. This is a
+# cs_cleanup hook rather than a `trap ... EXIT` because installing a second EXIT
+# trap would replace the verdict trap that cs_init installed.
+cs_cleanup() {
+  [ -n "${CS_POD:-}" ] || return 0
+  kubectl -n "$CS_NS" exec "$CS_POD" -- rm -f "$POD_VALUES" >/dev/null 2>&1 || true
+}
+
+# --- rewrite ----------------------------------------------------------------
+out="$(cs_pod_exec "$CS_POD" bash -c "
+  set -a; . $POD_VALUES; set +a
+  python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
+rc=$?
+
+case "$rc" in
+  0) ;;
+  10|1) cs_fail E_CONF_FIELD_MISSING "conf=$CONF_NAME" recover=stop-report:user \
+          hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+  11|12|13) # The key list embedded in recover= is sanitized to [A-Z_,] before it
+          # goes in. The raw rewriter output carries newlines and prose, and a
+          # verb containing whitespace is unparseable — the contract's whole
+          # guarantee is that a recover= value is a single whitespace-free token.
+          keys="$(printf '%s' "$out" | grep -m1 '^FAIL:' | sed 's/.*missing: //' \
+                  | tr -c 'A-Z_,' '\n' | tr -d '\n' | cut -c1-80)"
+          case "$keys" in ''|*[!A-Z_,]*) keys=all ;; esac
+          cs_fail E_CONF_VALUES_MISSING "conf=$CONF_NAME" \
+          recover="fix-values:$VALUES:$keys" \
+          hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+  *) cs_fail E_INTERNAL "rc=$rc" recover=stop-report:user \
+          hint="rewriter failed: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
+esac
+applied="$(printf '%s' "$out" | grep -m1 '^applied:' | sed 's/^applied: //')"
+
+# --- byte-gate --------------------------------------------------------------
+# The automated approval gate that replaces a human diff review: a diff can
+# look right while the bytes on disk hold `***`.
+#
+# The remote side prints an explicit verdict and always exits 0, because both
+# obvious shorthands lie here:
+#
+#   * folding kubectl's stderr in (cs_pod_exec) turns the CLEAN case into
+#     apparent evidence — `grep -q` misses, exits 1, kubectl reports
+#     `command terminated with exit code 1`, and the caller sees a non-empty
+#     string. That made this gate fail on every run, clean or not.
+#   * testing the exit status instead cannot tell a clean config from a
+#     transport failure (both surface as "no output"), so an unreachable pod
+#     would silently PASS the one check that exists to catch a leaked secret.
+#
+# So anything that is not an explicit GATE_CLEAN is a failure.
+gate="$(cs_pod_exec_out "$CS_POD" bash -c "
+  if [ ! -f $CONF_DIR/$CONF_NAME ]; then echo GATE_NOFILE; exit 0; fi
+  if grep -E '^(SSH_DEFAULT_PASSWORD|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY|CEPH_KEYRING|CEPHFS_KEYRING)=' $CONF_DIR/$CONF_NAME | grep -qF '***'; then
+    echo GATE_LEAK
+  else
+    echo GATE_CLEAN
+  fi" | tail -1)"
+case "$gate" in
+  GATE_CLEAN) ;;
+  GATE_LEAK) cs_fail E_CONF_REDACTED "where=conf" "conf=$CONF_NAME" \
+               recover="fix-values:$VALUES:all" \
+               hint="redaction artifacts are on disk in $CONF_NAME; do not proceed to deploy" ;;
+  GATE_NOFILE) cs_fail E_CONF_FIELD_MISSING "conf=$CONF_NAME" recover=stop-report:user \
+               hint="$CONF_NAME vanished from the pod between the rewrite and the gate" ;;
+  *) cs_fail E_POD_EXEC "pod=$CS_POD" \
+       "gate=$(printf '%s' "${gate:-empty}" | tr -c 'A-Za-z0-9._:@/+,-' '_' | cut -c1-40)" \
+       recover="rerun:pod-up" \
+       hint="could not read the byte-gate result back from the pod; refusing to assume the config is clean" ;;
+esac
+
+# Record whether external CephFS was requested, for verify to gate on.
+#
+# CEPHFS_FS IS the external-CephFS switch in the installer
+# (EXT_CEPHFS_ENABLED="${CEPHFS_FS:-}"), so an RBD-only external import never
+# runs the CephFS module and therefore never creates a CephFS StorageClass.
+# Without this record `verify --ceph` would demand one anyway and fail a
+# perfectly healthy RBD-only cluster - a false failure that then sends the
+# model to rerun:deploy, which reproduces it. Absent (older run dir): verify
+# keeps requiring it, so this can only ever remove a false failure, never
+# introduce a false pass.
+case " ${CS_VALUES_KEYS} " in
+  *" CEPHFS_FS "*) cs_run_env_set "CEPHFS_REQUESTED=$(cs_q 1)" ;;
+  *)               cs_run_env_set "CEPHFS_REQUESTED=$(cs_q 0)" ;;
+esac
+
+# A config change can invalidate the SSH password env-probe already proved.
+cs_stamp_clear env-ok
+cs_stamp_write conf-ok "$CONF_NAME"
+
+cs_note "applied: $applied"
+cs_note "byte-gate: clean (no *** artifacts)"
+cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')"

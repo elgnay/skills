@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# pod-down — delete the CubeStack bootstrap installer pod.
+#
+# The pod is deploy tooling only: once the cluster is verified the pod has no
+# ongoing role, and leaving it running wastes a node's ~483MB image plus the
+# pod's resources. But until the cluster IS verified the pod is the only place
+# the deploy log and admin.conf exist — deleting it early destroys the evidence
+# needed to diagnose and recover.
+#
+# That rule is mechanical here rather than prose: without a verify-ok stamp in
+# the run dir this refuses (E_POD_DELETE_UNSAFE), and --force is the deliberate
+# override. The delete is idempotent — "already gone" is a success, not an error.
+#
+# The pod's /tmp/cubestack-values.conf holds live credentials, so it is shredded
+# before the pod goes away.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+usage() {
+  cat <<'USAGE'
+pod-down [options]
+  --run ID     the run being cleaned up (default: this run's id)
+  --pod NAME   delete this pod (default: this run's, <prefix>-<run-id>)
+  --force      delete without a verify-ok stamp (the cluster was not verified)
+  -h, --help   this text
+USAGE
+}
+
+POD_OPT=""
+FORCE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)   cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)   POD_OPT="${2:-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+cs_budget_guard
+
+# The safety gate runs before anything touches the cluster: it is a local file
+# check, and "never delete the pod before the cluster is verified" must hold even
+# when the cluster is unreachable.
+if [ "$FORCE" != 1 ] && [ -z "$(cs_stamp_read verify-ok)" ]; then
+  cs_fail E_POD_DELETE_UNSAFE recover=rerun:verify \
+    hint="no verify-ok stamp in the run dir; the pod still holds the deploy log and admin.conf (use --force to delete anyway)"
+fi
+
+cs_kubeconfig_guard
+
+# A missing run id is a usage error, NOT "nothing to delete". Reporting
+# `already=1` for it would be a success verdict for a cleanup that never
+# identified a pod — the one shape of wrong answer this contract exists to
+# prevent. "The pod is already gone" is a different case, checked below.
+if [ -n "$POD_OPT" ]; then
+  TARGET="$POD_OPT"
+else
+  TARGET="$(cs_pod_resolve "")" || cs_usage_fail \
+    "no run id — pass --run <run-id> (preflight prints it as run=) or --pod <name>"
+fi
+
+# The local copy of the values file is a credential; it goes away either way.
+rm -f "$(cs_run_dir)/values.conf" 2>/dev/null || true
+
+if ! kubectl -n "$CS_NS" get pod "$TARGET" >/dev/null 2>&1; then
+  cs_note "pod $TARGET is already gone"
+  cs_ok "pod=$TARGET" "deleted=0" "already=1"
+fi
+
+# Shred the credentials the config and fetch steps left behind, then remove each
+# file regardless of whether the filesystem supports shred.
+#
+# A glob, because those steps name their copy /tmp/cubestack-values.<script>.conf
+# so that Steps 4 and 5 can run in parallel without deleting each other's file.
+# The bare path is still covered: an older script version may have left one, and
+# this is the last chance to remove it before the pod goes.
+if cs_pod_ready "$TARGET"; then
+  cs_logged kubectl -n "$CS_NS" exec "$TARGET" -- bash -c \
+    'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf; do
+       [ -f "$f" ] || continue
+       shred -u "$f" 2>/dev/null || rm -f "$f"
+     done'
+else
+  cs_note "pod $TARGET is not Ready; skipping the values-file shred (deletion removes it anyway)"
+fi
+
+cs_logged kubectl -n "$CS_NS" delete pod "$TARGET" --wait=false
+
+# Bounded confirm: --wait=false returns before the kubelet has finished
+# terminating, so a bare "delete returned" is not "gone". Through cs_wait_cmd so
+# a signal interrupts the wait rather than being deferred behind it, and with
+# the redirect inside the backgrounded child so such a signal still reports
+# E_INTERRUPTED on stderr instead of into /dev/null.
+quiet() { "$@" >/dev/null 2>&1; }
+cs_wait_cmd quiet kubectl -n "$CS_NS" wait --for=delete "pod/$TARGET" --timeout=60s || true
+
+if kubectl -n "$CS_NS" get pod "$TARGET" >/dev/null 2>&1; then
+  cs_note "pod $TARGET is still terminating (bounded wait expired); the delete was accepted"
+fi
+
+cs_ok "pod=$TARGET" "deleted=1" "already=0"

@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# preflight — resolve every Step 0 prerequisite against the live cluster.
+#
+# READ-ONLY. Re-runnable at any time; the instant the user changes one answer,
+# run it again. This replaces the old "resolve, then re-resolve only what
+# changed" prose: the resolution rules are deterministic and live here, not in
+# the model's judgement.
+#
+# It never chooses for the user on things the user stated, and never presents a
+# menu where a rule exists:
+#   subnet -> the one with the most nodes able to host the requested shape
+#             (ties break on the lexicographically lowest subnet label)
+#   NAD    -> the one bound to that subnet
+#   index  -> first free cubestack<N>, across VMs *and* pools
+#
+# Writes <run-dir>/run.env (resolved values, NON-SECRET) and prints a confirm
+# block for the user.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+usage() {
+  cat <<'USAGE'
+preflight [options]
+  --nodes N        node count (default 1)
+  --owner USER     owner label (default $USER)
+  --image IMG      golden image (default ubuntu-22.04-server-amd64-img)
+  --cp N           vCPU per VM (default 8)
+  --mem GI         RAM GiB per VM (default 24)
+  --disk GI        root disk GiB (default 80)
+  --subnet LABEL   force a subnet label instead of auto-selecting
+  --nad NAME       force a NetworkAttachmentDefinition
+  --expose MODE    nodeport (default) | metallb
+  --pool-range R   MetalLB range, only meaningful with --expose metallb
+  --index N        force the cubestack<N> index
+  --harbor FQDN    Harbor endpoint (default harbor.isuanova.com)
+  --minio-ep URL   MinIO endpoint for the offline fetch
+  --external-ceph  mark the run as importing an external Ceph Provider
+  --run ID         pin the run id instead of deriving it from the target
+                   (default: cubestack<N>, the resolved target). Every other
+                   script takes the same flag; pass it on, or two installs
+                   running at the same time will share state.
+  -h, --help       this text
+USAGE
+}
+
+NODES=1
+OWNER="${USER:-$(id -un)}"
+IMAGE="$CS_IMAGE_GOLDEN_DEFAULT"
+CP=8
+MEM_GI=24
+DISK_GI=80
+SUBNET=""
+NAD=""
+EXPOSE="nodeport"
+POOL_RANGE=""
+INDEX=""
+HARBOR="$CS_HARBOR_DEFAULT"
+MINIO_EP=""
+EXTERNAL_CEPH=0
+RUN_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --nodes)   NODES="${2:-}"; shift 2 ;;
+    --owner)   OWNER="${2:-}"; shift 2 ;;
+    --image)   IMAGE="${2:-}"; shift 2 ;;
+    --cp)      CP="${2:-}"; shift 2 ;;
+    --mem)     MEM_GI="${2:-}"; shift 2 ;;
+    --disk)    DISK_GI="${2:-}"; shift 2 ;;
+    --subnet)  SUBNET="${2:-}"; shift 2 ;;
+    --nad)     NAD="${2:-}"; shift 2 ;;
+    --expose)  EXPOSE="${2:-}"; shift 2 ;;
+    --pool-range) POOL_RANGE="${2:-}"; shift 2 ;;
+    --index)   INDEX="${2:-}"; shift 2 ;;
+    --harbor)  HARBOR="${2:-}"; shift 2 ;;
+    --minio-ep) MINIO_EP="${2:-}"; shift 2 ;;
+    --external-ceph) EXTERNAL_CEPH=1; shift ;;
+    --run)     RUN_ID="${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+for v in NODES CP MEM_GI DISK_GI; do
+  eval "n=\${$v}"
+  cs_kv_nonnumeric "$n" && cs_usage_fail "$v must be a positive integer (got '$n')"
+  [ "$n" -gt 0 ] || cs_usage_fail "$v must be greater than zero"
+done
+case "$EXPOSE" in nodeport|metallb) ;; *) cs_usage_fail "--expose must be nodeport or metallb" ;; esac
+if [ "$EXPOSE" = "metallb" ] && [ -z "$POOL_RANGE" ]; then
+  cs_usage_fail "--expose metallb needs --pool-range <start>-<end>"
+fi
+
+# The budget is consumed AFTER the run id is known (below), so preflight's
+# attempt counter lands in the run dir it actually belongs to. Consuming it here
+# would charge every run's preflight to `runs/default/attempts`.
+cs_kubeconfig_guard
+
+# --- subnet -----------------------------------------------------------------
+# Deterministic: the subnet with the most nodes whose allocatable CPU/RAM can
+# host the requested shape. Ties break on the lexicographically lowest label.
+if [ -z "$SUBNET" ]; then
+  NODE_ROWS="$(kubectl get nodes \
+    -o custom-columns='NAME:.metadata.name,SUBNET:.metadata.labels.kubevirt\.io/subnet,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory' \
+    --no-headers 2>/dev/null)"
+  SUBNET="$(printf '%s\n' "$NODE_ROWS" | awk -v cp="$CP" -v mem="$MEM_GI" '
+    function togi(s){ if(s~/Ti$/){sub(/Ti$/,"",s);return s*1024}
+                     if(s~/Gi$/){sub(/Gi$/,"",s);return s+0}
+                     if(s~/Mi$/){sub(/Mi$/,"",s);return s/1024}
+                     if(s~/Ki$/){sub(/Ki$/,"",s);return s/1048576}
+                     return s/1073741824 }
+    function toc(s){ if(s~/m$/){sub(/m$/,"",s);return s/1000} return s+0 }
+    { if ($2=="" || $2=="<none>") next
+      if (toc($3)>=cp && togi($4)>=mem) good[$2]++ }
+    END { best=""; bestn=-1
+          for (s in good)
+            if (good[s]>bestn || (good[s]==bestn && (best=="" || s<best))) { bestn=good[s]; best=s }
+          if (best!="") print best }')"
+  if [ -z "$SUBNET" ]; then
+    cs_fail E_SUBNET_UNRESOLVED "cp=$CP" "mem=${MEM_GI}Gi" recover=stop-report:admin \
+      hint="no node carries a kubevirt.io/subnet label with room for the requested shape"
+  fi
+fi
+
+# --- NAD --------------------------------------------------------------------
+if [ -z "$NAD" ]; then
+  NADS="$(kubectl -n "$CS_NS" get network-attachment-definitions -o name 2>/dev/null \
+          | sed 's|^.*/||')"
+  if [ -z "$NADS" ]; then
+    cs_fail E_SUBNET_UNRESOLVED "subnet=$SUBNET" recover=stop-report:admin \
+      hint="no NetworkAttachmentDefinition in namespace ${CS_NS}"
+  fi
+  for cand in "$SUBNET" "$(printf '%s' "$SUBNET" | sed 's/-[0-9]*$//')"; do
+    hit="$(printf '%s\n' "$NADS" | grep -F -- "$cand" | head -1)"
+    [ -n "$hit" ] && { NAD="$hit"; break; }
+  done
+  if [ -z "$NAD" ]; then
+    n_nads="$(printf '%s\n' "$NADS" | grep -c .)"
+    if [ "$n_nads" = "1" ]; then
+      NAD="$NADS"
+    else
+      cs_fail E_SUBNET_UNRESOLVED "subnet=$SUBNET" \
+        "nads=$(printf '%s' "$NADS" | tr '\n' ',')" recover=stop-report:admin \
+        hint="no NAD matches this subnet and more than one exists; pass --nad"
+    fi
+  fi
+fi
+
+# --- free index -------------------------------------------------------------
+if [ -z "$INDEX" ]; then
+  USED_MAX="$(kubectl -n "$CS_NS" get vm,virtualmachinepool -o name 2>/dev/null \
+              | sed 's|^.*/||' | grep -E '^cubestack[0-9]+$' \
+              | sed 's/^cubestack//' | sort -n | tail -1)"
+  cs_kv_nonnumeric "${USED_MAX:-}" && USED_MAX=0
+  INDEX=$((USED_MAX + 1))
+fi
+
+# --- naming -----------------------------------------------------------------
+if [ "$NODES" -eq 1 ]; then
+  POOL=""
+  VM_NAMES="cubestack${INDEX}"
+else
+  POOL="cubestack${INDEX}"
+  VM_NAMES=""
+  i=0
+  while [ "$i" -lt "$NODES" ]; do
+    VM_NAMES="${VM_NAMES}${VM_NAMES:+,}cubestack${INDEX}-${i}"
+    i=$((i + 1))
+  done
+fi
+
+# --- run id -----------------------------------------------------------------
+# The run id IS the target: `cubestack<N>`. That single choice gives the run a
+# stable identity without giving it a shared one —
+#
+#   * re-running preflight for the same target is a cheap re-read of the same
+#     run dir (run.env, stamps, attempt counters), which is what "re-run it the
+#     instant the user changes an answer" depends on; and
+#   * two installs running at the same time resolve DIFFERENT indices (the free
+#     index is `first free cubestack<N>` across VMs and pools), so they get
+#     different run dirs and, from that, different bootstrap pod names.
+#
+# Changing an answer that does not change the target (node count, shape, expose
+# mode) keeps the same run dir; changing which cluster you are installing does
+# not, and should not. --run pins an explicit id instead (that is how a run is
+# resumed by name); CUBESTACK_RUN in the environment wins over both.
+# CUBESTACK_RUN wins over --run: it is how a caller pins the whole session to one
+# run, and a pin that could be overridden by a stray flag would be no pin at all.
+if [ -n "$RUN_ID" ] && [ -z "${CUBESTACK_RUN:-}" ]; then
+  cs_run_opt "$RUN_ID"
+elif [ -z "${CUBESTACK_RUN:-}" ]; then
+  export CUBESTACK_RUN="$HOME/.cubestack/runs/cubestack${INDEX}"
+fi
+RUN_ID="$(basename "$(cs_run_dir)")"
+mkdir -p "$(cs_run_dir)/verdict" "$(cs_run_dir)/logs" 2>/dev/null || true
+
+cs_budget_guard
+
+: > "$(cs_run_env_file)" 2>/dev/null || true
+cs_run_env_set \
+  "RUN_ID=$(cs_q "$RUN_ID")" \
+  "NODES=$(cs_q "$NODES")" \
+  "OWNER=$(cs_q "$OWNER")" \
+  "IMAGE=$(cs_q "$IMAGE")" \
+  "CP=$(cs_q "$CP")" \
+  "MEM_GI=$(cs_q "$MEM_GI")" \
+  "DISK_GI=$(cs_q "$DISK_GI")" \
+  "SUBNET=$(cs_q "$SUBNET")" \
+  "NAD=$(cs_q "$NAD")" \
+  "EXPOSE=$(cs_q "$EXPOSE")" \
+  "POOL_RANGE=$(cs_q "$POOL_RANGE")" \
+  "INDEX=$(cs_q "$INDEX")" \
+  "HARBOR=$(cs_q "$HARBOR")" \
+  "MINIO_EP=$(cs_q "$MINIO_EP")" \
+  "EXTERNAL_CEPH=$(cs_q "$EXTERNAL_CEPH")" \
+  "POOL=$(cs_q "$POOL")" \
+  "VM_NAMES=$(cs_q "$VM_NAMES")"
+
+cat <<EOF
+CONFIRM — resolved prerequisites (nothing has been created yet)
+  nodes         $NODES
+  VMs           $VM_NAMES${POOL:+   (VirtualMachinePool $POOL)}
+  shape         ${CP} vCPU / ${MEM_GI} GiB RAM / ${DISK_GI} GiB root
+  subnet        $SUBNET   (NAD $NAD)
+  owner label   owner=$OWNER
+  golden image  $IMAGE
+  expose        $EXPOSE${POOL_RANGE:+   (pool $POOL_RANGE)}
+  Harbor        $HARBOR
+  MinIO         ${MINIO_EP:-<not set — required before fetch-offline>}
+  external Ceph $([ "$EXTERNAL_CEPH" = "1" ] && echo yes || echo no)
+
+  run id        $RUN_ID        (--run $RUN_ID on every later step)
+  run dir       $(cs_run_dir)
+  pod name      $(cs_pod_name "$RUN_ID")   (unique to this run)
+
+Secrets (SSH password, MinIO keys, Ceph keyrings) are NOT resolved here and are
+never stored in the run dir — they arrive through the Write -> configure path.
+EOF
+
+cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" "nad=$NAD" \
+      "vms=$VM_NAMES" "run_dir=$(cs_run_dir)"

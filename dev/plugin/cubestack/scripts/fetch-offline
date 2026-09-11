@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# fetch-offline — seed minio.conf, then pull ~22 GiB of offline packages.
+#
+# Two things this owns that used to be prose (and both cost real minutes when
+# the model got them wrong):
+#
+#   1. `fetch-offline-from-minio.sh` reads deployments/config/minio.conf, NOT
+#      cluster.conf. A fresh pod ships only the .example, so a first run exits 1
+#      even with correct credentials already in cluster.conf — and the failure
+#      looks nothing like a credentials problem.
+#   2. minio.conf holds the MinIO secret, so it takes the same redaction hazard
+#      as cluster.conf. It is written in the pod from the example via a repo
+#      helper, never with sed/echo/heredoc, and byte-gated afterwards.
+#
+# Idempotent and resumable: `du` on offline-files/ is the only evidence a prior
+# fetch completed, so a re-run that already has the bytes skips the download
+# instead of trusting that "a previous run said done".
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CONF_DIR="/opt/cubestack-installer/deployments/config"
+REPO="/opt/cubestack-installer"
+# The full set is ~22 GiB. Below this floor the fetch did not complete; treating
+# a partial tree as done is what turns into a confusing mid-deploy failure.
+FLOOR_MIB=15000
+
+POD_ARG=""
+VALUES=""
+
+usage() {
+  cat <<'USAGE'
+fetch-offline --values <file> [--pod NAME] [--run ID] [--floor MIB]
+  --values FILE  local values file carrying MINIO_EP / MINIO_AK / MINIO_SK
+  --run ID       the run this fetch belongs to (default: this run's id)
+  --pod NAME     installer pod (default: this run's, <prefix>-<run-id>)
+  --floor MIB    consider the fetch complete above this size (default 15000)
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --values) VALUES="${2:-}"; shift 2 ;;
+    --run)    cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)    POD_ARG="${2:-}"; shift 2 ;;
+    --floor)  FLOOR_MIB="${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+[ -n "$VALUES" ] || cs_usage_fail "--values is required"
+cs_kv_nonnumeric "$FLOOR_MIB" && cs_usage_fail "--floor must be a number"
+cs_budget_guard
+cs_kubeconfig_guard
+cs_values_lint "$VALUES" MINIO_EP MINIO_AK MINIO_SK
+cs_pod_require "$POD_ARG"
+
+# Script-scoped, NOT the bare /tmp/cubestack-values.conf: the skill documents
+# Steps 4 and 5 as parallel, and configure copies its own values file into the
+# same pod. On one shared path each script's cleanup `rm -f` deletes the file the
+# other is about to `source`, and a half-written copy sources as a truncated one —
+# a wrong secret rather than a visible error. pod-down shreds the whole family.
+POD_VALUES="/tmp/cubestack-values.$CS_SCRIPT.conf"
+
+cs_cleanup() {
+  [ -n "${CS_POD:-}" ] || return 0
+  kubectl -n "$CS_NS" exec "$CS_POD" -- rm -f "$POD_VALUES" >/dev/null 2>&1 || true
+}
+
+# --- seed minio.conf --------------------------------------------------------
+# The helper is re-copied unconditionally: a stale copy from an older run must
+# never be able to execute, and the pod's /tmp does not survive a recreate.
+cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/cubestack-minio-conf.py" \
+  "$CS_NS/$CS_POD:/tmp/cubestack-minio-conf.py" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the minio helper in"
+cs_logged kubectl -n "$CS_NS" cp "$VALUES" \
+  "$CS_NS/$CS_POD:$POD_VALUES" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the values file in"
+
+# A missing example is the one case where we cannot proceed at all — it means
+# the installer image is not what we expect.
+if ! cs_pod_exec "$CS_POD" bash -c "test -f $CONF_DIR/minio.conf.example" >/dev/null 2>&1; then
+  cs_fail E_FETCH_NO_MINIO_CONF "pod=$CS_POD" recover=stop-report:user \
+    hint="neither minio.conf nor minio.conf.example exists in the pod"
+fi
+
+out="$(cs_pod_exec "$CS_POD" bash -c "
+  set -a; . $POD_VALUES; set +a
+  python3 /tmp/cubestack-minio-conf.py $CONF_DIR/minio.conf $CONF_DIR/minio.conf.example")"
+rc=$?
+case "$rc" in
+  0) ;;
+  11) cs_fail E_CONF_VALUES_MISSING "file=$VALUES" \
+        recover="fix-values:$VALUES:MINIO_EP,MINIO_AK,MINIO_SK" \
+        hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+  *) cs_fail E_FETCH_NO_MINIO_CONF "rc=$rc" recover=stop-report:user \
+        hint="could not write minio.conf: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
+esac
+
+# Byte-gate: a redacted secret fails exactly like an absent file.
+if cs_pod_exec "$CS_POD" bash -c "grep -F '***' $CONF_DIR/minio.conf" >/dev/null 2>&1; then
+  cs_fail E_CONF_REDACTED "where=minio.conf" "file=$VALUES" \
+    recover="fix-values:$VALUES:MINIO_SK" \
+    hint="redaction artifacts on disk in minio.conf; a redacted secret fails like an absent file"
+fi
+
+# --- skip if already fetched ------------------------------------------------
+size_mib() {
+  cs_pod_exec "$CS_POD" bash -c \
+    "du -sm $REPO/deployments/offline-files/ 2>/dev/null | cut -f1" 2>/dev/null | tr -d '[:space:]'
+}
+
+before="$(size_mib)"
+cs_kv_nonnumeric "$before" && before=0
+if [ "$before" -ge "$FLOOR_MIB" ]; then
+  cs_note "offline files already present (${before} MiB) — skipping the fetch"
+  cs_ok "size=${before}MiB" "skipped=1" "pod=$CS_POD"
+fi
+
+# --- fetch ------------------------------------------------------------------
+cs_note "fetching offline packages (${before} MiB present) — this takes a few minutes"
+fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
+  "cd $REPO && ./deployments/scripts/tools/offline/fetch-offline-from-minio.sh --yes 2>&1")"
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  # Classify by cause, never by exit status — "exit 1" maps to no single
+  # recovery, which is exactly why the old troubleshooting table had three
+  # indistinguishable rows for it.
+  case "$fetch_out" in
+    *SignatureDoesNotMatch*|*AccessDenied*|*'403'*|*InvalidAccessKeyId*)
+      cs_fail E_FETCH_AUTH "rc=$rc" "file=$VALUES" \
+        recover="fix-values:$VALUES:MINIO_AK,MINIO_SK" \
+        hint="MinIO rejected the credentials after minio.conf was written" ;;
+    *)
+      cs_fail E_FETCH_NETWORK "rc=$rc" "endpoint=$(cs_run_env_get MINIO_EP)" \
+        recover="rerun:fetch-offline" \
+        hint="fetch failed: $(printf '%s' "$fetch_out" | grep -iE 'error|refused|timeout|unreachable' | head -1 | cut -c1-100)" ;;
+  esac
+fi
+
+after="$(size_mib)"
+cs_kv_nonnumeric "$after" && after=0
+if [ "$after" -lt "$FLOOR_MIB" ]; then
+  cs_fail E_FETCH_PARTIAL "size=${after}MiB" "floor=${FLOOR_MIB}MiB" \
+    recover="rerun:fetch-offline" \
+    hint="fetch exited 0 but only ${after} MiB landed; the fetch is resumable, re-run it"
+fi
+
+cs_ok "size=${after}MiB" "skipped=0" "pod=$CS_POD"

@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# verify — the Step 7 verification sweep as ONE call and ONE verdict.
+#
+# READ-ONLY against both clusters. Every `kubectl` runs against the DEPLOYED
+# cluster's kubeconfig from INSIDE the installer pod:
+#   /opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf
+# so the deployed cluster is never resolved through the KubeVirt kubeconfig by
+# accident. Replaces ~10 independent `kubectl get`s whose output the model had
+# to interpret.
+#
+# Success writes the verify-ok stamp — that stamp (not a guess) is what lets a
+# later step delete the bootstrap pod.
+#
+# The re-pass on nodes is deliberate: a node that is Ready=False seconds after
+# the deploy exits is usually just kubelet settling, so one internal re-pass
+# after 30 s happens BEFORE any verdict. A second failure is final — this is a
+# re-pass, not a poll loop.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+# The deployed cluster's kubeconfig, inside the pod.
+CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
+
+usage() {
+  cat <<'USAGE'
+verify [options]
+
+  --run ID           the run being verified (default: this run's id)
+  --pod NAME         installer pod (default: this run's, <prefix>-<run-id>)
+  --expect-nodes N   expected Ready node count (default: run.env NODES)
+  --ceph             also verify the external-Ceph consumer side (rook-ceph)
+  -h, --help         this text
+
+On success writes the verify-ok stamp. Verdict: nodes=, namespaces=, services=,
+plus ceph_state=, sc=, pvc= when an external Ceph was imported.
+USAGE
+}
+
+POD_ARG=""
+EXPECT_NODES=""
+WANT_CEPH=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)          cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)          POD_ARG="${2:-}"; shift 2 ;;
+    --expect-nodes) EXPECT_NODES="${2:-}"; shift 2 ;;
+    --ceph)         WANT_CEPH=1; shift ;;
+    -h|--help)      usage; cs_ok "help=1" ;;
+    *)              cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+if [ -n "$EXPECT_NODES" ]; then
+  cs_kv_nonnumeric "$EXPECT_NODES" && cs_usage_fail "--expect-nodes must be a positive integer (got '$EXPECT_NODES')"
+  [ "$EXPECT_NODES" -gt 0 ] || cs_usage_fail "--expect-nodes must be greater than zero"
+fi
+
+cs_budget_guard
+cs_kubeconfig_guard
+# Sets CS_POD and fails through the verdict (never inside $( )).
+cs_pod_require "$POD_ARG"
+
+# kubectl against the deployed cluster, always from inside the pod.
+kget() { cs_pod_exec "$CS_POD" kubectl --kubeconfig="$KCONF" "$@"; }
+
+# One resource name per line; used where a "No resources found" notice must not
+# be mistaken for a resource.
+names_only() { grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*$'; }
+
+KCONF="$CS_KCONF"
+
+# --- the deploy actually produced a kubeconfig ------------------------------
+# Without admin.conf there is no deployed cluster to verify at all: the deploy
+# never got as far as writing one.
+if ! cs_pod_exec "$CS_POD" bash -c "test -f '$KCONF'" >/dev/null 2>&1; then
+  cs_fail E_VERIFY_NODES "pod=$CS_POD" "kubeconfig=$KCONF" recover=rerun:deploy \
+    hint="missing kubeconfig $KCONF in pod $CS_POD - the deploy did not produce a cluster to verify"
+fi
+
+# --- nodes ------------------------------------------------------------------
+# node_scan sets NODE_TOTAL / NODE_BAD / NODE_ERR as globals (no subshell).
+node_scan() {
+  NODE_OUT="$(kget get nodes --no-headers \
+    -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status' 2>&1)"
+  NODE_TOTAL=0
+  NODE_BAD=""
+  NODE_ERR=""
+  case "$NODE_OUT" in
+    *'Error from server'*|*'command terminated'*|*'Unable to connect'*|*'connection refused'*)
+      NODE_ERR=1 ;;
+  esac
+  while read -r n r; do
+    case "$n" in ''|'Error'|'error'|'Unable'|'command') continue ;; esac
+    case "$n" in *[!A-Za-z0-9._-]*) continue ;; esac
+    NODE_TOTAL=$((NODE_TOTAL + 1))
+    [ "$r" = "True" ] || NODE_BAD="$NODE_BAD${NODE_BAD:+,}$n"
+  done <<EOF
+$NODE_OUT
+EOF
+}
+
+if [ -z "$EXPECT_NODES" ]; then
+  EXPECT_NODES="$(cs_run_env_get NODES)"
+  cs_kv_nonnumeric "${EXPECT_NODES:-}" && EXPECT_NODES=""
+fi
+
+node_pass=1
+while [ "$node_pass" -le 2 ]; do
+  node_scan
+  if [ -z "$NODE_ERR" ] && [ "$NODE_TOTAL" -ge 1 ] && [ -z "$NODE_BAD" ]; then
+    if [ -z "$EXPECT_NODES" ] || [ "$NODE_TOTAL" -eq "$EXPECT_NODES" ]; then
+      break
+    fi
+  fi
+  # One internal re-pass: kubelet may still be settling right after the deploy.
+  if [ "$node_pass" -eq 1 ]; then
+    sleep 30
+  fi
+  node_pass=$((node_pass + 1))
+done
+
+if [ -n "$NODE_ERR" ]; then
+  cs_fail E_VERIFY_NODES "pod=$CS_POD" recover=rerun:verify \
+    hint="the deployed cluster's API is unreachable from the pod via $KCONF"
+fi
+if [ "$NODE_TOTAL" -eq 0 ]; then
+  cs_fail E_VERIFY_NODES "nodes=0" recover=rerun:verify \
+    hint="the deployed cluster reports no nodes at all"
+fi
+if [ -n "$NODE_BAD" ]; then
+  cs_fail E_VERIFY_NODES "nodes=$NODE_TOTAL" "notready=$NODE_BAD" recover=rerun:verify \
+    hint="these nodes are NotReady after a 30s re-pass; the deploy may still be finishing"
+fi
+if [ -n "$EXPECT_NODES" ] && [ "$NODE_TOTAL" -ne "$EXPECT_NODES" ]; then
+  cs_fail E_VERIFY_NODES "nodes=$NODE_TOTAL" "expect=$EXPECT_NODES" recover=rerun:verify \
+    hint="node count does not match the resolved plan"
+fi
+
+# --- namespaces -------------------------------------------------------------
+NS_LIST="$(kget get ns --no-headers -o custom-columns='N:.metadata.name' 2>&1 | names_only)"
+NS_COUNT=0
+while read -r n; do
+  [ -n "$n" ] || continue
+  NS_COUNT=$((NS_COUNT + 1))
+done <<EOF
+$NS_LIST
+EOF
+
+# Is this run an external-Ceph consumer? run.env holds the resolved plan.
+CEPH_RUN=0
+[ "$(cs_run_env_get EXTERNAL_CEPH)" = "1" ] && CEPH_RUN=1
+CEPH_CHECK=0
+[ "$WANT_CEPH" = "1" ] && [ "$CEPH_RUN" = "1" ] && CEPH_CHECK=1
+
+NS_WANT="default,kube-system"
+[ "$CEPH_CHECK" = "1" ] && NS_WANT="$NS_WANT,rook-ceph"
+NS_MISSING=""
+OLDIFS="$IFS"
+IFS=,
+set -f
+for want in $NS_WANT; do
+  printf '%s\n' "$NS_LIST" | grep -qxF -- "$want" || NS_MISSING="$NS_MISSING${NS_MISSING:+,}$want"
+done
+set +f
+IFS="$OLDIFS"
+if [ -n "$NS_MISSING" ]; then
+  cs_fail E_VERIFY_NAMESPACE "namespaces=$NS_MISSING" "found=$NS_COUNT" recover=rerun:verify \
+    hint="expected namespaces are absent from the deployed cluster"
+fi
+
+# --- key services -----------------------------------------------------------
+SVC_LIST="$(kget get svc -A --no-headers \
+  -o custom-columns='NS:.metadata.namespace,N:.metadata.name' 2>&1 \
+  | awk 'NF==2 && $1 ~ /^[A-Za-z0-9._-]+$/ && $2 ~ /^[A-Za-z0-9._-]+$/ {print $2}' \
+  | sort -u | tr '\n' ',' | sed 's/,$//')"
+
+HAS_REGISTRY=0
+if printf '%s\n' "$SVC_LIST" | tr ',' '\n' | grep -qxF 'registry'; then
+  HAS_REGISTRY=1
+fi
+if [ "$HAS_REGISTRY" -ne 1 ]; then
+  cs_fail E_VERIFY_SERVICE "services=${SVC_LIST:--}" recover=rerun:verify \
+    hint="the cluster's registry Service is absent - the registry module did not complete"
+fi
+
+# Envoy Gateway is optional (ENVOY_GATEWAY_ENABLED can be off), and its
+# data-plane Service only exists once a Gateway resource exists. So it is
+# required only when the deployed cluster really is running a Gateway: gating on
+# an addon that may legitimately not be there is exactly the false-negative trap
+# the `-l owner=` poll fell into.
+ENVOY_SVC="$(printf '%s\n' "$SVC_LIST" | tr ',' '\n' | grep -F 'envoy' | head -1)"
+ENVOY_EXPECT=0
+if [ -z "$ENVOY_SVC" ]; then
+  # names_only first: the NotFound error text itself names the CRD, so matching
+  # before filtering would report "installed" for a cluster without Gateway API.
+  GW_CRD="$(kget get crd gatewayclasses.gateway.networking.k8s.io --no-headers \
+            -o custom-columns='N:.metadata.name' 2>&1 | names_only)"
+  case "$GW_CRD" in
+    *gatewayclasses*)
+      GW_ANY="$(kget get gateway -A --no-headers -o custom-columns='N:.metadata.name' 2>&1 | names_only | head -1)"
+      [ -n "$GW_ANY" ] && ENVOY_EXPECT=1
+      ;;
+  esac
+fi
+if [ -z "$ENVOY_SVC" ] && [ "$ENVOY_EXPECT" = "1" ]; then
+  cs_fail E_VERIFY_SERVICE "services=${SVC_LIST:--}" recover=rerun:verify \
+    hint="a Gateway exists but no envoy data-plane Service does; Envoy Gateway is not healthy"
+fi
+SERVICES_REPORT="${SVC_LIST:--}"
+
+# --- external Ceph consumer side --------------------------------------------
+CEPH_STATE=""
+SC_REPORT=""
+PVC_REPORT=""
+CEPH_USERS=""
+if [ "$CEPH_CHECK" = "1" ]; then
+  # 1. CephConnection + ClientProfile must BOTH exist. The ClientProfile is what
+  #    makes ceph-csi-operator generate the clusterID->monitors config.json;
+  #    without it the provisioner fails with `failed-to-fetch-monitor-list` and
+  #    every PVC hangs Pending forever (the 2026-09-09 incident).
+  CEPH_CONN="$(kget -n rook-ceph get cephconnection --no-headers \
+                -o custom-columns='N:.metadata.name' 2>&1 | names_only | tr '\n' ',' | sed 's/,$//')"
+  CLIENT_PROF="$(kget -n rook-ceph get clientprofile --no-headers \
+                -o custom-columns='N:.metadata.name' 2>&1 | names_only | tr '\n' ',' | sed 's/,$//')"
+  if [ -z "$CEPH_CONN" ] || [ -z "$CLIENT_PROF" ]; then
+    cs_fail E_VERIFY_CEPH_PROFILE "cephconnection=${CEPH_CONN:--}" "clientprofile=${CLIENT_PROF:--}" \
+      recover=stop-report:user \
+      hint="BOTH CephConnection and ClientProfile must exist; without the ClientProfile ceph-csi-operator never writes the clusterID->monitors config and every PVC hangs Pending forever with failed-to-fetch-monitor-list"
+  fi
+
+  # 2. CephCluster must reach STATE=Connected. An external-mode CephCluster
+  #    reports Connected, NEVER Ready - do not gate on Ready. Poll 30s x 10.
+  ceph_wait=0
+  CEPH_STATE=""
+  while [ "$ceph_wait" -lt 11 ]; do
+    CEPH_STATE="$(kget -n rook-ceph get cephcluster --no-headers \
+      -o custom-columns='NAME:.metadata.name,STATE:.status.state' 2>&1 \
+      | awk 'NF==2 && $1 ~ /^[A-Za-z0-9._-]+$/ && $2 ~ /^[A-Za-z]+$/ {print $2; exit}')"
+    [ "$CEPH_STATE" = "Connected" ] && break
+    ceph_wait=$((ceph_wait + 1))
+    [ "$ceph_wait" -lt 11 ] && sleep 30
+  done
+  if [ "$CEPH_STATE" != "Connected" ]; then
+    cs_fail E_CEPH_CONNECTING "ceph_state=${CEPH_STATE:-unknown}" recover=rerun:verify \
+      hint="an external-mode CephCluster must reach Connected (it never reports Ready); check the Provider mon path after 300s"
+  fi
+
+  # 3. StorageClasses provisioned from the external Ceph. Match the documented
+  #    names first, then the CSI provisioner family - the installer's names
+  #    follow the RBD/CephFS driver, not a fixed string.
+  SC_LINES="$(kget get sc --no-headers -o custom-columns='NAME:.metadata.name,PROV:.provisioner' 2>&1)"
+  RBD_SC="$(printf '%s\n' "$SC_LINES" | awk 'NF==2 && $1 ~ /^[A-Za-z0-9._-]+$/ &&
+      ($1 == "ceph-rbd" || $1 ~ /^ceph-rbd/ || $1 == "ceph-block" || $2 ~ /rbd[.]csi[.]ceph[.]com$/) {print $1; exit}')"
+  FS_SC="$(printf '%s\n' "$SC_LINES" | awk 'NF==2 && $1 ~ /^[A-Za-z0-9._-]+$/ &&
+      ($1 == "cephfs" || $1 ~ /^cephfs/ || $2 ~ /cephfs[.]csi[.]ceph[.]com$/) {print $1; exit}')"
+  # CephFS is a separate switch in the installer (CEPHFS_FS), so an RBD-only
+  # external import legitimately has no CephFS StorageClass. Demand it only when
+  # the values file asked for it. Unset (a run dir older than this key) keeps
+  # requiring it, so an unknown is never a false pass - only a known 0 is.
+  CEPHFS_REQ="$(cs_run_env_get CEPHFS_REQUESTED)"
+  [ -n "$CEPHFS_REQ" ] || CEPHFS_REQ=1
+  if [ -z "$RBD_SC" ] || { [ "$CEPHFS_REQ" = "1" ] && [ -z "$FS_SC" ]; }; then
+    # rerun:deploy, not rerun:configure: configure only writes cluster.conf, it
+    # does not create StorageClasses. Re-running it regenerates the same config
+    # and reproduces this failure. The Ceph import is a deploy step. (If the
+    # real cause is CEPH_CSI_ENABLED being false, the follow-up run fails the
+    # same way and the model stops rather than looping - the failure is
+    # reported honestly instead of being papered over.)
+    cs_fail E_CEPH_SC_MISSING "ceph_rbd=${RBD_SC:--}" "cephfs=${FS_SC:--}" recover=rerun:deploy \
+      hint="the external Ceph StorageClasses are absent - the import did not run or CEPH_CSI_ENABLED was not true"
+  fi
+  SC_REPORT="$RBD_SC,$FS_SC"
+
+  # 4. CSI secrets carry the Provider user in userID - a username, not a secret.
+  #
+  # cs_pod_exec_out, not cs_pod_exec: an absent secret makes kubectl exit
+  # non-zero, and the folded-in `command terminated with exit code 1` would
+  # sanitize to a non-empty run of underscores and be reported as a real
+  # `userID`. A missing secret must read as missing, not as a garbage user.
+  for s in rook-csi-rbd-node rook-csi-rbd-provisioner rook-csi-cephfs-node rook-csi-cephfs-provisioner; do
+    uid="$(cs_pod_exec_out "$CS_POD" bash -c \
+      "kubectl --kubeconfig='$KCONF' -n rook-ceph get secret '$s' -o jsonpath='{.data.userID}' 2>/dev/null | base64 -d 2>/dev/null" \
+      | tr -c 'A-Za-z0-9._:@/+-' '_' | head -1)"
+    [ -n "$uid" ] && CEPH_USERS="$CEPH_USERS${CEPH_USERS:+,}$uid"
+  done
+
+  # 5. PVCs are reported, never gated: a WaitForFirstConsumer StorageClass
+  #    leaves a PVC Pending by design until something consumes it.
+  PVC_LINES="$(kget get pvc -A --no-headers -o custom-columns='PH:.status.phase' 2>&1)"
+  PVC_TOTAL=0
+  PVC_BOUND=0
+  while read -r ph; do
+    case "$ph" in Bound|Pending|Lost) ;; *) continue ;; esac
+    PVC_TOTAL=$((PVC_TOTAL + 1))
+    [ "$ph" = "Bound" ] && PVC_BOUND=$((PVC_BOUND + 1))
+  done <<EOF
+$PVC_LINES
+EOF
+  PVC_REPORT="$PVC_BOUND/$PVC_TOTAL"
+fi
+
+# --- stamp + verdict --------------------------------------------------------
+cs_stamp_write verify-ok "nodes=$NODE_TOTAL namespaces=$NS_COUNT services=$SERVICES_REPORT ceph=$CEPH_CHECK at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+
+set -- "nodes=$NODE_TOTAL" "namespaces=$NS_COUNT" "services=$SERVICES_REPORT"
+if [ "$CEPH_CHECK" = "1" ]; then
+  set -- "$@" "ceph_state=$CEPH_STATE" "sc=$SC_REPORT" "pvc=$PVC_REPORT"
+  [ -n "$CEPH_USERS" ] && set -- "$@" "csi_users=$CEPH_USERS"
+fi
+cs_ok "$@"

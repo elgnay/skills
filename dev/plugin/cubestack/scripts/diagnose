@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# diagnose — print a BOUNDED excerpt of the evidence behind a failure code.
+#
+# This exists so the model never has to become a log reader on the failure path.
+# A verdict carries a code; the fix is decided from that code, and the evidence
+# is only needed to confirm the guess or to write the report. Reading it here —
+# filtered to the lines that matter, capped at 40 — keeps a 40-minute deploy log
+# out of the caller's context and costs one call instead of a dozen greps.
+#
+# Given a failure code it reads the log that actually holds that code's evidence:
+# the deploy log inside the pod for deploy/Ceph codes, the named script's own log
+# in the run dir otherwise. Given a script name it reads that script's log. The
+# verdict always ends with evidence=<path> so the caller can go to the full file
+# deliberately if the excerpt is not enough.
+#
+# READ-ONLY. It never dumps an unbounded log and never touches the cluster.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CS_DEPLOY_LOG=/tmp/cubestack-cluster-install.log
+CS_LINES_DEFAULT=40
+CS_LINES_MAX=40
+
+usage() {
+  cat <<'USAGE'
+diagnose <CODE|script-name> [options]
+  --lines N        excerpt length (default 40, max 40)
+  --run ID         the run whose logs to read (default: this run's id)
+  -h, --help       this text
+
+Examples:
+  diagnose E_DEPLOY_KUBESPRAY_SSH
+  diagnose E_CEPH_CONNECTING
+  diagnose E_POD_UNSCHEDULABLE
+  diagnose deploy-wait --lines 20
+USAGE
+}
+
+NAME=""
+LINES=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lines) LINES="${2:-}"; shift 2 ;;
+    --run)   cs_run_opt "${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    -*) cs_usage_fail "unknown argument: $1" ;;
+    *)
+      if [ -n "$NAME" ]; then cs_usage_fail "only one code or script name is accepted (got '$NAME' and '$1')"; fi
+      NAME="$1"; shift ;;
+  esac
+done
+
+[ -n "$NAME" ] || cs_usage_fail "usage: diagnose <CODE|script-name> [--lines N]"
+
+if [ -z "$LINES" ]; then
+  LINES="$CS_LINES_DEFAULT"
+else
+  cs_kv_nonnumeric "$LINES" && cs_usage_fail "--lines must be a positive integer (got '$LINES')"
+  [ "$LINES" -gt 0 ] || cs_usage_fail "--lines must be greater than zero"
+  [ "$LINES" -gt "$CS_LINES_MAX" ] && LINES="$CS_LINES_MAX"
+fi
+
+cs_budget_guard
+
+# --- what to grep for, per code ---------------------------------------------
+# Each pattern is deliberately narrow: the point of diagnose is to show the ~10
+# lines that decide the fix, not the ~10,000 that describe the run.
+diag_pattern() {
+  case "$1" in
+    E_DEPLOY_KUBESPRAY_SSH)
+      echo 'ssh|UNREACHABLE|unreachable|Permission denied|port 22|Connection refused|Failed to connect|timed out' ;;
+    E_DEPLOY_PRECOND_CONF)
+      echo '\*\*\*|SSH_DEFAULT_PASSWORD|MINIO_|CEPH_|redact' ;;
+    E_DEPLOY_PRECOND_FETCH)
+      echo 'offline|fetch|No space|disk|minio|MinIO' ;;
+    E_DEPLOY_PRECOND_SSHPASS)
+      echo 'sshpass' ;;
+    E_DEPLOY_PRECOND_ENV)
+      echo 'sshpass|harbor|Harbor|minio|MinIO|subnet|SSH' ;;
+    E_DEPLOY_ALREADY_RUNNING)
+      echo 'deploy-cluster|\.deploy\.state|lock|pid' ;;
+    E_DEPLOY_LAUNCH)
+      echo 'deploy-cluster|LAUNCH|setsid|nohup|log' ;;
+    E_DEPLOY_NO_RECAP|E_DEPLOY_EXITED_NONZERO)
+      echo 'fatal:|FAILED|unreachable|TASK \[|PLAY RECAP|ERROR' ;;
+    E_DEPLOY_STILL_RUNNING)
+      echo 'TASK \[|PLAY \[|RUNNING|changed:' ;;
+    E_CEPH_CONNECTING)
+      echo 'rook|ceph|Ceph|Connecting|mon|MON|HEALTH' ;;
+    E_VERIFY_CEPH_PROFILE)
+      echo 'ClientProfile|CephConnection|clientprofile|ceph-csi|config\.json|monitor|failed-to-fetch' ;;
+    E_VERIFY_CEPH_PVC_PENDING)
+      echo 'PVC|Pending|pending|provisioner|csi|ceph' ;;
+    E_POD_UNSCHEDULABLE)
+      echo 'Scheduling|Unschedulable|FailedScheduling|nodeSelector|taint|Insufficient' ;;
+    E_POD_IMAGE_PULL)
+      echo 'ImagePull|ErrImagePull|pull|harbor|Harbor|Unauthorized' ;;
+    E_POD_NOT_READY|E_POD_EXEC|E_POD_DELETE_UNSAFE)
+      echo 'Ready|ImagePull|Scheduling|Started|Created|pod' ;;
+    E_HARBOR_DNS|E_HARBOR_UNREACHABLE)
+      echo 'harbor|Harbor|resolve|DNS|443|reach' ;;
+    E_MINIO_UNREACHABLE)
+      echo 'minio|MinIO|9000|bucket' ;;
+    E_SUBNET_UNRESOLVED)
+      echo 'subnet|NAD|network-attachment|capacity|node' ;;
+    E_NO_KUBECONFIG)
+      echo 'KUBECONFIG|kubeconfig|unreachable|refused|cluster' ;;
+    E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_CONF_FIELD_MISSING)
+      echo 'values|KEY=|field|missing|redact|\*\*\*' ;;
+    *) echo '' ;;
+  esac
+}
+
+# The script whose own log holds the code's evidence, for the local fallback.
+diag_owner() {
+  case "$1" in
+    E_POD_*)               echo pod-up ;;
+    E_DEPLOY_*)            echo deploy-wait ;;
+    E_HARBOR_*|E_MINIO_*)  echo env-probe ;;
+    E_CONF_*)              echo configure ;;
+    E_VERIFY_*|E_CEPH_*)   echo verify ;;
+    E_SUBNET_UNRESOLVED|E_NO_KUBECONFIG) echo preflight ;;
+    *)                     echo "" ;;
+  esac
+}
+
+diag_known_code() {
+  case "$1" in
+    E_NO_KUBECONFIG|E_SUBNET_UNRESOLVED|E_POD_UNSCHEDULABLE|E_POD_IMAGE_PULL|E_POD_NOT_READY| \
+    E_POD_EXEC|E_POD_DELETE_UNSAFE|E_HARBOR_DNS|E_HARBOR_UNREACHABLE|E_MINIO_UNREACHABLE| \
+    E_POOL_GATE_OFF|E_NAME_SPACE_EXHAUSTED|E_CONF_FIELD_MISSING|E_DEPLOY_LAUNCH| \
+    E_DEPLOY_EXITED_NONZERO|E_DEPLOY_KUBESPRAY_SSH|E_DEPLOY_NO_RECAP|E_DEPLOY_PRECOND_CONF| \
+    E_DEPLOY_PRECOND_FETCH|E_DEPLOY_PRECOND_SSHPASS|E_DEPLOY_PRECOND_ENV| \
+    E_DEPLOY_ALREADY_RUNNING|E_DEPLOY_STILL_RUNNING|E_VERIFY_CEPH_PROFILE| \
+    E_VERIFY_CEPH_PVC_PENDING|E_CEPH_CONNECTING|E_RETRY_BUDGET|E_LOCK_HELD| \
+    E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_USAGE|E_INTERNAL)
+      return 0 ;;
+  esac
+  return 1
+}
+
+case "$NAME" in
+  E_*) diag_known_code "$NAME" || cs_usage_fail "unknown failure code: $NAME" ;;
+  *[!a-z0-9-]*|'') cs_usage_fail "not a failure code or script name: $NAME" ;;
+  *) diag_known_code "$NAME" && cs_usage_fail "not a failure code or script name: $NAME" ;;
+esac
+
+PAT="$(diag_pattern "$NAME")"
+OWNER="$(diag_owner "$NAME")"
+if [ -z "$OWNER" ]; then
+  case "$NAME" in E_*) OWNER="" ;; *) OWNER="$NAME" ;; esac
+fi
+LOCAL=""
+[ -n "$OWNER" ] && LOCAL="$(cs_run_dir)/logs/${OWNER}.log"
+
+# Deploy/Ceph codes leave their evidence in the pod's deploy log; everything else
+# is already on the operator side.
+POD_FIRST=0
+case "$NAME" in E_DEPLOY_*|E_VERIFY_*|E_CEPH_*) POD_FIRST=1 ;; esac
+
+OUT=""
+EVID=""
+
+# The one pod exec here is a bounded read, but a kubectl exec against an
+# unresponsive API server can still block indefinitely, and a foreground child
+# defers the EXIT trap for exactly that long. cs_wait_cmd keeps it interruptible;
+# the redirect sits in the backgrounded child so a signal's verdict still
+# reaches stderr rather than the capture file.
+cs_run_mkdir
+EXEC_OUT="$(cs_run_dir)/diagnose.exec"
+diag_capture() { "$@" > "$EXEC_OUT" 2>&1; }
+
+if [ "$POD_FIRST" = 1 ]; then
+  POD_NAME="$(cs_pod_resolve "")" || POD_NAME=""
+  if [ -n "$POD_NAME" ] && cs_pod_ready "$POD_NAME"; then
+    cs_wait_cmd diag_capture cs_pod_exec "$POD_NAME" bash -c \
+      'grep -aiE "$1" "$2" 2>/dev/null | tail -n "$3"' _ "$PAT" "$CS_DEPLOY_LOG" "$LINES"
+    OUT="$(cat "$EXEC_OUT" 2>/dev/null)"
+    [ -n "$OUT" ] && EVID="$POD_NAME:$CS_DEPLOY_LOG"
+  fi
+fi
+
+if [ -z "$OUT" ] && [ -n "$LOCAL" ] && [ -f "$LOCAL" ]; then
+  OUT="$(grep -aiE "$PAT" "$LOCAL" 2>/dev/null | tail -n "$LINES")"
+  [ -n "$OUT" ] && EVID="$LOCAL"
+fi
+
+# Last resort: any log in the run dir (bounded to LINES, filenames prefixed).
+if [ -z "$OUT" ]; then
+  OUT="$(grep -aiE "$PAT" "$(cs_run_dir)"/logs/*.log 2>/dev/null | tail -n "$LINES")"
+  [ -n "$OUT" ] && EVID="$(cs_run_dir)/logs"
+fi
+
+if [ -n "$OUT" ]; then
+  printf '%s\n' "$OUT"
+  N="$(printf '%s\n' "$OUT" | grep -c '')"
+else
+  N=0
+  cs_note "no matching evidence for $NAME${EVID:+ in $EVID}"
+fi
+
+cs_ok "code=$NAME" "lines=$N" "evidence=${EVID:-none}"

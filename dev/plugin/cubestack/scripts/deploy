@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# deploy — launch the CubeStack deploy (deploy-cluster.sh) DETACHED in the pod.
+#
+# This script only starts the deploy; it never waits for it (that is
+# deploy-wait). It exists because the two things that kill a deploy are both
+# avoidable here:
+#
+#   * a precondition that is cheap to check now and expensive to discover later —
+#     a `***`-redacted credential, a half-fetched offline tree, a missing
+#     sshpass — each of which otherwise surfaces 12+ minutes in, at local_path;
+#   * an undetached launch. `nohup` + `disown` alone leave the process inside the
+#     exec's session, where a later reap kills it mid-deploy. `setsid` puts it in
+#     a new session owned by the container init, and the launch exec returns
+#     immediately (if it does not, the detach was incomplete).
+#
+# It also refuses to start a second deploy over a live one, and it is the only
+# place that decides whether to resume or to re-run with --fresh.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CS_FETCH_FLOOR_MB=15360
+CS_DEPLOY_LOG=/tmp/cubestack-cluster-install.log
+
+usage() {
+  cat <<'USAGE'
+deploy [options]
+  --run ID       the run being deployed (default: this run's id)
+  --pod NAME     bootstrap pod (default: this run's, <prefix>-<run-id>)
+  --fresh        clear .deploy.state and re-run every module
+  --vms a,b,c    target VM names (default: run.env VM_NAMES)
+  -h, --help     this text
+
+Launches deploy-cluster.sh detached in the pod and returns immediately.
+Follow with deploy-wait (run it as a background task) to watch it to completion.
+USAGE
+}
+
+POD_OPT=""
+FORCE_FRESH=0
+VMS=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)   cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)   POD_OPT="${2:-}"; shift 2 ;;
+    --fresh) FORCE_FRESH=1; shift ;;
+    --vms)   VMS="${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+cs_budget_guard
+cs_kubeconfig_guard
+cs_pod_require "$POD_OPT"
+
+# --- node set ---------------------------------------------------------------
+# The deploy's inventory state is per-pod AND per-node-set: pointing a pod that
+# was prepped for one set of VMs at a different set makes k8s_deploy report
+# "已完成,跳过" and the deploy then dies at local_path with no cluster at all.
+# Recording the set lets the only-and-exact case that needs --fresh be detected
+# mechanically instead of remembered.
+if [ -z "$VMS" ]; then
+  VMS="$(cs_run_env_get VM_NAMES)"
+fi
+if [ -z "$VMS" ]; then
+  cs_usage_fail "--vms a,b,c is required (run.env has no VM_NAMES; run preflight first)"
+fi
+NODESET="$(printf '%s\n' "$VMS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | sort | tr '\n' ',' | sed 's/,$//')"
+
+cs_run_mkdir
+NODESET_FILE="$(cs_run_dir)/deploy-nodeset"
+PREV_NODESET=""
+[ -f "$NODESET_FILE" ] && PREV_NODESET="$(cat "$NODESET_FILE" 2>/dev/null)"
+
+FRESH=0
+DRIFT=""
+if [ "$FORCE_FRESH" = 1 ]; then
+  FRESH=1
+  cs_note "--fresh requested explicitly"
+elif [ -n "$PREV_NODESET" ] && [ "$PREV_NODESET" != "$NODESET" ]; then
+  FRESH=1
+  DRIFT="node set changed ($PREV_NODESET -> $NODESET); --fresh applied automatically"
+fi
+
+# --- preconditions (cheap, inside the pod, before anything is launched) ------
+# One exec, all four probes: a 1-second precise verdict instead of a 12-minute
+# death at local_path.
+PRE="$(cs_pod_exec "$CS_POD" bash -c '
+  D=/opt/cubestack-installer/deployments
+  C="$D/config/cluster.conf"
+  if [ -f "$C" ]; then echo conf=1; else echo conf=0; fi
+  r=$(grep -cF "***" "$C" 2>/dev/null)
+  echo "redacted=${r:-0}"
+  m=$(du -sm "$D/offline-files" 2>/dev/null | cut -f1)
+  case "$m" in ""|*[!0-9]*) m=0 ;; esac
+  echo "fetch_mb=$m"
+  if command -v sshpass >/dev/null 2>&1; then echo sshpass=1; else echo sshpass=0; fi')"
+
+probe_kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | tail -1; }
+
+CONF_OK="$(probe_kv "$PRE" conf)"
+CONF_REDACTED="$(probe_kv "$PRE" redacted)"
+FETCH_MB="$(probe_kv "$PRE" fetch_mb)"
+SSHPASS="$(probe_kv "$PRE" sshpass)"
+[ -n "$CONF_OK" ] || CONF_OK=0
+[ -n "$CONF_REDACTED" ] || CONF_REDACTED=0
+[ -n "$FETCH_MB" ] || FETCH_MB=0
+[ -n "$SSHPASS" ] || SSHPASS=0
+
+if [ "$CONF_OK" != "1" ]; then
+  cs_fail E_DEPLOY_PRECOND_CONF "pod=$CS_POD" recover="fix-values:cluster.conf:SSH_DEFAULT_PASSWORD,MINIO_SECRET_KEY" \
+    hint="deployments/config/cluster.conf is missing in the pod; run the config step before deploying"
+fi
+if [ "$CONF_REDACTED" != "0" ]; then
+  cs_fail E_DEPLOY_PRECOND_CONF "pod=$CS_POD" "redacted=$CONF_REDACTED" \
+    recover="fix-values:cluster.conf:SSH_DEFAULT_PASSWORD,MINIO_SECRET_KEY" \
+    hint="cluster.conf contains *** (tool-layer redaction); rewrite it through the values file and re-verify the bytes"
+fi
+if [ "$FETCH_MB" -lt "$CS_FETCH_FLOOR_MB" ]; then
+  cs_fail E_DEPLOY_PRECOND_FETCH "pod=$CS_POD" "fetch_mb=$FETCH_MB" recover=rerun:fetch-offline \
+    hint="offline files are below the ~15GiB floor; the deploy would die at local_path - run the offline fetch first"
+fi
+if [ "$SSHPASS" != "1" ]; then
+  cs_fail E_DEPLOY_PRECOND_SSHPASS "pod=$CS_POD" recover=rerun:env-probe \
+    hint="sshpass is missing in the pod; kubespray needs it for the initial password SSH to the VMs"
+fi
+if [ -z "$(cs_stamp_read env-ok)" ]; then
+  cs_fail E_DEPLOY_PRECOND_ENV "pod=$CS_POD" recover=rerun:env-probe \
+    hint="no env-ok stamp in the run dir; the environment probe has not passed for this run"
+fi
+
+# --- never launch a second deploy over a live one ---------------------------
+RUN="$(cs_pod_exec "$CS_POD" bash -c '
+  l=$(find /opt/cubestack-installer -maxdepth 4 -name ".deploy.state.lock" 2>/dev/null | head -1)
+  if [ -n "$l" ]; then echo lock=1; else echo lock=0; fi
+  p=$(pgrep -f "[d]eploy-cluster.sh" | head -1)
+  if [ -n "$p" ]; then echo running=1; echo "pid=$p"; else echo running=0; fi')"
+LOCK="$(probe_kv "$RUN" lock)"
+RUNNING="$(probe_kv "$RUN" running)"
+RUNPID="$(probe_kv "$RUN" pid)"
+[ -n "$LOCK" ] || LOCK=0
+[ -n "$RUNNING" ] || RUNNING=0
+
+if [ "$LOCK" = "1" ] && [ "$RUNNING" = "1" ]; then
+  cs_fail E_DEPLOY_ALREADY_RUNNING "pod=$CS_POD" "pid=${RUNPID:-none}" recover=deploy-wait \
+    hint="a deploy is already running in the pod; wait for it with deploy-wait instead of starting a second"
+fi
+if [ "$LOCK" = "1" ]; then
+  cs_note "stale .deploy.state.lock present (no live deploy process); resuming"
+fi
+
+# --- launch (detached) ------------------------------------------------------
+LAUNCH_CMD="./deployments/scripts/deploy-cluster.sh"
+[ "$FRESH" = 1 ] && LAUNCH_CMD="$LAUNCH_CMD --fresh"
+
+# setsid: new session, out of the exec's kill scope. nohup + disown + </dev/null:
+# no controlling terminal, no SIGHUP, stdin cannot block. The `[d]` bracket keeps
+# pgrep from matching the wrapper that names its own target; the -x "$$" filter
+# additionally drops the wrapper's own pid, which legitimately carries the real
+# path in its argv, so pid= is the deploy's pid and not the launcher's.
+LAUNCH_SCRIPT='cd /opt/cubestack-installer && setsid nohup '"$LAUNCH_CMD"' > '"$CS_DEPLOY_LOG"' 2>&1 < /dev/null & disown; sleep 1; pid=$(pgrep -f "[d]eploy-cluster.sh" | grep -v -x "$$" | head -1); if [ -n "$pid" ]; then echo "launched pid $pid"; else echo "LAUNCH FAILED"; fi'
+
+# Through a file + cs_wait_cmd rather than `$( )`: this exec is the one place a
+# broken detach shows up as a hang, and a foreground child would defer the EXIT
+# trap (and therefore the verdict) for as long as it hangs. The redirect is on
+# the backgrounded child, not on the cs_wait_cmd call, so a signal during the
+# exec still writes its verdict to stderr instead of into the capture file.
+LAUNCH_OUT_FILE="$(cs_run_dir)/deploy.launch.out"
+launch_capture() { "$@" > "$LAUNCH_OUT_FILE" 2>&1; }
+cs_wait_cmd launch_capture cs_pod_exec "$CS_POD" bash -c "$LAUNCH_SCRIPT"
+LAUNCH_OUT="$(cat "$LAUNCH_OUT_FILE" 2>/dev/null)"
+PID="$(printf '%s\n' "$LAUNCH_OUT" | sed -n 's/^launched pid \([0-9][0-9]*\).*/\1/p' | tail -1)"
+
+if [ -z "$PID" ]; then
+  cs_fail E_DEPLOY_LAUNCH "pod=$CS_POD" recover=stop-report:user \
+    hint="deploy-cluster.sh did not stay running after a detached launch: $(printf '%s' "$LAUNCH_OUT" | tr '\n' ' ' | cut -c1-100)"
+fi
+
+# The set is recorded only once the launch is confirmed, so a failed launch does
+# not silently arm the drift detector against the next attempt.
+printf '%s\n' "$NODESET" > "$NODESET_FILE" 2>/dev/null || true
+
+[ -n "$DRIFT" ] && cs_note "$DRIFT"
+cs_note "deploy launched (pid=$PID fresh=$FRESH); watch it with deploy-wait"
+
+cs_ok "pid=$PID" "fresh=$FRESH" "log=$CS_DEPLOY_LOG"
