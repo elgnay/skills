@@ -182,8 +182,9 @@ NODES_WORKERS='worker,<hostname>,<ip>,ubuntu,-|worker,<hostname>,<ip>,ubuntu,-'
 Multi-node: the `NODES_MASTER` line plus that single `NODES_WORKERS` line. Single-node:
 omit `NODES_WORKERS` entirely — `NODES_MASTER` alone is the single master.
 
-**External Ceph** — the Provider exports an `external-ceph.env`. Point `preflight` at it, and
-that is the whole of the setup:
+**External Ceph** — the Provider's external-Ceph import guide documents an `external-ceph.env`
+in full; its §3 says to save that content verbatim under that name ("保持原样、一行不改"). Take
+the file so saved and point `preflight` at it — that is the whole of the setup:
 
 ```bash
 "$S/preflight" --nodes 1 --minio-ep http://<host>:9000 \

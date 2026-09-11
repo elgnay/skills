@@ -116,7 +116,8 @@ mon/osd/mgr itself:
 | `CEPH_MODE` | `external` | Consume an external Provider, not an in-cluster Ceph |
 
 **The recommended path is the official one: point `preflight` at the Provider's exported
-`external-ceph.env`.**
+`external-ceph.env`** — the file whose content the Provider's external-Ceph import guide
+documents, saved verbatim under that name (the guide's §3).
 
 ```bash
 "$S/preflight" --nodes 1 --minio-ep http://<host>:9000 \
