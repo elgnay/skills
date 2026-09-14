@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# env-probe — every Step 3 pre-deploy reachability check, in one call.
+#
+# READ-ONLY against the cluster (it does install sshpass inside the pod). This
+# replaces ~5+N hand-written `kubectl exec` probes with one invocation and one
+# verdict line, so the model never reads raw probe output and never mis-reads a
+# "SSH FAIL" string as something else.
+#
+# Four risk classes live in this one step and they have four DIFFERENT recovery
+# verbs, but a verdict carries one code. So the classes are checked in a FIXED
+# precedence and the first class that fails is the one reported:
+#
+#   1. pod exec works at all ................ E_POD_EXEC       rerun:pod-up
+#   2. sshpass present (install if missing) .. E_SSHPASS_INSTALL rerun:env-probe
+#   3. VM TCP port 22 ....................... E_SSH_TCP        sibling-vm:rebuild:<names>
+#   4. password SSH as the given user ....... E_SSH_AUTH       sibling-vm:rebuild:<names>
+#   5. MinIO TCP ............................ E_MINIO_UNREACHABLE stop-report:admin
+#   6. Harbor DNS then port 443 ............. E_HARBOR_DNS / E_HARBOR_UNREACHABLE
+#                                                            stop-report:admin
+#
+# Within a class the probes BATCH: two of three VMs failing SSH is one verdict
+# naming both (`vms=a,b`), because the recovery acts on the set. Fail fast on
+# the first failing CLASS, never on the first failing VM.
+#
+# The SSH password is used but never printed and never stored — the env-ok stamp
+# digests the VM set, the user, and the password's PRESENCE only.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+usage() {
+  cat <<'USAGE'
+env-probe --vms a@IP,b@IP [options]
+
+  --vms LIST        name@ip pairs, comma-separated (required)
+  --run ID          the run this probe belongs to (default: this run's id)
+  --pod NAME        installer pod (default: this run's, <prefix>-<run-id>)
+  --user USER       SSH user (default ubuntu)
+  --password PW     SSH password (default: $CUBESTACK_SSH_PASSWORD, else ubuntu)
+  --minio-ip IP     MinIO host to probe (default: from run.env MINIO_EP)
+  --minio-port P    MinIO port (default 9000)
+  --harbor FQDN     Harbor endpoint (default $CS_HARBOR_DEFAULT)
+  --harbor-port P   Harbor port (default 443)
+  -h, --help        this text
+
+Checks, in this order: pod exec, sshpass, VM port 22, password SSH, MinIO,
+Harbor. On success writes the env-ok stamp; the verdict reports how many probes
+ran so "0 of 3" can never look like OK.
+USAGE
+}
+
+VMS=""
+POD_ARG=""
+SSH_USER="ubuntu"
+SSH_PW="${CUBESTACK_SSH_PASSWORD:-ubuntu}"
+MINIO_IP=""
+MINIO_PORT="9000"
+HARBOR="$CS_HARBOR_DEFAULT"
+HARBOR_PORT="443"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vms)         VMS="${2:-}"; shift 2 ;;
+    --run)         cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)         POD_ARG="${2:-}"; shift 2 ;;
+    --user)        SSH_USER="${2:-}"; shift 2 ;;
+    --password)    SSH_PW="${2:-}"; shift 2 ;;
+    --minio-ip)    MINIO_IP="${2:-}"; shift 2 ;;
+    --minio-port)  MINIO_PORT="${2:-}"; shift 2 ;;
+    --harbor)      HARBOR="${2:-}"; shift 2 ;;
+    --harbor-port) HARBOR_PORT="${2:-}"; shift 2 ;;
+    -h|--help)     usage; cs_ok "help=1" ;;
+    *)             cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$VMS" ] || cs_usage_fail "--vms a@IP,b@IP is required"
+
+# A password the tool layer redacted to *** is not a wrong password — rebuilding
+# the VM for it would be the wrong recovery. Refuse it here, before any probe.
+if ! cs_check_redaction SSH_PW; then
+  cs_usage_fail "the SSH password carries the redaction artifact (${CS_BAD_KEYS}); pass the real value - it will not be printed"
+fi
+[ -n "$SSH_PW" ] || cs_usage_fail "--password must not be empty"
+
+if [ -z "$MINIO_IP" ]; then
+  # run.env holds the RESOLVED MinIO endpoint (non-secret); strip scheme/port.
+  MINIO_EP="$(cs_run_env_get MINIO_EP)"
+  MINIO_IP="$(printf '%s' "$MINIO_EP" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|/.*$||' -e 's|:.*$||')"
+fi
+[ -n "$MINIO_IP" ] || cs_usage_fail "--minio-ip is required (not set on the command line or in run.env)"
+
+cs_budget_guard
+cs_kubeconfig_guard
+
+# --- 1. pod exec ------------------------------------------------------------
+# cs_pod_require sets CS_POD and fails through the verdict (never inside $( )).
+cs_pod_require "$POD_ARG"
+EXEC_OUT="$(cs_pod_exec "$CS_POD" bash -c 'echo CS_EXEC_OK')"
+case "$EXEC_OUT" in
+  *CS_EXEC_OK*) ;;
+  *) cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+       hint="kubectl exec into pod $CS_POD produced no output; the pod is not usable as a bootstrap host" ;;
+esac
+CHECKED=1
+
+# --- 2. sshpass -------------------------------------------------------------
+# kubespray needs it for the initial password SSH into the VMs.
+SSHPASS_STATE="present"
+if ! cs_pod_exec "$CS_POD" bash -c 'command -v sshpass' >/dev/null 2>&1; then
+  installed=0
+  attempt=1
+  while [ "$attempt" -le 2 ]; do
+    # Noisy (apt output) — to the log file, never to stdout.
+    if cs_logged cs_pod_exec "$CS_POD" bash -c 'apt-get install -y -qq sshpass'; then
+      installed=1
+      break
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 2 ] && sleep 10
+  done
+  if [ "$installed" -ne 1 ]; then
+    cs_fail E_SSHPASS_INSTALL "pod=$CS_POD" recover="rerun:env-probe" \
+      hint="sshpass is missing and apt-get install failed twice; kubespray cannot do password SSH without it"
+  fi
+  SSHPASS_STATE="installed"
+fi
+CHECKED=$((CHECKED + 1))
+
+# --- target list ------------------------------------------------------------
+# name@ip pairs, split into two parallel comma-lists.
+VM_NAMES=""
+VM_IPS=""
+OLDIFS="$IFS"
+IFS=,
+set -f
+for entry in $VMS; do
+  [ -n "$entry" ] || continue
+  vname="${entry%@*}"
+  vip="${entry#*@}"
+  if [ -z "$vname" ] || [ -z "$vip" ] || [ "$vname" = "$vip" ]; then
+    set +f; IFS="$OLDIFS"
+    cs_usage_fail "--vms entry '$entry' is not name@ip"
+  fi
+  VM_NAMES="$VM_NAMES${VM_NAMES:+,}$vname"
+  VM_IPS="$VM_IPS${VM_IPS:+,}$vip"
+done
+set +f
+IFS="$OLDIFS"
+[ -n "$VM_NAMES" ] || cs_usage_fail "--vms carried no usable name@ip pair"
+VM_COUNT=0
+IFS=,; set -f
+for v in $VM_NAMES; do VM_COUNT=$((VM_COUNT + 1)); done
+set +f; IFS="$OLDIFS"
+
+# Background probes only ever WRITE A RESULT FILE. cs_fail must not run in a
+# subshell (it would exit only that subshell and the caller would carry on), so
+# every failure is evaluated here, in the main shell, after `wait`.
+TMPD="$(mktemp -d 2>/dev/null || printf '/tmp/cs-env-probe.%s' "$$")"
+mkdir -p "$TMPD" 2>/dev/null || true
+# Scratch cleanup goes through the cs_cleanup hook, which cs_on_exit runs BEFORE
+# it decides the verdict. Do not chain a second EXIT trap instead:
+# `trap 'rm -rf "$TMPD"; cs_on_exit' EXIT` looks like it preserves the verdict
+# trap, but the `rm` clobbers `$?` before cs_on_exit reads it — cs_on_exit then
+# sees rc=0, so a SIGTERM is reported as E_INTERNAL rc=0 rather than
+# E_INTERRUPTED signal=TERM. (Measured; the verdict still lands, but the
+# diagnosis is wrong and rc=0 reads as a clean exit.)
+cs_cleanup() { rm -rf "$TMPD" 2>/dev/null || true; }
+
+# 3 attempts over ~30 s per target.
+tcp22_probe() {  # $1 = name, $2 = ip, $3 = result file
+  n=0
+  while [ "$n" -lt 3 ]; do
+    if cs_pod_exec "$CS_POD" bash -c \
+        "timeout 3 bash -c 'echo > /dev/tcp/$2/22'" >/dev/null 2>&1; then
+      printf 'ok %s\n' "$1" > "$3"
+      return 0
+    fi
+    n=$((n + 1))
+    [ "$n" -lt 3 ] && sleep 10
+  done
+  printf 'fail %s\n' "$1" > "$3"
+}
+
+# --- 3. VM TCP 22 -----------------------------------------------------------
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  vip="$(printf '%s' "$VM_IPS" | cut -d, -f"$idx")"
+  ( tcp22_probe "$vname" "$vip" "$TMPD/tcp.$idx" ) &
+done
+set +f; IFS="$OLDIFS"
+wait
+# Collect by INDEX, never by glob. Two reasons: `set -f` above is still in
+# effect here (a glob would silently stay literal and every failure would read
+# as a pass), and a probe that never reported must count as a failure — "0 of 3
+# ran" can never masquerade as OK.
+BAD_TCP=""
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  f="$TMPD/tcp.$idx"
+  if [ ! -f "$f" ] || [ "$(awk 'NR==1{print $1}' "$f" 2>/dev/null)" != "ok" ]; then
+    BAD_TCP="$BAD_TCP${BAD_TCP:+,}$vname"
+  fi
+done
+set +f; IFS="$OLDIFS"
+if [ -n "$BAD_TCP" ]; then
+  cs_fail E_SSH_TCP "vms=$BAD_TCP" "port=22" recover="sibling-vm:rebuild:$BAD_TCP" \
+    hint="port 22 is not reachable from the pod on these VMs after 3 attempts over ~30s"
+fi
+CHECKED=$((CHECKED + VM_COUNT))
+
+# --- 4. password SSH --------------------------------------------------------
+# This is the check that delegated VM creation produced working password auth
+# (catches a redacted cloud-init passwd or a publickey-only VM).
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  vip="$(printf '%s' "$VM_IPS" | cut -d, -f"$idx")"
+  ( out="$(cs_probe_ssh "$vip" "$SSH_USER" "$SSH_PW" 3)"
+    # cs_probe_ssh merges the remote stderr (the known-hosts Warning) into its
+    # output; keep only the hostname line, and treat any error-ish remnant as a
+    # failure rather than "something printed, so it must have worked".
+    host="$(printf '%s\n' "$out" | grep -vE '^(Warning:|$)' | tail -1)"
+    case "$host" in
+      ''|*rror*|*enied*|*'command terminated'*|*'unable to'*|*'timed out'*)
+        printf 'fail %s\n' "$vname" > "$TMPD/ssh.$idx" ;;
+      *)
+        printf 'ok %s %s\n' "$vname" "$host" > "$TMPD/ssh.$idx" ;;
+    esac ) &
+done
+set +f; IFS="$OLDIFS"
+wait
+BAD_SSH=""
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  f="$TMPD/ssh.$idx"
+  if [ ! -f "$f" ] || [ "$(awk 'NR==1{print $1}' "$f" 2>/dev/null)" != "ok" ]; then
+    BAD_SSH="$BAD_SSH${BAD_SSH:+,}$vname"
+  fi
+done
+set +f; IFS="$OLDIFS"
+if [ -n "$BAD_SSH" ]; then
+  cs_fail E_SSH_AUTH "vms=$BAD_SSH" "user=$SSH_USER" recover="sibling-vm:rebuild:$BAD_SSH" \
+    hint="password SSH as $SSH_USER failed after 3 attempts; the VM did not get password auth - rebuild just these VMs"
+fi
+CHECKED=$((CHECKED + VM_COUNT))
+
+# --- 5. MinIO ---------------------------------------------------------------
+if ! cs_probe_tcp "$MINIO_IP" "$MINIO_PORT" 3; then
+  cs_fail E_MINIO_UNREACHABLE "minio=$MINIO_IP:$MINIO_PORT" recover=stop-report:admin \
+    hint="MinIO is not reachable from the pod; the offline package fetch would fail"
+fi
+CHECKED=$((CHECKED + 1))
+
+# --- 6. Harbor --------------------------------------------------------------
+# Resolve first, so "does not resolve" and "port closed" stay distinguishable.
+HARBOR_IP="$(cs_pod_exec "$CS_POD" bash -c \
+  "getent hosts $HARBOR 2>/dev/null | awk '{print \$1}' | head -1")"
+if [ -z "$HARBOR_IP" ]; then
+  HARBOR_IP="$(cs_pod_exec "$CS_POD" bash -c \
+    "python3 -c \"import socket;print(socket.gethostbyname('$HARBOR'))\" 2>/dev/null")"
+fi
+HARBOR_IP="$(printf '%s\n' "$HARBOR_IP" | grep -E '^[0-9]+\.' | head -1)"
+if [ -z "$HARBOR_IP" ]; then
+  cs_fail E_HARBOR_DNS "harbor=$HARBOR" recover=stop-report:admin \
+    hint="Harbor does not resolve from inside the pod; the installer image could not be pulled"
+fi
+if ! cs_probe_tcp "$HARBOR_IP" "$HARBOR_PORT" 3; then
+  cs_fail E_HARBOR_UNREACHABLE "harbor=$HARBOR" "ip=$HARBOR_IP" "port=$HARBOR_PORT" \
+    recover=stop-report:admin \
+    hint="Harbor resolves ($HARBOR_IP) but port $HARBOR_PORT is closed from the pod"
+fi
+CHECKED=$((CHECKED + 1))
+
+# --- stamp ------------------------------------------------------------------
+# Digest of the VM set + SSH user + password PRESENCE. Never the password, and
+# never a hash of it. Falls back to cksum where no sha is available.
+digest_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  elif command -v cksum >/dev/null 2>&1; then
+    printf '%s' "$1" | cksum | awk '{print $1}'
+  else
+    printf 'unhashable'
+  fi
+}
+PW_PRESENCE="absent"
+[ -n "$SSH_PW" ] && PW_PRESENCE="present"
+VMSET_DIGEST="$(digest_of "$VMS|$SSH_USER|$PW_PRESENCE")"
+cs_stamp_write env-ok "vms_digest=$VMSET_DIGEST user=$SSH_USER password=$PW_PRESENCE vms=$VM_COUNT sshpass=$SSHPASS_STATE"
+
+cs_ok "checked=$CHECKED" "sshpass=$SSHPASS_STATE" "vms=$VM_COUNT" "minio=ok" "harbor=ok"

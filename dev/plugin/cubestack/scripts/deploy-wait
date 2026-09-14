@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# deploy-wait — watch the detached deploy to completion and grade the result.
+#
+# RUN THIS AS A BACKGROUND TASK. A deploy takes 12-40 min (single-node) and
+# longer for multi-node, far beyond any foreground tool timeout. This script
+# blocks until the deploy process exits or its budget expires; a caller that
+# cannot run background tasks should use --chunk N and re-invoke a bounded
+# number of times instead.
+#
+# COMPLETION IS PROCESS EXIT, NOT THE BANNER. The final
+# `✅ 一键部署流程完成` banner is cosmetic and is the first thing lost when the
+# deploy is killed at the very end — a banner-keyed poll once ran ~8 min past an
+# already-finished deploy. This script keys on the process being gone and then
+# grades the log's PLAY RECAP.
+#
+# The pgrep uses the `[d]eploy-cluster.sh` bracket: the poll's own command line
+# contains the pattern, so a bare `pgrep -f deploy-cluster.sh` would match its own
+# wrapper and print RUNNING forever.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CS_DEPLOY_LOG=/tmp/cubestack-cluster-install.log
+CS_CYCLE=30            # seconds between poll cycles
+CS_DEF_SINGLE=3600     # 60 min, single-node
+CS_DEF_MULTI=5400      # 90 min, multi-node
+
+usage() {
+  cat <<'USAGE'
+deploy-wait [options]
+  --run ID          the run being waited on (default: this run's id)
+  --pod NAME        bootstrap pod (default: this run's, <prefix>-<run-id>)
+  --budget SECONDS  give up after this long (default: 3600 single-node / 5400 multi)
+  --chunk SECONDS   return after this long with running=1 instead of blocking
+  -h, --help        this text
+
+Blocks until the deploy process exits, then grades PLAY RECAP from the log.
+Designed to be run as a background task.
+USAGE
+}
+
+POD_OPT=""
+BUDGET=""
+CHUNK=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)    cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)    POD_OPT="${2:-}"; shift 2 ;;
+    --budget) BUDGET="${2:-}"; shift 2 ;;
+    --chunk)  CHUNK="${2:-}"; shift 2 ;;
+    -h|--help) usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+for v in BUDGET CHUNK; do
+  eval "n=\${$v}"
+  [ -n "$n" ] || continue
+  cs_kv_nonnumeric "$n" && cs_usage_fail "$v must be a positive integer (got '$n')"
+  [ "$n" -gt 0 ] || cs_usage_fail "$v must be greater than zero"
+done
+
+cs_budget_guard
+cs_kubeconfig_guard
+cs_pod_require "$POD_OPT"
+
+# --- budget -----------------------------------------------------------------
+if [ -z "$BUDGET" ]; then
+  NODES="$(cs_run_env_get NODES)"
+  cs_kv_nonnumeric "${NODES:-}" && NODES=1
+  if [ "$NODES" -gt 1 ]; then BUDGET="$CS_DEF_MULTI"; else BUDGET="$CS_DEF_SINGLE"; fi
+fi
+
+START=$SECONDS
+cs_run_mkdir
+POLL_OUT="$(cs_run_dir)/deploy-wait.poll"
+
+# Every pod exec goes through cs_wait_cmd and a file rather than `$( )`.
+# bash defers an EXIT trap while a FOREGROUND child runs, so a signal arriving
+# during a plain `OUT="$(kubectl exec ...)"` would hold the verdict for as long
+# as the exec blocks. `wait` is interruptible, so the verdict lands in ~1s and
+# the pod-side deploy (which is detached on purpose) is left running.
+#
+# The redirect lives in the backgrounded CHILD (poll_to_file), never on the
+# cs_wait_cmd call: `cs_wait_cmd cmd > file` redirects this shell for the whole
+# wait, and a signal's E_INTERRUPTED verdict would then be captured into the
+# file instead of reaching stderr.
+poll_to_file() { "$@" > "$POLL_OUT" 2>&1; }
+pod_exec_out() { cs_wait_cmd poll_to_file cs_pod_exec "$@"; }
+
+# (Re)read the deploy log: the last PLAY RECAP block (the banner line AND the
+# per-host summary lines under it — the values live on the summary lines, so
+# grepping the banner text alone finds nothing) plus the tail for the failing
+# task and the active module.
+fetch_evidence() {
+  pod_exec_out "$CS_POD" bash -c '
+    L='"$CS_DEPLOY_LOG"'
+    echo "###RECAP"
+    # EVERY PLAY RECAP block, each bounded FORWARD to the lines that carry the
+    # counters. kubespray is not the last thing this deploy runs — the addon
+    # modules follow it — so the recap is normally NOT at the end of the log.
+    # Taking "last recap to EOF" and then tailing that window returns the addon
+    # output instead of the recap, and grading it finds no failed=/ok= at all:
+    # a successful deploy reported as E_DEPLOY_NO_RECAP.
+    awk "/^PLAY RECAP/{s=8} s>0{print; s--}" "$L" 2>/dev/null
+    echo "###TAIL"
+    tail -n 80 "$L" 2>/dev/null'
+  EVIDENCE="$(cat "$POLL_OUT" 2>/dev/null)"
+  RECAP="$(printf '%s\n' "$EVIDENCE" | sed -n '/^###RECAP$/,/^###TAIL$/p' | sed '1d;$d')"
+  TAIL="$(printf '%s\n' "$EVIDENCE" | sed -n '/^###TAIL$/,$p' | sed '1d')"
+}
+
+# Sanitize a task/module name for a verdict value (no spaces).
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._:@/+,-' '_' | tr -s '_' | cut -c1-48; }
+
+last_task() { printf '%s\n' "$1" | grep -aE '^TASK \[' | tail -1 | sed 's/^TASK \[//; s/\].*$//'; }
+
+failing_task() {
+  printf '%s\n' "$1" | awk '/^TASK \[/{t=$0} /fatal:|FAILED!|unreachable|UNREACHABLE/{print t; exit}' \
+    | sed 's/^TASK \[//; s/\].*$//'
+}
+
+while :; do
+  pod_exec_out "$CS_POD" bash -c '
+    pgrep -f "[d]eploy-cluster.sh" >/dev/null 2>&1 && echo RUNNING || echo EXITED
+    tail -n 5 '"$CS_DEPLOY_LOG"' 2>/dev/null'
+  OUT="$(cat "$POLL_OUT" 2>/dev/null)"
+  if [ -z "$OUT" ]; then
+    POD_GONE=1
+  else
+    POD_GONE=0
+  fi
+
+  STATE="$(printf '%s\n' "$OUT" | grep -m1 -E '^(RUNNING|EXITED)$')"
+
+  if [ "$POD_GONE" = 1 ]; then
+    # An exec that yields nothing at all is a dead or vanished pod, not a quiet
+    # deploy: fail precisely instead of sleeping out the budget.
+    if ! cs_pod_ready "$CS_POD"; then
+      cs_fail E_POD_NOT_READY "pod=$CS_POD" "reason=$(cs_pod_reason "$CS_POD")" \
+        recover=rerun:pod-up hint="the bootstrap pod stopped answering mid-deploy; its log holds the deploy state"
+    fi
+  fi
+  [ -n "$STATE" ] || STATE=RUNNING
+
+  ELAPSED=$((SECONDS - START))
+  cs_logged printf '%s\n' "--- elapsed=${ELAPSED}s ${STATE}"
+  cs_logged printf '%s\n' "$OUT"
+
+  if [ "$STATE" = "EXITED" ]; then
+    fetch_evidence
+
+    # A recap is only usable when a host summary line carries failed=/ok=. A
+    # bare banner line (no counters) is not a result.
+    if ! printf '%s\n' "$RECAP" | grep -qaE 'failed=[0-9]'; then
+      cs_fail E_DEPLOY_NO_RECAP "pod=$CS_POD" "elapsed=${ELAPSED}s" recover=rerun:deploy \
+        hint="the deploy process is gone but the log has no usable PLAY RECAP; re-run deploy (it resumes from .deploy.state)"
+    fi
+
+    FAILED_MAX=0
+    UNREACH_MAX=0
+    LAST_RECAP=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      f="$(printf '%s' "$line" | sed -n 's/.*failed=\([0-9][0-9]*\).*/\1/p')"
+      u="$(printf '%s' "$line" | sed -n 's/.*unreachable=\([0-9][0-9]*\).*/\1/p')"
+      case "$f" in ''|*[!0-9]*) f=0 ;; esac
+      case "$u" in ''|*[!0-9]*) u=0 ;; esac
+      [ "$f" -gt "$FAILED_MAX" ] && FAILED_MAX="$f"
+      [ "$u" -gt "$UNREACH_MAX" ] && UNREACH_MAX="$u"
+      # The counters live on the per-host summary line, not necessarily on the
+      # last line of the block — a recap is followed by its timing table.
+      case "$line" in *ok=*) LAST_RECAP="$line" ;; esac
+    done <<EOF
+$RECAP
+EOF
+
+    OK_N="$(printf '%s' "$LAST_RECAP" | sed -n 's/.*ok=\([0-9][0-9]*\).*/\1/p')"
+    CHANGED_N="$(printf '%s' "$LAST_RECAP" | sed -n 's/.*changed=\([0-9][0-9]*\).*/\1/p')"
+    [ -n "$OK_N" ] || OK_N=0
+    [ -n "$CHANGED_N" ] || CHANGED_N=0
+    TASK="$(sanitize "$(last_task "$TAIL")")"
+
+    if [ "$FAILED_MAX" = "0" ] && [ "$UNREACH_MAX" = "0" ]; then
+      # Success even when the banner never printed: that is exactly the case the
+      # process-exit rule exists for.
+      cs_ok "recap=ok=$OK_N,changed=$CHANGED_N,failed=$FAILED_MAX" \
+            "elapsed=${ELAPSED}s" "module=${TASK:-none}" "log=$CS_DEPLOY_LOG"
+    fi
+
+    BADTASK="$(sanitize "$(failing_task "$TAIL")")"
+    # Deliberately specific: a bare `ssh` match would fire on any module whose
+    # name mentions it (k8s_sshkey, passwordless) and mislabel the failure.
+    if [ "$UNREACH_MAX" != "0" ] || printf '%s\n' "$TAIL" | grep -qaE \
+        'UNREACHABLE|unreachable=[1-9]|Permission denied|port 22|Failed to connect|Connection refused|No route to host|Host key verification'; then
+      cs_fail E_DEPLOY_KUBESPRAY_SSH "pod=$CS_POD" "recap=ok=$OK_N,changed=$CHANGED_N,failed=$FAILED_MAX,unreachable=$UNREACH_MAX" \
+        "task=${BADTASK:-none}" "elapsed=${ELAPSED}s" recover=stop-report:user \
+        hint="kubespray could not reach a VM over SSH; check the VM is running and SSH_DEFAULT_PASSWORD matches"
+    fi
+    cs_fail E_DEPLOY_EXITED_NONZERO "pod=$CS_POD" "recap=ok=$OK_N,changed=$CHANGED_N,failed=$FAILED_MAX" \
+      "task=${BADTASK:-none}" "elapsed=${ELAPSED}s" recover=stop-report:user \
+      hint="the deploy exited with failed tasks; the failing task and the log tail are in the deploy log"
+  fi
+
+  MODULE="$(sanitize "$(printf '%s\n' "$OUT" | grep -aE '^TASK \[' | tail -1 | sed 's/^TASK \[//; s/\].*$//')")"
+  cs_note "elapsed=${ELAPSED}s $STATE${MODULE:+ module=$MODULE}"
+
+  if [ -n "$CHUNK" ] && [ "$ELAPSED" -ge "$CHUNK" ]; then
+    # Bounded re-invocation mode: hand the caller a stable "still running" and let
+    # it decide whether to call again.
+    cs_ok "running=1" "elapsed=${ELAPSED}s"
+  fi
+
+  if [ "$ELAPSED" -ge "$BUDGET" ]; then
+    cs_fail E_DEPLOY_STILL_RUNNING "pod=$CS_POD" "budget=${BUDGET}s" "elapsed=${ELAPSED}s" \
+      recover=rerun:deploy-wait \
+      hint="the deploy is still running at the budget; re-run deploy-wait to keep watching (the budget is never extended silently)"
+  fi
+
+  SLEEP="$CS_CYCLE"
+  if [ -n "$CHUNK" ]; then
+    LEFT=$((CHUNK - ELAPSED))
+    [ "$LEFT" -lt "$SLEEP" ] && SLEEP="$LEFT"
+  fi
+  LEFT_B=$((BUDGET - ELAPSED))
+  [ "$LEFT_B" -lt "$SLEEP" ] && SLEEP="$LEFT_B"
+  # cs_wait_cmd, not a bare `sleep`: a bare foreground sleep defers the EXIT
+  # trap for its whole duration, so a signal would produce no verdict for up to
+  # 30s and the caller could not tell that from a hang.
+  [ "$SLEEP" -gt 0 ] && cs_wait_cmd sleep "$SLEEP"
+done

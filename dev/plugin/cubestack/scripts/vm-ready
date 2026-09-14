@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# vm-ready — the single gate on VM provisioning.
+#
+# READ-ONLY. One call per provisioning attempt, and the ONLY place a VM is
+# declared ready. VM creation itself belongs to the sibling KubeVirt skill
+# (suanova-dev-vm) and is never done here: this script only reads back what
+# that skill was asked to wait for.
+#
+# It exists because the readiness rule was prose, and the prose had two traps:
+#
+#   * The MODEL computed ordinals. A pool's replicas are cubestack<N>-0 …
+#     cubestack<N>-<k>, and hand-expanding that range is a known source of
+#     off-by-one errors. With --pool the expansion happens here, once.
+#   * The MODEL matched VMIs by label. A VirtualMachinePool puts `owner=` on
+#     its VM objects, but the VMIs those VMs create do NOT carry the label —
+#     so `kubectl get vmi -l owner=<user>` returns only unrelated VMs and looks
+#     permanently "not ready". That false negative once burned ~8 minutes of
+#     polling on a healthy 2-VM pool. There is deliberately NO owner-selection
+#     mode in this script; VMI name == VM name, so it matches by name only.
+#
+# On success the verdict carries every VM's IP, so no later step needs a second
+# `kubectl get` to learn them.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+usage() {
+  cat <<'USAGE'
+vm-ready [options] NAME...
+vm-ready --pool cubestack3 --expect 2
+
+  --pool NAME      VirtualMachinePool to expand: NAME-0 … NAME-<expect-1>
+  --expect N       expected VM count (required with --pool unless run.env has NODES)
+  --namespace NS   namespace to read (default: $CS_NS, i.e. "default")
+  --run ID         the run whose run.env supplies --expect (default: this run)
+  -h, --help       this text
+
+Every name must read Running, Ready=True with an IP assigned — by EXACT NAME,
+never by -l owner=.  The verdict reports vms=<name>@<ip>,… plus master= and
+workers=, so callers never re-resolve names, ordinals, or addresses.
+USAGE
+}
+
+POOL=""
+EXPECT=""
+NS="$CS_NS"
+NAMES=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pool)      POOL="${2:-}"; shift 2 ;;
+    --expect)    EXPECT="${2:-}"; shift 2 ;;
+    --namespace|-n) NS="${2:-}"; shift 2 ;;
+    --run)       cs_run_opt "${2:-}"; shift 2 ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    -*)          cs_usage_fail "unknown argument: $1" ;;
+    *)           NAMES="$NAMES${NAMES:+,}$1"; shift ;;
+  esac
+done
+
+if [ -n "$POOL" ] && [ -n "$NAMES" ]; then
+  cs_usage_fail "--pool expands the ordinals itself; give either --pool NAME or explicit NAME..., not both"
+fi
+if [ -z "$POOL" ] && [ -z "$NAMES" ]; then
+  cs_usage_fail "no VM names given (pass NAME..., or --pool NAME --expect N)"
+fi
+if [ -n "$EXPECT" ]; then
+  cs_kv_nonnumeric "$EXPECT" && cs_usage_fail "--expect must be a positive integer (got '$EXPECT')"
+  [ "$EXPECT" -gt 0 ] || cs_usage_fail "--expect must be greater than zero"
+fi
+
+# --- ordinal expansion ------------------------------------------------------
+# The model never computes these: with --pool P and --expect N the target set is
+# exactly P-0 … P-<N-1>.
+if [ -n "$POOL" ]; then
+  if [ -z "$EXPECT" ]; then
+    EXPECT="$(cs_run_env_get NODES)"
+  fi
+  cs_kv_nonnumeric "${EXPECT:-}" && cs_usage_fail "--pool needs --expect N (or NODES in run.env)"
+  [ "$EXPECT" -gt 0 ] || cs_usage_fail "--expect must be greater than zero"
+  NAMES=""
+  i=0
+  while [ "$i" -lt "$EXPECT" ]; do
+    NAMES="${NAMES}${NAMES:+,}${POOL}-${i}"
+    i=$((i + 1))
+  done
+fi
+
+cs_budget_guard
+cs_kubeconfig_guard
+
+# --- inspect every name -----------------------------------------------------
+# Batched: one verdict names every bad VM, so N bad VMs cost one round trip.
+MISSING=""
+NOTREADY=""
+VMS=""
+MASTER=""
+FIRST_NAME=""
+TOTAL=0
+READY_N=0
+GATE=0
+
+OLDIFS="$IFS"
+IFS=,
+set -f
+for name in $NAMES; do
+  [ -n "$name" ] || continue
+  TOTAL=$((TOTAL + 1))
+  [ -n "$FIRST_NAME" ] || FIRST_NAME="$name"
+
+  row="$(kubectl -n "$NS" get vmi "$name" --no-headers \
+         -o custom-columns='PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status,IP:.status.interfaces[0].ipAddress' 2>&1)"
+  rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    # No VMI. A VM object without a VMI is "not ready"; no VM object at all is
+    # "missing" — unless the pool API itself is the reason it never existed.
+    if kubectl -n "$NS" get vm "$name" --no-headers >/dev/null 2>&1; then
+      NOTREADY="$NOTREADY${NOTREADY:+,}$name"
+    else
+      MISSING="$MISSING${MISSING:+,}$name"
+      poolname="$(printf '%s' "$name" | sed -n 's/^\(.*\)-[0-9][0-9]*$/\1/p')"
+      if [ -n "$poolname" ]; then
+        perr="$(kubectl -n "$NS" get virtualmachinepool "$poolname" 2>&1 1>/dev/null)"
+        if printf '%s' "$perr" \
+           | grep -qiE 'feature.?gate|does not have a resource type|doesn.t have a resource type|resource type .virtualmachinepool'; then
+          GATE=1
+        fi
+      fi
+    fi
+    continue
+  fi
+
+  phase="$(printf '%s\n' "$row" | awk 'NR==1{print $1}')"
+  ready="$(printf '%s\n' "$row" | awk 'NR==1{print $2}')"
+  ip="$(printf '%s\n' "$row" | awk 'NR==1{print $3}')"
+  case "$ip" in ''|'<none>') ip="" ;; esac
+
+  if [ "$phase" = "Running" ] && [ "$ready" = "True" ] && [ -n "$ip" ]; then
+    READY_N=$((READY_N + 1))
+    VMS="$VMS${VMS:+,}${name}@${ip}"
+  else
+    NOTREADY="$NOTREADY${NOTREADY:+,}$name"
+  fi
+done
+set +f
+IFS="$OLDIFS"
+
+# --- verdict ----------------------------------------------------------------
+# Precedence: the pool feature gate explains every other absence, so it wins.
+if [ "$GATE" = "1" ]; then
+  cs_fail E_POOL_GATE_OFF "vms=$MISSING" "namespace=$NS" recover=stop-report:admin \
+    hint="the VirtualMachinePool API is not served (VMPool gate off) so $MISSING was never created - do not fall back to standalone VMs; an admin must enable the gate"
+fi
+
+if [ -n "$MISSING" ]; then
+  cs_fail E_VM_MISSING "vms=$MISSING" "namespace=$NS" "ready=$READY_N" \
+    recover="sibling-vm:wait:$MISSING" \
+    hint="no VirtualMachine or VMI with these names; hand them back to the sibling KubeVirt skill to provision and wait"
+fi
+
+if [ -n "$NOTREADY" ]; then
+  cs_fail E_VM_NOT_READY "vms=$NOTREADY" "namespace=$NS" "ready=$READY_N" \
+    recover="sibling-vm:wait:$NOTREADY" \
+    hint="VM exists but is not Running/Ready with an IP; the sibling KubeVirt skill owns the wait - do not poll here"
+fi
+
+if [ -n "$EXPECT" ] && [ "$READY_N" -ne "$EXPECT" ]; then
+  cs_fail E_VM_NOT_READY "ready=$READY_N" "expect=$EXPECT" "namespace=$NS" \
+    recover="sibling-vm:wait:${POOL:-$NAMES}" \
+    hint="expected $EXPECT Ready VMs, found $READY_N"
+fi
+
+# --- roles ------------------------------------------------------------------
+# Single-node cubestack<N> is the master. Multi-node cubestack<N>-0 is the
+# master and -1… are workers (pool ordinal order).
+WORKERS=""
+MASTER=""
+if [ "$TOTAL" -le 1 ]; then
+  MASTER="$FIRST_NAME"
+  WORKERS="-"
+else
+  IFS=,
+  set -f
+  for name in $NAMES; do
+    case "$name" in *-0) MASTER="$name"; break ;; esac
+  done
+  set +f
+  IFS="$OLDIFS"
+  [ -n "$MASTER" ] || MASTER="$FIRST_NAME"
+  IFS=,
+  set -f
+  for name in $NAMES; do
+    [ "$name" = "$MASTER" ] && continue
+    WORKERS="$WORKERS${WORKERS:+,}$name"
+  done
+  set +f
+  IFS="$OLDIFS"
+fi
+
+cs_ok "vms=$VMS" "master=$MASTER" "workers=$WORKERS" "ready=$READY_N" "namespace=$NS"

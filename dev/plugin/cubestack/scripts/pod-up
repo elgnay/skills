@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# pod-up — create (or reuse) the CubeStack bootstrap installer pod.
+#
+# The installer pod is the bootstrap host for the whole run: it carries the
+# installer image, cluster.conf, the ~22GiB offline fetch and kubespray, and it
+# is the machine that SSHs into the target VMs. It is not part of the deployed
+# cluster and is deleted again once the run verifies (pod-down).
+#
+# Idempotent, and reuse is a FEATURE: a leftover pod may already hold the offline
+# fetch and a valid cluster.conf, so reusing it skips an entire fetch. The one
+# thing that cannot be patched in place is the kubevirt.io/subnet nodeSelector —
+# Pod spec fields are immutable — so a pod pinned to a different subnet is
+# deleted and recreated rather than applied over.
+#
+# The wait is a single bounded `kubectl wait`; the timeout IS the wait, and
+# nobody hand-writes a re-poll loop here.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+# The offline fetch is ~22GiB when complete. Below this floor it is a partial or
+# missing fetch, and a deploy started against it dies ~12 minutes in at
+# local_path. The deploy script applies the same floor before launching.
+CS_FETCH_FLOOR_MB=15360
+CS_READY_TIMEOUT=180s
+
+usage() {
+  cat <<'USAGE'
+pod-up [options]
+  --run ID         the run this pod belongs to (default: this run's id).
+                   The pod is named <prefix>-<run-id>, so two installs running
+                   at the same time never touch each other's bootstrap host.
+  --pod NAME       create/use exactly this pod name, overriding --run.
+                   The name is recorded in run.env so later steps follow it.
+  --subnet LABEL   kubevirt.io/subnet nodeSelector (default: run.env SUBNET)
+  --image IMG      installer image (default: the cubestack installer image)
+  --namespace NS   namespace (default: default)
+  --recreate       delete an existing pod instead of reusing it
+  --fresh          alias for --recreate, so `recover="rerun-fresh:pod-up"`
+                   is runnable verbatim
+  -h, --help       this text
+USAGE
+}
+
+POD_OPT=""
+SUBNET=""
+IMAGE="$CS_IMAGE_DEFAULT"
+NS=""
+RECREATE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run)       cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)       POD_OPT="${2:-}"; shift 2 ;;
+    --subnet)    SUBNET="${2:-}"; shift 2 ;;
+    --image)     IMAGE="${2:-}"; shift 2 ;;
+    --namespace) NS="${2:-}"; shift 2 ;;
+    --recreate|--fresh) RECREATE=1; shift ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$NS" ] && CS_NS="$NS"
+
+cs_kubeconfig_guard
+
+# --- subnet -----------------------------------------------------------------
+# The nodeSelector pins the pod to a node on the same subnet as the target VMs:
+# that is what gives it underlay access to the VMs, MinIO and Harbor. No
+# hostNetwork is involved.
+#
+# Resolved and VALIDATED before cs_budget_guard, because a bad label must not
+# cost an attempt. It once did: preflight prints both `subnet=10-66-3-0` and
+# `nad=vm-underlay-10-66-3-0` on the same line, the NAD name was passed here by
+# mistake, and the drift branch below deleted a Ready pod, waited out the whole
+# 180s Ready timeout on a pod that could never schedule, and spent the last of
+# the run's two pod-up attempts — leaving E_RETRY_BUDGET as the only verdict and
+# no way to recreate the pod it had just destroyed.
+if [ -z "$SUBNET" ]; then
+  SUBNET="$(cs_run_env_get SUBNET)"
+fi
+if [ -z "$SUBNET" ]; then
+  cs_usage_fail "--subnet <label> is required (run.env has no SUBNET; pass --run <run-id> and run preflight first)"
+fi
+
+# Only asserted when the lookup itself succeeded, so a transient API error is
+# never mistaken for "no such subnet". This is what stops the drift branch from
+# deleting a healthy pod over a typo.
+if MATCHING_NODES="$(kubectl get nodes -l "kubevirt.io/subnet=$SUBNET" --no-headers 2>/dev/null)"; then
+  # Instruction first: cs_fail cuts hint at 160 chars, so a diagnosis that fills
+  # the budget costs the reader the part telling them what to pass instead.
+  [ -n "$MATCHING_NODES" ] || cs_usage_fail \
+    "pass preflight's subnet= LABEL, not its nad= name: no node carries kubevirt.io/subnet=$SUBNET"
+fi
+
+cs_budget_guard
+
+# --- which pod are we talking about? ----------------------------------------
+# The name is derived from the run, never fixed and never adopted from a search:
+#
+#   * a fixed name means the second of two concurrent runs applies to the first
+#     run's pod, and since `kubevirt.io/subnet` is immutable that apply path
+#     deletes and recreates it — discarding the ~22GiB offline fetch and the
+#     cluster.conf the first run had already paid for; and
+#   * a "newest matching pod wins" search has the same effect from the other
+#     direction, because the search cannot tell one run's pod from another's.
+#
+# Nothing is reused across runs here. Reuse within a run still works, and still
+# skips the fetch: the name is stable for the life of the run, so a re-invocation
+# finds its own pod with `fetch=present` and takes it as-is.
+if [ -n "$POD_OPT" ]; then
+  TARGET="$POD_OPT"
+else
+  TARGET="$(cs_pod_name)" || cs_usage_fail \
+    "no run id — pass --run <run-id> (preflight prints it as run=) or --pod <name>"
+fi
+
+EXISTS=0
+kubectl -n "$CS_NS" get pod "$TARGET" >/dev/null 2>&1 && EXISTS=1
+
+# --- pod spec helpers -------------------------------------------------------
+apply_pod() {
+  cs_logged kubectl -n "$CS_NS" apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $TARGET
+  namespace: $CS_NS
+spec:
+  nodeSelector:
+    kubevirt.io/subnet: "$SUBNET"
+  restartPolicy: Never
+  containers:
+  - name: installer
+    image: $IMAGE
+    command: ["sleep", "infinity"]
+    tty: true
+EOF
+}
+
+# cs_wait_cmd (not a bare foreground kubectl) so a signal interrupts the wait
+# and the verdict lands, instead of being deferred behind the whole 180s child.
+# cs_logged with its redirect INSIDE the backgrounded child: `cs_wait_cmd
+# cs_logged …` would redirect this shell for the entire wait, so the
+# E_INTERRUPTED verdict a signal produces would land in the log rather than on
+# stderr (the wait itself is what must not hold the trap, not the logging).
+log_wait() { "$@" >> "$(cs_log_file)" 2>&1; }
+
+wait_ready() {
+  cs_wait_cmd log_wait kubectl -n "$CS_NS" wait --for=condition=Ready "pod/$TARGET" --timeout="$CS_READY_TIMEOUT"
+}
+
+delete_pod() {
+  cs_logged kubectl -n "$CS_NS" delete pod "$TARGET" --wait=false
+  # Bounded, and the only wait here: an immutable-field recreate needs the old
+  # object gone before the apply. A timeout is reported, not extended.
+  cs_wait_cmd log_wait kubectl -n "$CS_NS" wait --for=delete "pod/$TARGET" --timeout=60s || true
+}
+
+describe_pod() { cs_logged kubectl -n "$CS_NS" describe pod "$TARGET"; }
+
+# create + bounded wait. 0 = Ready.
+create_and_wait() {
+  apply_pod || return 1
+  wait_ready
+}
+
+# fetch=present|absent + conf=present|absent, read from inside the pod.
+probe_payload() {
+  local out
+  out="$(cs_pod_exec "$TARGET" bash -c '
+    d=/opt/cubestack-installer/deployments
+    m=$(du -sm "$d/offline-files" 2>/dev/null | cut -f1)
+    case "$m" in ""|*[!0-9]*) m=0 ;; esac
+    if [ "$m" -ge '"$CS_FETCH_FLOOR_MB"' ]; then echo fetch=present; else echo fetch=absent; fi
+    if [ -f "$d/config/cluster.conf" ]; then echo conf=present; else echo conf=absent; fi')"
+  FETCH="$(printf '%s\n' "$out" | sed -n 's/^fetch=//p' | tail -1)"
+  CONF="$(printf '%s\n' "$out" | sed -n 's/^conf=//p' | tail -1)"
+  [ -n "$FETCH" ] || FETCH=absent
+  [ -n "$CONF" ] || CONF=absent
+}
+
+REUSED=0
+if [ "$EXISTS" = 1 ]; then
+  CUR_SUBNET="$(kubectl -n "$CS_NS" get pod "$TARGET" \
+    -o jsonpath='{.spec.nodeSelector.kubevirt\.io/subnet}' 2>/dev/null)"
+  if cs_pod_ready "$TARGET"; then
+    READY=1
+  else
+    READY=0
+  fi
+
+  if [ "$RECREATE" = 0 ] && [ "$READY" = 1 ] && [ "$CUR_SUBNET" = "$SUBNET" ]; then
+    REUSED=1
+    cs_note "reusing pod $TARGET (Ready, subnet=$SUBNET)"
+  else
+    if [ "$RECREATE" = 1 ]; then
+      cs_note "recreating pod $TARGET (--recreate)"
+    elif [ "$READY" != 1 ]; then
+      cs_note "recreating pod $TARGET (exists but not Ready)"
+    else
+      cs_note "recreating pod $TARGET (subnet changed: ${CUR_SUBNET:-<none>} -> $SUBNET)"
+    fi
+    delete_pod
+    EXISTS=0
+  fi
+fi
+
+if [ "$REUSED" = 0 ]; then
+  cs_note "creating pod $TARGET (image=$IMAGE subnet=$SUBNET)"
+  if ! create_and_wait; then
+    REASON="$(cs_pod_reason "$TARGET")"
+    PHASE="$(kubectl -n "$CS_NS" get pod "$TARGET" -o jsonpath='{.status.phase}' 2>/dev/null)"
+    NODE_NOW="$(cs_pod_node "$TARGET")"
+    UNSCHED=0
+    if [ "$PHASE" = "Pending" ] && [ -z "$NODE_NOW" ]; then UNSCHED=1; fi
+    case "$REASON" in
+      *Unschedulable*) UNSCHED=1 ;;
+    esac
+    if [ "$UNSCHED" = 0 ]; then
+      EV="$(kubectl -n "$CS_NS" get events \
+            --field-selector "involvedObject.name=$TARGET" 2>/dev/null \
+            | grep -c 'FailedScheduling')"
+      case "${EV:-0}" in ''|0) ;; *) UNSCHED=1 ;; esac
+    fi
+
+    case "$REASON" in
+      *ImagePullBackOff*|*ErrImagePull*|*ImageInspectError*|*RegistryUnavailable*)
+        # The image pull is the one failure worth one automatic retry: a transient
+        # registry blip looks identical to a bad tag. Full budget is ~6 min.
+        cs_note "image pull failure; deleting and retrying once (image=$IMAGE)"
+        delete_pod
+        if ! create_and_wait; then
+          describe_pod
+          REASON="$(cs_pod_reason "$TARGET")"
+          cs_fail E_POD_IMAGE_PULL "pod=$TARGET" "image=$IMAGE" \
+            "reason=${REASON:-none}" recover=stop-report:admin \
+            hint="image pull still failing after one clean retry; check the image tag and Harbor reachability from the node"
+        fi
+        ;;
+      *)
+        if [ "$UNSCHED" = 1 ]; then
+          describe_pod
+          cs_fail E_POD_UNSCHEDULABLE "pod=$TARGET" "subnet=$SUBNET" \
+            "phase=${PHASE:-none}" "reason=${REASON:-none}" recover=stop-report:admin \
+            hint="no node matches nodeSelector kubevirt.io/subnet=$SUBNET (or resources are exhausted); inspect the FailedScheduling event"
+        fi
+        describe_pod
+        # rerun-fresh, not `rerun:pod-up --recreate`: the verb must carry no
+        # whitespace or the whole tokenization guarantee is void, and a plain
+        # rerun would *reuse* the pod and reproduce the failure. Not the
+        # node-set-drift case this verb is usually reserved for, but it is the
+        # only sanctioned spelling of "re-invoke with the recreate flag".
+        cs_fail E_POD_NOT_READY "pod=$TARGET" "phase=${PHASE:-none}" \
+          "reason=${REASON:-none}" recover=rerun-fresh:pod-up \
+          hint="pod did not become Ready within $CS_READY_TIMEOUT; see the pod description in $(cs_log_file)"
+        ;;
+    esac
+  fi
+fi
+
+probe_payload
+POD_NODE="$(cs_pod_node "$TARGET")"
+
+# Record the name so every later step (env-probe, configure, fetch-offline,
+# deploy, deploy-wait, verify, pod-down) targets THIS run's pod — including when
+# --pod overrode the derived name. Replaced rather than appended so a repeated
+# invocation cannot leave two POD_NAME lines in run.env.
+cs_run_env_put "POD_NAME=$(cs_q "$TARGET")"
+
+cs_ok "pod=$TARGET" "node=${POD_NODE:-none}" "reused=$REUSED" \
+      "fetch=$FETCH" "conf=$CONF"
