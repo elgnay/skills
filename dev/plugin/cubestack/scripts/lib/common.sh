@@ -446,6 +446,120 @@ cs_ceph_env_lint() {  # $1 = path to a provider external-ceph.env
   return 0
 }
 
+# --- CephFS host-mount guide ------------------------------------------------
+# The Provider documents its Linux-host CephFS mount in a markdown guide, and
+# that guide holds the ONLY copy of the host-mount credential available to us:
+# the fsid, the mon, and the CephX user and key. So `mount-models` PARSES the
+# guide instead of asking for yet another secret file. Only the guide's PATH is
+# recorded in the run dir; its contents never enter the repo, the skill, or the
+# values file.
+#
+# Extraction is narrow and anchored to the guide's own config blocks, so the
+# illustrative `mount -t ceph 10.66.3.46:6789:/ ...` commands the same guide
+# contains cannot be mistaken for the real values:
+#
+#   [client.<user>]              the keyring section header
+#   <ws>key = <base64>           the key, inside that section
+#   fsid = <uuid>                the ceph.conf block
+#   mon host = <ip>:<port>       the ceph.conf block
+#
+# Each field must appear EXACTLY once. A guide carrying two keys or two mons is
+# not one we can pick from safely — silently taking the first would mount
+# against whichever happened to sit nearer the top.
+#
+# Value-free by construction: reports field NAMES and counts, never content.
+# The parse globals it sets ARE the secret (CS_GUIDE_KEY); a caller must never
+# print them, log them, or put them in a verdict.
+cs_count_lines() {  # count non-blank lines in $1
+  [ -n "$1" ] || { printf '0'; return 0; }
+  printf '%s\n' "$1" | grep -c '[^[:space:]]'
+}
+
+# On success sets CS_GUIDE_USER, CS_GUIDE_KEY, CS_GUIDE_FSID, CS_GUIDE_MON.
+# Calls cs_fail on any problem, so invoke it DIRECTLY — never inside $( ).
+cs_cephfs_guide_lint() {  # $1 = path to the CephFS host-mount guide
+  local f="$1" users keys fsids mons nu nk nf nm
+
+  [ -f "$f" ] || cs_fail E_MODELS_GUIDE_INVALID "file=$f" recover=stop-report:user \
+    hint="no CephFS mount guide at that path; the Provider documents one - pass its real path"
+
+  # The path rides in k=v fields, and the contract forbids whitespace there.
+  case "$f" in *[[:space:]]*)
+    cs_fail E_USAGE recover=stop-report:user \
+      hint="the guide path contains whitespace, which breaks the verdict token grammar; move it somewhere without spaces" ;;
+  esac
+
+  [ -s "$f" ] || cs_fail E_MODELS_GUIDE_INVALID "file=$f" recover=stop-report:user \
+    hint="the mount guide is empty"
+
+  # A real guide is a few KB. Anything far larger is not one, and does not get
+  # parsed on a guess.
+  if [ "$(wc -c < "$f" | tr -d ' ')" -gt 65536 ]; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" recover=stop-report:user \
+      hint="far larger than a mount guide; refusing to parse it - pass the real guide"
+  fi
+
+  # A *** artifact means the guide passed through the tool layer's redaction, so
+  # the "key" in it is literally three asterisks. Mounting with that fails EACCES,
+  # which is indistinguishable from a wrong key and wastes the whole debugging
+  # path in the guide's troubleshooting section.
+  if grep -qF '***' "$f"; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" recover=stop-report:user \
+      hint="the guide carries *** redaction artifacts where the key belongs; re-fetch it unredacted"
+  fi
+
+  users="$(sed -n 's/^\[client\.\([^]]*\)\][[:space:]]*$/\1/p' "$f")"
+  keys="$(sed -n 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*//p' "$f" | sed 's/[[:space:]]*$//')"
+  fsids="$(sed -n 's/^[[:space:]]*fsid[[:space:]]*=[[:space:]]*//p' "$f" | sed 's/[[:space:]]*$//')"
+  mons="$(sed -n 's/^[[:space:]]*mon host[[:space:]]*=[[:space:]]*//p' "$f" | sed 's/[[:space:]]*$//')"
+
+  nu="$(cs_count_lines "$users")"
+  nk="$(cs_count_lines "$keys")"
+  nf="$(cs_count_lines "$fsids")"
+  nm="$(cs_count_lines "$mons")"
+
+  local missing=""
+  [ "$nu" -eq 1 ] || missing="$missing${missing:+,}user($nu)"
+  [ "$nk" -eq 1 ] || missing="$missing${missing:+,}key($nk)"
+  [ "$nf" -eq 1 ] || missing="$missing${missing:+,}fsid($nf)"
+  [ "$nm" -eq 1 ] || missing="$missing${missing:+,}mon($nm)"
+  [ -z "$missing" ] || cs_fail E_MODELS_GUIDE_INVALID "file=$f" "fields=$missing" \
+    recover=stop-report:user \
+    hint="the guide must carry each of [client.x], key, fsid and mon host EXACTLY once; got $missing - pass the Provider's real guide"
+
+  CS_GUIDE_USER="$users"
+  CS_GUIDE_KEY="$keys"
+  CS_GUIDE_FSID="$fsids"
+  CS_GUIDE_MON="$mons"
+
+  # Shape checks. A fsid that is not a UUID means the wrong line was matched; a
+  # mon that is not host:port would be passed to `mount -t ceph` verbatim.
+  case "$CS_GUIDE_FSID" in
+    *[!0-9a-fA-F-]*) cs_fail E_MODELS_GUIDE_INVALID "file=$f" "field=fsid" recover=stop-report:user \
+      hint="the fsid line is not a UUID; the guide's fsid block was not parsed as expected" ;;
+  esac
+  if ! printf '%s' "$CS_GUIDE_FSID" | grep -qE '^[0-9a-fA-F-]{36}$'; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" "field=fsid" recover=stop-report:user \
+      hint="the fsid is not 36 characters of UUID; re-check the guide"
+  fi
+  if ! printf '%s' "$CS_GUIDE_MON" | grep -qE '^[0-9.]+:[0-9]+(,[0-9.]+:[0-9]+)*$'; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" "field=mon" recover=stop-report:user \
+      hint="the mon host is not ip:port (or a comma-separated list); re-check the guide"
+  fi
+  if ! printf '%s' "$CS_GUIDE_KEY" | grep -qE '^[A-Za-z0-9+/=]+$'; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" "field=key" recover=stop-report:user \
+      hint="the key is not base64-shaped; the guide's keyring block was not parsed as expected"
+  fi
+  # A CephX user name is passed to `mount -o name=`, so it must not be able to
+  # carry whitespace or a comma into the option list.
+  if ! printf '%s' "$CS_GUIDE_USER" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    cs_fail E_MODELS_GUIDE_INVALID "file=$f" "field=user" recover=stop-report:user \
+      hint="the CephX user is not a plain client name; re-check the guide's keyring header"
+  fi
+
+  return 0
+}
+
 cs_usage_fail() {  # $1 = usage string
   cs_fail E_USAGE recover=stop-report:user hint="$1"
 }

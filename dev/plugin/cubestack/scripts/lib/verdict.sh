@@ -42,8 +42,12 @@ cs_exit_class() {
     E_NAME_SPACE_EXHAUSTED|E_CONF_FIELD_MISSING|E_DEPLOY_LAUNCH| \
     E_DEPLOY_EXITED_NONZERO|E_DEPLOY_KUBESPRAY_SSH|E_VERIFY_CEPH_PROFILE| \
     E_VERIFY_CEPH_PVC_PENDING|E_RETRY_BUDGET|E_LOCK_HELD| \
-    E_CEPH_ENV_MISSING|E_CEPH_ENV_INVALID)
+    E_CEPH_ENV_MISSING|E_CEPH_ENV_INVALID| \
+    E_MODELS_NO_CEPH_COMMON|E_MODELS_GUIDE_INVALID)
       echo 2 ;;
+    # E_MODELS_MOUNT is deliberately NOT here: a mount that failed on a
+    # reachable node is worth exactly one re-invocation, which is what the
+    # class-1 default gives it.
     *) echo 1 ;;
   esac
 }
@@ -218,6 +222,11 @@ cs_attempt_limit() {
     # E_RETRY_BUDGET with a stale-but-destroyed stamp. 4 = the two the flow
     # requires, plus the rerun:env-probe its own E_SSHPASS_INSTALL recovery needs.
     env-probe)   echo 4 ;;
+    # mount-models is invoked once by a healthy run, but its failure mode is a
+    # flaky ssh or a transient mon timeout rather than a deterministic input
+    # error — so one retry must not be the last. 3 = the one the flow needs plus
+    # two, and it still bounds a loop.
+    mount-models) echo 3 ;;
     *)           echo 2 ;;
   esac
 }

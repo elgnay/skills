@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# mount-models — mount the Provider's CephFS `/models` on every node host.
+#
+# OPTIONAL, and only meaningful for a run that imported an external Ceph: the
+# filesystem belongs to the Provider, and the consumer cluster only reads it.
+# A host-level kernel mount is not the same thing as the CSI StorageClasses the
+# import creates — those give PODS a filesystem, this gives the NODE HOST one,
+# which is what a model-serving workload that expects `/models` on the machine
+# is looking for.
+#
+# The credential path, and the reason this is a script rather than prose:
+#
+#   * the only host-mount credential available is the one written into the
+#     Provider's mount guide, so it is PARSED out of that guide rather than
+#     copied into the repo, the skill, or the values file. Only the guide's
+#     PATH is recorded in the run dir;
+#   * it is staged in a mode-700 temp dir, tarred, copied into the pod with
+#     `kubectl cp`, hash-verified against the local bytes, and streamed to the
+#     node over ssh STDIN — never an argument, never an environment variable, so
+#     it cannot appear in any process list on the pod or the node;
+#   * the host copy and the pod copy are both removed by the cs_cleanup hook on
+#     every exit path, and the node-side tar deletes itself once unpacked.
+#
+# Read-only throughout: the guide provides a read-only user, and the mount is
+# asserted to actually be read-only before this reports success.
+#
+# The step runs from the bootstrap pod, which pod-down deletes — so it must be
+# invoked between `verify` and `pod-down`.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+usage() {
+  cat <<'USAGE'
+mount-models --vms a@IP,b@IP [options]
+
+  --vms LIST       name@ip pairs, comma-separated (required) — the same form
+                   env-probe takes, so the Step 3 verdict's list can be reused
+  --run ID         the run this mount belongs to (default: this run's id)
+  --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
+  --guide FILE     the Provider's CephFS host-mount guide (default: the path
+                   preflight recorded in run.env). Parsed for the fsid, the mon,
+                   and the CephX user and key — the guide is never modified.
+  --user USER      SSH user (default ubuntu)
+  --password PW    SSH password (default $CUBESTACK_SSH_PASSWORD, else ubuntu)
+  --fs-path PATH   subdirectory of the CephFS to mount (default /models)
+  --mountpoint P   where to mount it on the node (default /models)
+  --dry-run        parse the guide and print what would be mounted, then stop.
+                   Local only — touches no pod and no node, so it never spends
+                   a retry. The key is never printed.
+  -h, --help       this text
+
+Installs /etc/ceph/{ceph.conf,ceph.client.<user>.keyring,.secret} on each node,
+mounts <mon>:<fs-path> at <mountpoint> read-only, and adds an /etc/fstab entry
+with _netdev so the mount survives a reboot. Idempotent: an existing correct
+mount is reported as already=1 and the files and fstab line are re-asserted.
+USAGE
+}
+
+VMS=""
+POD_ARG=""
+GUIDE=""
+SSH_USER="ubuntu"
+SSH_PW="${CUBESTACK_SSH_PASSWORD:-ubuntu}"
+FS_PATH="/models"
+MOUNTPOINT="/models"
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vms)        VMS="${2:-}"; shift 2 ;;
+    --run)        cs_run_opt "${2:-}"; shift 2 ;;
+    --pod)        POD_ARG="${2:-}"; shift 2 ;;
+    --guide)      GUIDE="${2:-}"; shift 2 ;;
+    --user)       SSH_USER="${2:-}"; shift 2 ;;
+    --password)   SSH_PW="${2:-}"; shift 2 ;;
+    --fs-path)    FS_PATH="${2:-}"; shift 2 ;;
+    --mountpoint) MOUNTPOINT="${2:-}"; shift 2 ;;
+    --dry-run)    DRY_RUN=1; shift ;;
+    -h|--help)    usage; cs_ok "help=1" ;;
+    *)            cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$VMS" ] || cs_usage_fail "--vms a@IP,b@IP is required"
+
+# The path preflight recorded wins only as a DEFAULT: an explicit --guide is how
+# a caller points at a re-issued guide without re-running Step 0.
+if [ -z "$GUIDE" ]; then
+  GUIDE="$(cs_run_env_get CEPHFS_GUIDE_FILE)"
+fi
+[ -n "$GUIDE" ] || cs_usage_fail \
+  "--guide is required (run.env has no CEPHFS_GUIDE_FILE; pass it on preflight with --cephfs-mount-guide)"
+
+# A password the tool layer redacted to *** is not a wrong password — rebuilding
+# the VM for it would be the wrong recovery. Refuse it before any probe.
+if ! cs_check_redaction SSH_PW; then
+  cs_usage_fail "the SSH password carries the redaction artifact (${CS_BAD_KEYS}); pass the real value - it will not be printed"
+fi
+[ -n "$SSH_PW" ] || cs_usage_fail "--password must not be empty"
+
+# Paths travel in k=v fields and, for the remote command, in a single-quoted
+# argument. Refuse the characters that would break either rather than quoting
+# around them.
+for p in "$FS_PATH" "$MOUNTPOINT" "$GUIDE"; do
+  case "$p" in
+    *[[:space:]]*) cs_usage_fail "paths must not contain whitespace (got '$p'); it breaks the verdict token grammar" ;;
+  esac
+done
+case "$FS_PATH$MOUNTPOINT" in
+  *"'"*) cs_usage_fail "paths must not contain a single quote; it cannot be passed to the node safely" ;;
+esac
+
+# --- guide (local, before anything crosses the wire) -------------------------
+# Sets CS_GUIDE_USER / CS_GUIDE_KEY / CS_GUIDE_FSID / CS_GUIDE_MON. The key is a
+# secret from here on: it is written to the staging dir and nowhere else, never
+# logged, never printed, never put in a verdict.
+cs_cephfs_guide_lint "$GUIDE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  cs_note "dry run — nothing will be written, no pod or node contacted"
+  cs_note "  guide      $GUIDE"
+  cs_note "  fsid       $CS_GUIDE_FSID"
+  cs_note "  mon        $CS_GUIDE_MON"
+  cs_note "  cephx user $CS_GUIDE_USER"
+  cs_note "  key        40+ chars parsed, not printed"
+  cs_note "  mount      $CS_GUIDE_MON:$FS_PATH -> $MOUNTPOINT (ro, fstab _netdev)"
+  cs_note "  nodes      $VMS"
+  cs_ok "dry_run=1" "guide=$(basename "$GUIDE")" "user=$CS_GUIDE_USER" \
+        "fs_path=$FS_PATH" "mountpoint=$MOUNTPOINT" "key_parsed=1"
+fi
+
+# --- budget -----------------------------------------------------------------
+# After the lint, for the reason configure states: a guide that fails validation
+# is a deterministic failure, so charging an attempt for it would both waste a
+# lifetime retry and refuse the re-invocation the lint itself prescribes.
+cs_budget_guard
+cs_kubeconfig_guard
+
+# --- pod --------------------------------------------------------------------
+cs_pod_require "$POD_ARG"
+
+# sshpass normally arrives with env-probe (Step 3), but mount-models is
+# separately invocable, so it re-checks rather than assuming step order. Only
+# sshpass's PRESENCE is needed — the password is passed per-connection below.
+if ! cs_pod_exec "$CS_POD" bash -c 'command -v sshpass' >/dev/null 2>&1; then
+  if ! cs_logged cs_pod_exec "$CS_POD" bash -c 'apt-get install -y -qq sshpass' \
+     || ! cs_pod_exec "$CS_POD" bash -c 'command -v sshpass' >/dev/null 2>&1; then
+    cs_fail E_SSHPASS_INSTALL "pod=$CS_POD" recover="rerun:mount-models" \
+      hint="sshpass is missing in the pod and could not be installed; without it the node hosts cannot be reached over password ssh"
+  fi
+fi
+
+# --- stage -----------------------------------------------------------------
+# Mode 700, because it holds the keyring for as long as it exists.
+STAGE="$(mktemp -d 2>/dev/null || printf '/tmp/cs-mount-models.%s' "$$")"
+mkdir -p "$STAGE" 2>/dev/null || true
+chmod 700 "$STAGE" 2>/dev/null || true
+# An unset STAGE under `set -u` would make the hook itself fail, which is the
+# one time it must not.
+POD_STAGE="/tmp/cubestack-cephfs.$CS_SCRIPT"
+POD_TAR="$POD_STAGE/files.tar"
+POD_SCRIPT="$POD_STAGE/cephfs-mount-node.sh"
+
+cs_cleanup() {
+  [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null
+  if [ -n "${CS_POD:-}" ] && [ -n "${POD_STAGE:-}" ]; then
+    kubectl -n "$CS_NS" exec "$CS_POD" -- sh -c "rm -rf $POD_STAGE" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+STAGE_FILES="$STAGE/files"
+mkdir -p "$STAGE_FILES"
+
+# ceph.conf is written from the guide's own block, so the client finds the mon
+# without needing --mon-host on every command.
+umask 077
+printf '[global]\nfsid = %s\nmon host = %s\n' "$CS_GUIDE_FSID" "$CS_GUIDE_MON" > "$STAGE_FILES/ceph.conf"
+printf '[client.%s]\n\tkey = %s\n' "$CS_GUIDE_USER" "$CS_GUIDE_KEY" > "$STAGE_FILES/ceph.client.$CS_GUIDE_USER.keyring"
+# The kernel client's -o secretfile= wants the bare key with no section header
+# and no `key = ` prefix (guide §三) — the keyring file will NOT work here.
+printf '%s\n' "$CS_GUIDE_KEY" > "$STAGE_FILES/ceph.client.$CS_GUIDE_USER.secret"
+chmod 600 "$STAGE_FILES"/* 2>/dev/null || true
+
+if ! tar cf "$STAGE/files.tar" -C "$STAGE_FILES" . 2>/dev/null; then
+  cs_fail E_INTERNAL "stage=$STAGE" recover=stop-report:user \
+    hint="could not build the staging tar on this host; the mount cannot be staged"
+fi
+STAGE_SHA="$(cs_sha256 "$STAGE/files.tar")"
+[ -n "$STAGE_SHA" ] || cs_fail E_INTERNAL recover=stop-report:user \
+  hint="cannot hash the staging tar on this host (needs shasum or sha256sum); refusing to send an unverified copy"
+
+cs_logged kubectl -n "$CS_NS" exec "$CS_POD" -- mkdir -p "$POD_STAGE" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="could not create the staging directory in the pod"
+
+cs_logged kubectl -n "$CS_NS" cp "$STAGE/files.tar" "$CS_NS/$CS_POD:$POD_TAR" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="could not copy the staging tar into the pod"
+
+POD_SHA="$(cs_pod_exec_out "$CS_POD" bash -c "sha256sum $POD_TAR 2>/dev/null | cut -d' ' -f1" | tail -1)"
+[ "$POD_SHA" = "$STAGE_SHA" ] || cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="the staged tar in the pod does not hash to the local file; refusing to mount from a truncated keyring"
+
+# The node-side script is re-copied unconditionally: the pod's /tmp does not
+# survive a recreate, and a stale copy from an older script version must never
+# be what runs on a node.
+cs_logged kubectl -n "$CS_NS" cp "$SELF_DIR/lib/cephfs-mount-node.sh" \
+  "$CS_NS/$CS_POD:$POD_SCRIPT" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="could not copy the node-side mount script into the pod"
+
+# --- targets ----------------------------------------------------------------
+VM_NAMES=""
+VM_IPS=""
+OLDIFS="$IFS"
+IFS=,
+set -f
+for entry in $VMS; do
+  [ -n "$entry" ] || continue
+  vname="${entry%@*}"
+  vip="${entry#*@}"
+  if [ -z "$vname" ] || [ -z "$vip" ] || [ "$vname" = "$vip" ]; then
+    set +f; IFS="$OLDIFS"
+    cs_usage_fail "--vms entry '$entry' is not name@ip"
+  fi
+  VM_NAMES="$VM_NAMES${VM_NAMES:+,}$vname"
+  VM_IPS="$VM_IPS${VM_IPS:+,}$vip"
+done
+set +f
+IFS="$OLDIFS"
+[ -n "$VM_NAMES" ] || cs_usage_fail "--vms carried no usable name@ip pair"
+VM_COUNT=0
+IFS=,; set -f
+for v in $VM_NAMES; do VM_COUNT=$((VM_COUNT + 1)); done
+set +f; IFS="$OLDIFS"
+
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+          -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+# Per-node staging path, named for the run so two runs cannot tread on each
+# other's tar on a shared node.
+NODE_TAR="/tmp/cs-cephfs-$(cs_run_id 2>/dev/null || printf 'run').tar"
+
+# Failure reasons are accumulated per VM so one verdict names every node that
+# went wrong, not just the first — the recovery acts on the set.
+RESULTD="$STAGE/results"
+mkdir -p "$RESULTD"
+
+one_node() {  # $1 = name, $2 = ip, $3 = index
+  _n="$1"; _ip="$2"; _i="$3"
+  _cmd="sshpass -p '$SSH_PW' ssh $SSH_OPTS ${SSH_USER}@${_ip}"
+
+  # Upload the tar, then run the script with stdin as the tar. Two connections
+  # rather than one, because the script must come from stdin too and a single
+  # stream cannot be both. Neither the key nor any path with a secret in it is
+  # ever an argument here.
+  if ! cs_pod_exec "$CS_POD" bash -c "$_cmd 'cat > $NODE_TAR' < $POD_TAR" >/dev/null 2>&1; then
+    printf 'fail %s %s\n' "$_n" "upload" > "$RESULTD/$_i"
+    return 0
+  fi
+
+  _out="$(cs_pod_exec "$CS_POD" bash -c \
+    "$_cmd 'bash -s $CS_GUIDE_MON $FS_PATH $MOUNTPOINT $CS_GUIDE_USER $NODE_TAR' < $POD_SCRIPT")"
+  _sent="$(printf '%s\n' "$_out" | grep -E '^MODELS_(OK|FAIL)' | tail -1)"
+
+  case "$_sent" in
+    'MODELS_OK '*) printf '%s %s %s\n' ok "$_n" "${_sent#MODELS_OK }" > "$RESULTD/$_i" ;;
+    'MODELS_FAIL '*) printf 'fail %s %s\n' "$_n" "${_sent#MODELS_FAIL }" > "$RESULTD/$_i" ;;
+    # No sentinel at all: ssh itself failed, or the node-side script died before
+    # reaching a conclusion. Both are failures — never "something printed, so it
+    # must have worked".
+    *) printf 'fail %s %s\n' "$_n" "noreply" > "$RESULTD/$_i" ;;
+  esac
+  return 0
+}
+
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  vip="$(printf '%s' "$VM_IPS" | cut -d, -f"$idx")"
+  ( one_node "$vname" "$vip" "$idx" ) &
+done
+set +f; IFS="$OLDIFS"
+wait
+
+# Collected by INDEX, never by glob: `set -f` is still in effect (a glob would
+# stay literal and every failure would read as a pass), and a node that never
+# reported must count as failed.
+BAD=""
+BAD_WHY=""
+MOUNTED=0
+ALREADY=0
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  f="$RESULTD/$idx"
+  st="$(awk 'NR==1{print $1}' "$f" 2>/dev/null)"
+  case "$st" in
+    ok)
+      case "$(awk 'NR==1{print $3}' "$f" 2>/dev/null)" in
+        already) ALREADY=$((ALREADY + 1)) ;;
+        *)       MOUNTED=$((MOUNTED + 1)) ;;
+      esac
+      ;;
+    *)
+      BAD="$BAD${BAD:+,}$vname"
+      if [ -z "$BAD_WHY" ]; then
+        BAD_WHY="$(awk 'NR==1{print $3}' "$f" 2>/dev/null)"
+        [ -n "$BAD_WHY" ] || BAD_WHY="noreply"
+      fi
+      ;;
+  esac
+done
+set +f; IFS="$OLDIFS"
+
+# One code, chosen by cause, because the verbs differ:
+#   nocephcommon — a package the nodes need is missing; only an admin can add it
+#   nosudo       — the node's sudo grant is not what cloud-init promised
+#   mount:*      — the Provider side refused or the mon is unreachable
+NOCC=0
+case "$BAD_WHY" in nocephcommon*) NOCC=1 ;; esac
+
+if [ -n "$BAD" ]; then
+  if [ "$NOCC" -eq 1 ]; then
+    # The four causes recover differently enough that naming the wrong one
+    # sends the reader at the wrong problem, so each gets its own sentence.
+    case "$BAD_WHY" in
+      nocephcommon:unmetdeps)
+        cs_fail E_MODELS_NO_CEPH_COMMON "vms=$BAD" "fs_path=$FS_PATH" recover=stop-report:admin \
+          hint="apt on these nodes has unmet dependencies that block every install, not just this one; repair node package state, then re-invoke" ;;
+      nocephcommon:noarchive)
+        cs_fail E_MODELS_NO_CEPH_COMMON "vms=$BAD" "fs_path=$FS_PATH" recover=stop-report:admin \
+          hint="these nodes cannot reach an apt archive, so ceph-common cannot be installed; provide it offline or restore the route to an archive" ;;
+      nocephcommon:nopackage)
+        cs_fail E_MODELS_NO_CEPH_COMMON "vms=$BAD" "fs_path=$FS_PATH" recover=stop-report:admin \
+          hint="the nodes' apt sources do not carry ceph-common; add a source that does (or install it offline) and re-invoke" ;;
+      *)
+        cs_fail E_MODELS_NO_CEPH_COMMON "vms=$BAD" "fs_path=$FS_PATH" recover=stop-report:admin \
+          hint="mount.ceph is missing on these nodes and installing ceph-common failed; see $(cs_log_file) for apt's own message" ;;
+    esac
+  fi
+  case "$BAD_WHY" in
+    nosudo)
+      cs_fail E_MODELS_MOUNT "vms=$BAD" "why=$BAD_WHY" "fs_path=$FS_PATH" \
+        recover="rerun:mount-models" \
+        hint="sudo -n failed on these nodes; the mount needs passwordless sudo, which VM cloud-init is expected to grant" ;;
+    mount:*)
+      cs_fail E_MODELS_MOUNT "vms=$BAD" "why=$BAD_WHY" "fs_path=$FS_PATH" \
+        recover="rerun:mount-models" \
+        hint="mount failed (${BAD_WHY#mount:}); errno 13 is a key/caps mismatch, errno 2 means the subpath is absent from the filesystem" ;;
+    *)
+      cs_fail E_MODELS_MOUNT "vms=$BAD" "why=$BAD_WHY" "fs_path=$FS_PATH" \
+        recover="rerun:mount-models" \
+        hint="the read-only CephFS mount did not come up on these nodes (reason ${BAD_WHY}); see $(cs_log_file)" ;;
+  esac
+fi
+
+cs_ok "vms=$VM_NAMES" "mounted=$MOUNTED" "already=$ALREADY" "fs_path=$FS_PATH" \
+      "mountpoint=$MOUNTPOINT" "mon=$CS_GUIDE_MON" "fstab=$VM_COUNT"

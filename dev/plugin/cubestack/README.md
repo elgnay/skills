@@ -21,6 +21,7 @@ A Claude Code skill for installing a single- or multi-node **CubeStack** cluster
 | **Cleanup** | The bootstrap pod is **ephemeral** — auto-deleted once Step 7 verifies the cluster is healthy |
 | **Run identity** | A run is scoped to what it installs (`--run cubestack<N>`): its own run dir, stamps, retry counters, **and its own bootstrap pod name**. Two installs can therefore run at the same time without applying to, reusing, or deleting each other's pod |
 | **Storage** | Optional **external Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Opt-in, off by default |
+| **Model store** | Optional **host-level CephFS mount** — the Provider's `/models` mounted read-only at `/models` on every node host, from the Provider's own mount guide. Opt-in, and independent of the CSI import |
 
 ---
 
@@ -35,7 +36,7 @@ A Claude Code skill for installing a single- or multi-node **CubeStack** cluster
 | **Step 4** | Generate and byte-verify `cluster.conf` | `configure` |
 | **Step 5** | Fetch the ~22GiB offline package set from MinIO | `fetch-offline` |
 | **Step 6** | Deploy — kubespray plus the enabled addon modules, then wait | `deploy` + `deploy-wait` |
-| **Step 7** | Verify cluster health, then auto-delete the installer pod | `verify` + `pod-down` |
+| **Step 7** | Verify cluster health, *(opt-in: mount the Provider's `/models` on every node)*, then auto-delete the installer pod | `verify` + `mount-models` + `pod-down` |
 
 Steps 1 and 2 are independent (the pod only needs the target **subnet label**, not the VMs), so they run concurrently and join at Step 3. `diagnose <CODE>` produces a bounded excerpt when something fails.
 
@@ -81,6 +82,8 @@ Three verified installs (8 vCPU / 24 GiB per VM), started from a clean state. Ru
 | **Total** | **~24 m 50 s** | **~25 m 42 s** | **~19 m 42 s** |
 
 **Deploy (S6) dominates at roughly half the wall time.** Run 1's S5 includes a failed fetch plus its recovery; once the Step 5 prerequisite is met the fetch lands first try (run 2).
+
+The optional model-store step was added after these three runs, so it has no column above. Measured separately on a 2-node cluster against the Provider's CephFS: **~20 s** when the nodes already have `ceph-common`, and about **+23 s per node** on the first run, which installs it. It runs in Step 7 and is off unless asked for.
 
 Three things in run 3 worth reading rather than skimming:
 
@@ -156,6 +159,52 @@ import — you do not have to remember a flag.
 
 ---
 
+## Optional: the Provider's `/models` on every node
+
+Separately from the CSI import, and independently opt-in, the nodes can be given a
+**host-level kernel mount** of the Provider's CephFS `/models`. This is not a Kubernetes
+volume: it is what a workload expects when it looks for `/models` *on the machine*, and the
+two are orthogonal — the CSI import gives **pods** a filesystem, this gives the **node hosts**
+one, and either can be present without the other.
+
+Point `preflight` at the Provider's Linux-host mount guide:
+
+```bash
+"$S/preflight" --nodes 2 --minio-ep http://<host>:9000 \
+  --cephfs-mount-guide /path/to/cephfs-linux-host-mount.md
+```
+
+Then, in Step 7 — after `verify`, before `pod-down`:
+
+```bash
+"$S/mount-models" --run <run-id> --vms <the Step 3 verdict's vms= list>
+```
+
+**The guide is the credential store, and the only one.** The script parses it for its `fsid`,
+its `mon host`, and the `[client.…]` user and key — there is no second secret file to keep in
+sync, and no new values-file key. The key is staged in a mode-700 temp dir, hash-verified
+after `kubectl cp` into the pod, and streamed to each node over ssh **stdin**, so it never
+appears in an argument list or a process list on either host. All copies are removed on every
+exit path, and `pod-down` shreds the pod staging directory as a backstop. Only the guide's
+**path** is recorded in the run dir.
+
+What it does per node: installs `/etc/ceph/{ceph.conf,ceph.client.<user>.keyring,.secret}`,
+mounts `<mon>:/models` at `/models` **read-only**, appends an `/etc/fstab` line with `_netdev`
+(so a reboot waits for the network instead of hanging on an unreachable mon), then proves the
+mount is genuinely read-only by asserting a write **fails**. It is idempotent — a re-invocation
+reports `already=<n>` and re-asserts the files and the fstab line.
+
+> `--dry-run` parses the guide and prints the resolved plan without touching a pod or a node.
+> It is local and read-only, so it never spends a retry; the key is never printed.
+
+Two failure modes are worth recognising, because both are external: `ceph-common` (which
+provides `mount.ceph`) may be absent on nodes built offline, and the read-only user's caps
+must actually cover the path being mounted. The first is
+`E_MODELS_NO_CEPH_COMMON` → `stop-report:admin`; the second surfaces as a mount errno and is
+a `stop-report` for the Provider, not something a retry fixes.
+
+---
+
 ## Prerequisites
 
 - **kubectl** and a kubeconfig that can reach the SUANOVA KubeVirt cluster
@@ -225,6 +274,7 @@ cp -R dev/plugin/cubestack/scripts ~/.claude/skills/cubestack-install/scripts
 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
 | External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the path to the Provider's exported `external-ceph.env` (the hand-filled mon + keyring route still works but is no longer the recommended one) |
+| Model store on the nodes | **Disabled** (opt-in) — when enabled, supply the path to the Provider's CephFS Linux-host mount guide; Step 7 then mounts its `/models` read-only at `/models` on every node host |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
 

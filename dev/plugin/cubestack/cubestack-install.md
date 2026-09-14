@@ -136,6 +136,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 7 | Service expose mode | `nodeport` (no MetalLB pool needed) |
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
 | 9 | External Ceph | off unless the user asks to import one — then ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`) |
+| 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
 
 Then resolve everything with one read-only call and confirm the printed plan:
 
@@ -236,6 +237,29 @@ hard-fails *mid-deploy*, so `configure` rejects that combination up front instea
 12 minutes in. On the official path CephFS is decided by the env file's `CEPHFS_FS_NAME`,
 which `configure` reads to decide whether `verify` should expect a CephFS StorageClass. RGW is
 internal-mode only — an external Provider's RGW is used directly and is never configured here.
+
+**Model store on the node hosts.** Separate from all of the above, and **opt-in only**, there
+is a step that mounts the Provider's CephFS `/models` at `/models` on every node *host*:
+
+```bash
+"$S/preflight" --nodes 2 --minio-ep http://<host>:9000 \
+  --cephfs-mount-guide /path/to/cephfs-linux-host-mount.md
+```
+
+This is a **host-level kernel mount**, not a Kubernetes volume — it is what a workload that
+expects `/models` to already exist on the machine is looking for. It is orthogonal to the
+StorageClasses the Ceph import creates: those give *pods* a filesystem, this gives the *node*
+one, and either can be present without the other.
+
+**No new values-file key** — this needs nothing in the values file, and the guide path is
+recorded in the run dir (`CEPHFS_GUIDE_FILE`), never in this repo.
+
+The credential never leaves the Provider's guide: at mount time the script parses the guide
+for its `fsid`, `mon host`, and the `[client.…]` user and key, stages them in a mode-700 temp
+dir, verifies the copy inside the pod by hash, and streams it to each node over ssh **stdin** —
+never as an argument, so it cannot appear in a process list. Both the host and pod copies are
+removed on every exit path, and `pod-down` shreds the pod staging directory as a backstop.
+Only the guide's **path** is recorded; its contents are never copied here or into `run.env`.
 
 ## Step 1 — Provision VMs (delegate; never create VMs here)
 
@@ -401,6 +425,22 @@ is the **only** place `--fresh` is ever prescribed.
 
 One call replaces ~10 independent `kubectl get`s. It refuses vacuity explicitly — zero
 nodes is `E_VERIFY_NODES`, not a vacuous OK — and on success writes the `verify-ok` stamp.
+
+**Only if Step 0 was given `--cephfs-mount-guide`** — mount `/models` on every node, *here*,
+after the cluster is proven and before the pod goes away:
+
+```bash
+"$S/mount-models" --run <run-id> --vms <the Step 3 verdict's vms= list>
+```
+
+The pod is the only host that can reach the nodes, so this step cannot run later —
+`pod-down` deletes it. `--guide` is read from the run dir, so it is not passed again.
+The mount is read-only, persisted in `/etc/fstab` with `_netdev` so it survives a reboot, and
+idempotent: a re-invocation reports `already=<n>` and re-asserts the files and the fstab line.
+
+> Add `--dry-run` to parse the guide and print the resolved plan **without** touching a pod or
+> a node. It is local and read-only, so it never spends a retry — the cheap way to check the
+> guide is the right one before committing to the step.
 
 ```bash
 "$S/pod-down" --run <run-id>           # refuses without a verify-ok stamp

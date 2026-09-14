@@ -87,13 +87,23 @@ fi
 # it in place - the installer sources it mid-deploy - so this is the only place
 # it gets removed. It holds the Provider's CSI secrets and RGW keys; deleting
 # the pod without shredding it would be the one credential left behind.
+#
+# /tmp/cubestack-cephfs.* is the mount-models staging directory. That step
+# removes it through its own cs_cleanup hook, but a hook cannot run if the
+# script is SIGKILLed - so this is the backstop, and it matters more than the
+# others: the directory holds a bare CephX key in a file named `.secret`.
 if cs_pod_ready "$TARGET"; then
   cs_logged kubectl -n "$CS_NS" exec "$TARGET" -- bash -c \
     'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf \
               /opt/cubestack-installer/deployments/config/external-ceph.env; do
        [ -f "$f" ] || continue
        shred -u "$f" 2>/dev/null || rm -f "$f"
-     done'
+     done
+     for f in /tmp/cubestack-cephfs.*/*; do
+       [ -f "$f" ] || continue
+       shred -u "$f" 2>/dev/null || rm -f "$f"
+     done
+     rm -rf /tmp/cubestack-cephfs.* 2>/dev/null'
 else
   cs_note "pod $TARGET is not Ready; skipping the values-file shred (deletion removes it anyway)"
 fi
