@@ -11,6 +11,7 @@ A Claude Code skill for managing virtual machines (VM / VMI) in the **SUANOVA Ku
 | Operation | Description |
 |-----------|-------------|
 | **Create** | Clone from a golden image; pick subnet / CPU / RAM / disk / owner label, create in one shot |
+| **Static IP** | Claim an underlay address from an `IPPool`; it survives restart and live migration |
 | **Inspect** | List all VMs / VMIs, filter by owner, see node / IP / status |
 | **Lifecycle** | Start / stop / restart via `runStrategy` |
 | **Connect** | `ssh ubuntu@<IP>` directly (no virtctl needed); console / VNC optional |
@@ -37,8 +38,8 @@ Verified cluster environment:
 | KubeVirt / CDI | v1.8.4 / v1.65.0 |
 | Storage | Rook/Ceph RBD, StorageClass `ceph-rbd-kubevirt` (RWX block, live-migration capable) |
 | Golden images | `default` ns: `ubuntu-22.04/24.04/26.04-server-amd64-img` |
-| Subnets / NADs | `10.66.2.0/24`, `10.66.3.0/24`, one NAD + Whereabouts IPAM per subnet |
-| Whereabouts pools | both subnets: **`x.x.x.200 ~ x.x.x.220`** (gateway `x.x.x.254`) |
+| Subnets / NADs | **10.66.3.0/24** (only live subnet); per-VM minted NADs only — the shared `vm-underlay-10-66-3-0` was retired 2026-09-29 |
+| IP pools | `dev-ip-pool`: `10.66.3.200 ~ 230` — currently the **only** pool; gateway `10.66.3.254`, mode `static` |
 | NAD DNS | `223.5.5.5` / `8.8.8.8` |
 
 ---
@@ -139,11 +140,23 @@ Full YAML for creating VMs / Pools is in `kubevirt-vm-user-guide.md` (§3 clone 
 
 ## Cluster facts at a glance
 
-| Subnet | NAD | Whereabouts pool | Gateway | Nodes |
-|--------|-----|------------------|---------|-------|
-| 10.66.2.0/24 | `vm-underlay-10-66-2-0` | 10.66.2.200 ~ 220 | 10.66.2.254 | `10-66-2-1` (1 node, no migration) |
-| 10.66.3.0/24 | `vm-underlay-10-66-3-0` | 10.66.3.200 ~ 220 | 10.66.3.254 | `10-66-3-46/47` (2 nodes, migratable) |
+**The underlay address comes from an IP pool** (`cubestack-ipam`): annotate the VM with `ipam.cubestack.io/pool`
+and a controller mints it a one-address NAD named `<vm-name>-static`, which `networks[].multus.networkName`
+must reference. The guest stays on DHCP. The address then survives a restart and a live migration.
 
+| Pool | Subnet | Band | Gateway | Mode |
+|------|--------|------|---------|------|
+| **`dev-ip-pool`** ← the only pool | 10.66.3.0/24 | 10.66.3.200 ~ 230 | 10.66.3.254 | `static` (migratable) |
+
+`cubestack-static-v4` was **deleted** — `dev-ip-pool` replaced it. The band-overlap warning that used to
+live here is **resolved**: the shared NAD `vm-underlay-10-66-3-0` (Whereabouts `.200 ~ 220`) was deleted on
+2026-09-29 once nothing referenced it, so `dev-ip-pool` is now the only thing allocating on this subnet.
+Disjointness between pools is still load-bearing if you add another one — see the IPAM guide.
+
+- Nodes: `10-66-3-43`, `10-66-3-46`, `10-66-3-47` — all on **10.66.3.0/24**, and **all three** carry the
+  `kubevirt.io/subnet=10-66-3-0` label (`.43` gained it 2026-09-28, so it is now a scheduling *and*
+  migration target like the other two).
+- ⚠️ The `10.66.2.0/24` subnet and its NAD **no longer exist** (verified 2026-09-28).
 - Golden images: `ubuntu-22.04-server-amd64-img`(3Gi), `ubuntu-24.04-server-amd64-img`(4Gi), `ubuntu-26.04-server-amd64-img`(4Gi)
 - Root disks must be **RWX + Block + `ceph-rbd-kubevirt`** (prerequisite for live migration)
 - VMs should carry an `owner` label (per-person querying, accounting, cleanup)
@@ -154,9 +167,10 @@ Full YAML for creating VMs / Pools is in `kubevirt-vm-user-guide.md` (§3 clone 
 
 - **Deletes are irreversible**: `reclaimPolicy: Delete` — deleting a VM/PVC removes the underlying RBD image. The skill always re-confirms before deleting.
 - **Pool scale-down deletes randomly**: lowering `replicas` may delete a middle instance. To fix the order, configure `scaleInStrategy...sortPolicy`.
-- **IP changes after live migration**: Whereabouts doesn't know about migration; the migration succeeds but the external IP may change (known upstream issue). Be careful with workloads that depend on a fixed IP.
+- **Never hand-assign an underlay IP**: no static guest IP, no hand-written NAD, no Whereabouts `ips` annotation. Overlapping a pool's band with the Whereabouts window is what makes two hosts answer on one address — and on a `static` pool nothing refuses the duplicate.
 - **Guest DNS must be set explicitly**: the NAD's DNS does not reach the guest — `networkData` must include `nameservers` (suggest `223.5.5.5` / `8.8.8.8`).
-- **Subnet and `nodeSelector` must match**: use the NAD for the subnet you want and pin the VM to that subnet's nodes, or scheduling fails / the VM gets a wrong-subnet IP.
+- **Subnet, `nodeSelector` and NAD must all match**: pin the VM to the subnet's labeled nodes *and* make `networkName` the `namespace/name` of the NAD the pool mints, or scheduling fails / the VM gets a wrong-subnet IP.
+- **Creating a pool is admin scope** — a wrong band can take out VMs that are not yours. Using one is user scope.
 
 ---
 
