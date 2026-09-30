@@ -13,7 +13,16 @@ CS_NS="${CS_NS:-default}"
 CS_POD_PREFIX="${CS_POD_PREFIX:-cubestack-install}"
 CS_IMAGE_DEFAULT="harbor.isuanova.com/cubestack/cubestack-installer-cli:latest"
 CS_HARBOR_DEFAULT="harbor.isuanova.com"
-CS_IMAGE_GOLDEN_DEFAULT="ubuntu-22.04-server-amd64-img"
+
+# There is deliberately NO golden-image default here. VM provisioning is delegated
+# to the sibling `suanova-dev-vm` skill (SKILL.md Step 1), and the golden image is
+# part of that skill's VM model - the same model whose default drifts whenever the
+# images change. This plugin used to carry `CS_IMAGE_GOLDEN_DEFAULT` and print a
+# `golden image` line in preflight's CONFIRM block, which read as a resolved
+# decision while no script ever read it back: the two skills then disagreed on the
+# default (kernel 5.15.0-186 here vs 5.15.0-130 in suanova-dev-vm) and nothing
+# noticed. If a caller ever needs image control, it belongs on the VM invocation,
+# not in run.env. Do not reintroduce it.
 
 cs_note() { printf '[%s] %s\n' "$CS_SCRIPT" "$*"; }
 
@@ -111,6 +120,21 @@ cs_run_env_put() {  # $@ = key=value
 # Single-quote a value for safe sourcing. Never use for secrets in a file that
 # will be read back into a printed context.
 cs_q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# A short, comparable form of an image reference or digest.
+#
+# Accepts either shape kubectl hands back -- a full `imageID` of the form
+# `repo/path@sha256:abc...`, or a bare `sha256:abc...` digest as recorded in a
+# stamp -- and reduces both to `sha256:` + the first 12 hex characters. Two
+# different normalizations of the same digest compare equal, which is the whole
+# point: a comparison written inline once for each shape is how a "these are the
+# same build" check silently answers "different". Empty in, empty out.
+cs_image_short() {
+  local d="${1##*@}"     # repo@sha256:...  -> sha256:...
+  d="${d##*:}"           # sha256:...       -> the bare hex (a no-op on bare hex)
+  [ -n "$d" ] || return 0
+  printf 'sha256:%s' "$(printf '%s' "$d" | cut -c1-12)"
+}
 
 cs_stamp_path() { printf '%s/%s' "$(cs_run_dir)" "$1"; }
 cs_stamp_write() { mkdir -p "$(cs_run_dir)" 2>/dev/null || true; printf '%s\n' "$2" > "$(cs_stamp_path "$1")" 2>/dev/null || true; }
@@ -280,9 +304,49 @@ cs_sha256() {
 # The values file is `source`d INSIDE the pod, so an unrecognised key or an
 # unquoted line is an injection vector, not merely a typo. Requiring
 # KEY='value' (single quotes, no embedded quote) makes sourcing safe.
+#
+# Every key here must exist in the installer's cluster.conf.example, because
+# the rewriter can only substitute a key the example carries. That invariant is
+# what the list is FOR, and it is worth re-checking against the installer
+# source whenever the image moves: a key the installer has dropped is accepted
+# here and then silently discarded (load_config is a plain `source`, with no
+# unknown-key validation), so the run stays green while the toggle does nothing.
+# Three such keys - ENVOY_GATEWAY_ENABLED, ENVOY_AI_GATEWAY_ENABLED and
+# PROMETHEUS_ENABLED - were carried here until 2026-09-28, when the installer
+# had already removed their modules entirely (commit dc4f3d7).
+#
+# Kept deliberately narrow: the toggles this skill's profiles and recovery paths
+# actually name, not the installer's whole ~20-toggle surface.
 CS_VALUES_ALLOWED="SSH_PW MINIO_EP MINIO_AK MINIO_SK NODES_MASTER NODES_WORKERS \
-METALLB_POOL CEPH_MODE CEPH_MONITORS CEPH_KEYRING CEPH_POOL CEPH_USER \
-CEPHFS_FS CEPHFS_DATA_POOL CEPHFS_META_POOL CEPHFS_USER CEPHFS_KEYRING"
+METALLB_POOL REGISTRY_IP SERVICE_EXPOSE_MODE METALLB_ENABLED \
+LOCAL_PATH_ENABLED REGISTRY_ENABLED \
+K8S_ENABLED KUBE_VIP_ENABLED LWS_ENABLED NETSHOOT_ENABLED \
+RDMA_ENABLED GPU_OPERATOR_ENABLED MULTUS_ENABLED \
+CEPH_MODE CEPH_EXTERNAL_PROVISION_SMOKE CEPH_MONITORS CEPH_KEYRING CEPH_POOL CEPH_USER \
+CEPHFS_FS CEPHFS_DATA_POOL CEPHFS_META_POOL CEPHFS_USER CEPHFS_KEYRING \
+HARBOR_RO_USER HARBOR_RO_PW"
+
+# HARBOR_RO_USER / HARBOR_RO_PW are the ONE exception to the invariant above:
+# they are THIS SKILL's keys, not the installer's. The rewriter never sees them
+# and neither does cluster.conf.example - they are read by `operator-up` (Step
+# 7), which sources the file inside the pod to log helm in to the Harbor OCI
+# repository and to build the deployed cluster's `harbor-credentials` Secret.
+# They are listed here because the lint is shared, and an unlisted key is
+# refused outright. Removing them is therefore NOT the "fix" it looks like.
+
+# LOCAL_PATH_ENABLED and REGISTRY_ENABLED are the two BASE-module storage toggles
+# (local_path, k8s_registry). Both are the installer's own keys and both really
+# change the cluster, so they are plumbed rather than merely accepted:
+#   * LOCAL_PATH_ENABLED is OVERRIDDEN whenever Ceph is on - with either
+#     CEPH_ENABLED or CEPH_CSI_ENABLED true, load_config forces it to false and
+#     switches the registry backend to ceph-block (lib-common.sh:556-565,
+#     which says outright that an explicit LOCAL_PATH_ENABLED is overridden).
+#     So an external-Ceph run gets local-path=false whatever this says; the key
+#     only bites on a run with no Ceph.
+#   * REGISTRY_ENABLED is the in-cluster registry itself (upstream default 1).
+#     Turning it off removes the addon, the node certs.d trust and the DNAT, and
+#     makes `verify`'s registry-Service check a false failure - which is why
+#     configure records what was asked for and verify reads it back.
 
 # On success sets CS_VALUES_KEYS (space-separated key names actually present).
 # Calls cs_fail on any problem, so invoke it DIRECTLY — never inside $( ).
@@ -562,4 +626,29 @@ cs_cephfs_guide_lint() {  # $1 = path to the CephFS host-mount guide
 
 cs_usage_fail() {  # $1 = usage string
   cs_fail E_USAGE recover=stop-report:user hint="$1"
+}
+
+# Guard for a value-taking flag, called as `cs_need_val "$@"` from inside the
+# argument loop BEFORE the arm reads "$2" and shifts.
+#
+# WHY IT MUST EXIST. `shift 2` on a trailing flag — `--count` with nothing after
+# it — FAILS WITHOUT SHIFTING: $# is 1, so bash refuses, returns 1 (a status the
+# `case` arm discards), and leaves $1 pointing at the same flag. The loop re-tests
+# `[ $# -gt 0 ]`, matches the same arm, and shifts nothing again — forever: no
+# output, no verdict, killed only by whatever timeout wraps the call.
+#
+# It is not only a typo hazard. An UNQUOTED variable that expanded to nothing
+# disappears from argv entirely, so `--run $RUN` with RUN empty arrives as a bare
+# `--run` and hangs. `--run "$RUN"` does not, because the empty word survives as a
+# real argument and the downstream validation rejects it — which is why this is
+# seen on resumed runs, where a value was expected to come from the run's own
+# record and did not.
+#
+# Testing $# HERE is the point: "$@" hands the caller's remaining arguments to
+# this function as its own, so $# is the caller's real count. A helper cannot
+# shift for the caller — `shift` inside a function moves the FUNCTION's
+# positional parameters, never the caller's — so this validates only, and the
+# arm's own `shift 2` is then reached only when it is guaranteed to succeed.
+cs_need_val() {  # $1 = the flag, as the caller saw it
+  [ "$#" -ge 2 ] || cs_usage_fail "$1 requires a value"
 }

@@ -64,15 +64,15 @@ HARBOR_PORT="443"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --vms)         VMS="${2:-}"; shift 2 ;;
-    --run)         cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)         POD_ARG="${2:-}"; shift 2 ;;
-    --user)        SSH_USER="${2:-}"; shift 2 ;;
-    --password)    SSH_PW="${2:-}"; shift 2 ;;
-    --minio-ip)    MINIO_IP="${2:-}"; shift 2 ;;
-    --minio-port)  MINIO_PORT="${2:-}"; shift 2 ;;
-    --harbor)      HARBOR="${2:-}"; shift 2 ;;
-    --harbor-port) HARBOR_PORT="${2:-}"; shift 2 ;;
+    --vms) cs_need_val "$@";         VMS="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";         cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";         POD_ARG="${2:-}"; shift 2 ;;
+    --user) cs_need_val "$@";        SSH_USER="${2:-}"; shift 2 ;;
+    --password) cs_need_val "$@";    SSH_PW="${2:-}"; shift 2 ;;
+    --minio-ip) cs_need_val "$@";    MINIO_IP="${2:-}"; shift 2 ;;
+    --minio-port) cs_need_val "$@";  MINIO_PORT="${2:-}"; shift 2 ;;
+    --harbor) cs_need_val "$@";      HARBOR="${2:-}"; shift 2 ;;
+    --harbor-port) cs_need_val "$@"; HARBOR_PORT="${2:-}"; shift 2 ;;
     -h|--help)     usage; cs_ok "help=1" ;;
     *)             cs_usage_fail "unknown argument: $1" ;;
   esac
@@ -94,8 +94,10 @@ if [ -z "$MINIO_IP" ]; then
 fi
 [ -n "$MINIO_IP" ] || cs_usage_fail "--minio-ip is required (not set on the command line or in run.env)"
 
-cs_budget_guard
+# The kubeconfig guard sits ABOVE the budget for reserve-vips' reason: spending
+# an attempt on a host that cannot answer would make the budget meaningless.
 cs_kubeconfig_guard
+cs_budget_guard
 
 # --- 1. pod exec ------------------------------------------------------------
 # cs_pod_require sets CS_POD and fails through the verdict (never inside $( )).

@@ -44,10 +44,10 @@ USAGE
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --values) VALUES="${2:-}"; shift 2 ;;
-    --run)    cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)    POD_ARG="${2:-}"; shift 2 ;;
-    --floor)  FLOOR_MIB="${2:-}"; shift 2 ;;
+    --values) cs_need_val "$@"; VALUES="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";    cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";    POD_ARG="${2:-}"; shift 2 ;;
+    --floor) cs_need_val "$@";  FLOOR_MIB="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac

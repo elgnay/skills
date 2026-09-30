@@ -10,8 +10,22 @@
 # menu where a rule exists:
 #   subnet -> the one with the most nodes able to host the requested shape
 #             (ties break on the lexicographically lowest subnet label)
-#   NAD    -> the one bound to that subnet
 #   index  -> first free cubestack<N>, across VMs *and* pools
+#
+# It deliberately resolves NOTHING about the VM's network attachment. A VM gets
+# its underlay address from a **cubestack-ipam pool claim**, and choosing that
+# pool is VM provisioning — which Step 1 delegates wholesale to the sibling
+# `suanova-dev-vm` skill, along with the manifest, the cloud-init hashing and the
+# `kubectl apply`. There is no NAD to select either: the controller mints
+# `default/<vm-name>-static` from the claim, so it does not exist yet at Step 0.
+#
+# A predecessor of this file grepped NAD names for the subnet label. That held
+# only while a single shared NAD (`vm-underlay-10-66-3-0`) carried the label in
+# its name; the cluster deleted it on 2026-09-29 and moved every VM to a pool
+# claim, so the grep matched nothing and healthy runs died as
+# `E_SUBNET_UNRESOLVED recover=stop-report:admin`. The subnet had resolved fine.
+# Resolving the pool here instead would only re-create the fault in a new place:
+# the same cluster fact, held in two skills, updated in one.
 #
 # Writes <run-dir>/run.env (resolved values, NON-SECRET) and prints a confirm
 # block for the user.
@@ -28,14 +42,11 @@ usage() {
 preflight [options]
   --nodes N        node count (default 1)
   --owner USER     owner label (default $USER)
-  --image IMG      golden image (default ubuntu-22.04-server-amd64-img)
-  --cp N           vCPU per VM (default 8)
-  --mem GI         RAM GiB per VM (default 24)
-  --disk GI        root disk GiB (default 80)
+  --cp N           vCPU per VM (default 24 on a 1-node box, 8 per VM otherwise)
+  --mem GI         RAM GiB per VM (default 64 on a 1-node box, 24 per VM otherwise)
+  --disk GI        root disk GiB (default 200 on a 1-node box, 100 per VM otherwise)
   --subnet LABEL   force a subnet label instead of auto-selecting
-  --nad NAME       force a NetworkAttachmentDefinition
-  --expose MODE    nodeport (default) | metallb
-  --pool-range R   MetalLB range, only meaningful with --expose metallb
+  --expose MODE    metallb (default) | nodeport
   --index N        force the cubestack<N> index
   --harbor FQDN    Harbor endpoint (default harbor.isuanova.com)
   --minio-ep URL   MinIO endpoint for the offline fetch
@@ -53,6 +64,19 @@ preflight [options]
                    guide is parsed at mount time for its fsid, mon and CephX
                    key, so no credential from it is ever copied into the run dir,
                    the values file or this repo.
+  --harbor-ro-values FILE
+                   a Harbor robot account with pull on suanova-private, suanova
+                   and mirrors, as KEY='value' lines (HARBOR_RO_USER,
+                   HARBOR_RO_PW). REQUIRED unless --no-operator: Step 7 turns the
+                   k8s box into a cubestack box and pulls the operator chart from
+                   Harbor OCI. Checked for shape here, at Step 0, while the user
+                   is still in the room — a malformed credential found at Step 7
+                   would fail a run that has already spent a full deploy. Only
+                   the FILE PATH is recorded. Write it BEFORE running preflight.
+  --no-operator    build only a k8s box: skip the Step 7 cubestack-box install
+                   (cubestack-operator + the CubeStackCluster CR). The run then
+                   ends at verify, with a verified k8s box and no platform.
+                   Off by default.
   --run ID         pin the run id instead of deriving it from the target
                    (default: cubestack<N>, the resolved target). Every other
                    script takes the same flag; pass it on, or two installs
@@ -63,45 +87,71 @@ USAGE
 
 NODES=1
 OWNER="${USER:-$(id -un)}"
-IMAGE="$CS_IMAGE_GOLDEN_DEFAULT"
-CP=8
-MEM_GI=24
-DISK_GI=80
+# Shape is resolved AFTER the argument loop, because its default depends on NODES
+# (see "shape defaults" below). Empty here means "the caller did not say".
+CP=""
+MEM_GI=""
+DISK_GI=""
 SUBNET=""
-NAD=""
-EXPOSE="nodeport"
-POOL_RANGE=""
+# LoadBalancer (MetalLB) is the DEFAULT. MetalLB is a required component of a box
+# this skill builds, and it is not a component toggle: it is gated by this global
+# expose mode, and nodeport mode makes the installer 自动关闭 it. Leaving nodeport
+# as the default therefore produced clusters with no metallb-system and no error
+# anywhere - the failure was invisible. `--expose nodeport` remains an explicit
+# opt-out, and `verify` does not demand MetalLB on a run that asked for it.
+EXPOSE="metallb"
 INDEX=""
 HARBOR="$CS_HARBOR_DEFAULT"
 MINIO_EP=""
 EXTERNAL_CEPH=0
 EXTERNAL_CEPH_ENV=""
 CEPHFS_GUIDE=""
+OPERATOR=1
+HARBOR_RO_VALUES=""
 RUN_ID=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --nodes)   NODES="${2:-}"; shift 2 ;;
-    --owner)   OWNER="${2:-}"; shift 2 ;;
-    --image)   IMAGE="${2:-}"; shift 2 ;;
-    --cp)      CP="${2:-}"; shift 2 ;;
-    --mem)     MEM_GI="${2:-}"; shift 2 ;;
-    --disk)    DISK_GI="${2:-}"; shift 2 ;;
-    --subnet)  SUBNET="${2:-}"; shift 2 ;;
-    --nad)     NAD="${2:-}"; shift 2 ;;
-    --expose)  EXPOSE="${2:-}"; shift 2 ;;
-    --pool-range) POOL_RANGE="${2:-}"; shift 2 ;;
-    --index)   INDEX="${2:-}"; shift 2 ;;
-    --harbor)  HARBOR="${2:-}"; shift 2 ;;
-    --minio-ep) MINIO_EP="${2:-}"; shift 2 ;;
+    --nodes) cs_need_val "$@";   NODES="${2:-}"; shift 2 ;;
+    --owner) cs_need_val "$@";   OWNER="${2:-}"; shift 2 ;;
+    --cp) cs_need_val "$@";      CP="${2:-}"; shift 2 ;;
+    --mem) cs_need_val "$@";     MEM_GI="${2:-}"; shift 2 ;;
+    --disk) cs_need_val "$@";    DISK_GI="${2:-}"; shift 2 ;;
+    --subnet) cs_need_val "$@";  SUBNET="${2:-}"; shift 2 ;;
+    --expose) cs_need_val "$@";  EXPOSE="${2:-}"; shift 2 ;;
+    --index) cs_need_val "$@";   INDEX="${2:-}"; shift 2 ;;
+    --harbor) cs_need_val "$@";  HARBOR="${2:-}"; shift 2 ;;
+    --minio-ep) cs_need_val "$@"; MINIO_EP="${2:-}"; shift 2 ;;
     --external-ceph) EXTERNAL_CEPH=1; shift ;;
-    --external-ceph-env) EXTERNAL_CEPH_ENV="${2:-}"; shift 2 ;;
-    --cephfs-mount-guide) CEPHFS_GUIDE="${2:-}"; shift 2 ;;
-    --run)     RUN_ID="${2:-}"; shift 2 ;;
+    --external-ceph-env) cs_need_val "$@"; EXTERNAL_CEPH_ENV="${2:-}"; shift 2 ;;
+    --cephfs-mount-guide) cs_need_val "$@"; CEPHFS_GUIDE="${2:-}"; shift 2 ;;
+    --harbor-ro-values) cs_need_val "$@";   HARBOR_RO_VALUES="${2:-}"; shift 2 ;;
+    --no-operator)        OPERATOR=0; shift ;;
+    --run) cs_need_val "$@";     RUN_ID="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
+
+# --- shape defaults ---------------------------------------------------------
+# The default shape depends on the NODE COUNT, because a 1-node box is a
+# different machine from a member of a multi-node one. A single node carries the
+# control plane, the worker load AND every addon on the same VM - Rook/Ceph, the
+# in-cluster registry, MetalLB, and (on a cubestack box) five platform components
+# - where a multi-node box spreads them. The flat 8 vCPU / 24 GiB default was
+# sized for the multi-node case and left the 1-node box as the tightest shape
+# this skill builds.
+#
+# Empty means "the caller did not say", which is exactly what lets an explicit
+# --cp/--mem/--disk win: the flag fills the variable and the default is skipped.
+# This runs BEFORE the validation below and before the capacity filter, which is
+# what the shape actually gates - a default the nodes cannot host has to fail
+# here, at Step 0, naming the numbers rather than halfway through a deploy.
+if [ "$NODES" -eq 1 ]; then
+  CP="${CP:-24}"; MEM_GI="${MEM_GI:-64}"; DISK_GI="${DISK_GI:-200}"
+else
+  CP="${CP:-8}"; MEM_GI="${MEM_GI:-24}"; DISK_GI="${DISK_GI:-100}"
+fi
 
 for v in NODES CP MEM_GI DISK_GI; do
   eval "n=\${$v}"
@@ -109,9 +159,12 @@ for v in NODES CP MEM_GI DISK_GI; do
   [ "$n" -gt 0 ] || cs_usage_fail "$v must be greater than zero"
 done
 case "$EXPOSE" in nodeport|metallb) ;; *) cs_usage_fail "--expose must be nodeport or metallb" ;; esac
-if [ "$EXPOSE" = "metallb" ] && [ -z "$POOL_RANGE" ]; then
-  cs_usage_fail "--expose metallb needs --pool-range <start>-<end>"
-fi
+# Metallic mode needs no pool here any more: the range is not chosen at Step 0,
+# it is CLAIMED from the host's cubestack-ipam at Step 1b (reserve-vips), which
+# is the only way to be sure MetalLB can never be handed an address a VM already
+# holds. `configure` refuses the run if Step 1b never happened, and `verify`
+# asserts the pool that ends up on the cluster is the block that was reserved —
+# so a missed Step 1b is caught in two places, neither of them here.
 
 # Passing the Provider's env file IS an external Ceph import, so the flag is
 # derived rather than required - a caller cannot ask for the official path and
@@ -137,6 +190,23 @@ fi
 # one does NOT imply --external-ceph.
 if [ -n "$CEPHFS_GUIDE" ]; then
   cs_cephfs_guide_lint "$CEPHFS_GUIDE"
+fi
+
+# The Harbor robot credential is what Step 7 installs the operator with, and it
+# is checked HERE for the same reason as the two above: a malformed credential
+# discovered at Step 7 fails a run that has already spent a full deploy, and this
+# check is local, cheap and read-only. Reports key NAMES only, never content.
+#
+# The credential FILE IS the switch — passing it turns the platform step back on
+# even next to --no-operator, because asking for the credential is asking for the
+# step. The reverse is refused loudly rather than resolved by a rule the user
+# cannot see: a bare `--no-operator` must be how you say "no operator".
+if [ -n "$HARBOR_RO_VALUES" ]; then
+  OPERATOR=1
+  cs_values_lint "$HARBOR_RO_VALUES" HARBOR_RO_USER HARBOR_RO_PW
+fi
+if [ "$OPERATOR" = "1" ] && [ -z "$HARBOR_RO_VALUES" ]; then
+  cs_usage_fail "--harbor-ro-values FILE is required unless --no-operator: Step 7 installs the platform operator by default and needs a Harbor robot credential (Write the file before running preflight)"
 fi
 
 # The budget is consumed AFTER the run id is known (below), so preflight's
@@ -170,29 +240,17 @@ if [ -z "$SUBNET" ]; then
   fi
 fi
 
-# --- NAD --------------------------------------------------------------------
-if [ -z "$NAD" ]; then
-  NADS="$(kubectl -n "$CS_NS" get network-attachment-definitions -o name 2>/dev/null \
-          | sed 's|^.*/||')"
-  if [ -z "$NADS" ]; then
-    cs_fail E_SUBNET_UNRESOLVED "subnet=$SUBNET" recover=stop-report:admin \
-      hint="no NetworkAttachmentDefinition in namespace ${CS_NS}"
-  fi
-  for cand in "$SUBNET" "$(printf '%s' "$SUBNET" | sed 's/-[0-9]*$//')"; do
-    hit="$(printf '%s\n' "$NADS" | grep -F -- "$cand" | head -1)"
-    [ -n "$hit" ] && { NAD="$hit"; break; }
-  done
-  if [ -z "$NAD" ]; then
-    n_nads="$(printf '%s\n' "$NADS" | grep -c .)"
-    if [ "$n_nads" = "1" ]; then
-      NAD="$NADS"
-    else
-      cs_fail E_SUBNET_UNRESOLVED "subnet=$SUBNET" \
-        "nads=$(printf '%s' "$NADS" | tr '\n' ',')" recover=stop-report:admin \
-        hint="no NAD matches this subnet and more than one exists; pass --nad"
-    fi
-  fi
-fi
+# --- pool vs subnet ---------------------------------------------------------
+# The default pool is a literal on 10.66.3.0/24. On any other subnet it is
+# off-L2: MetalLB never announces it, the registry VIP is unreachable and every
+# node pull fails - with nothing in the install saying why. The subnet label
+# carries the network (10-66-3-0), which is enough to catch that HERE, at Step 0,
+# The off-subnet check that used to live here has MOVED to `reserve-vips`. It
+# could only ever compare the pool against the subnet once the pool existed, and
+# at Step 0 it does not: the addresses are claimed from the host's ledger at Step
+# 1b. Doing it there also catches the case this check could never see — the host
+# offering a pool on a subnet the box's nodes are not on, which is off-L2, so
+# MetalLB never announces and every node pull fails with nothing naming the cause.
 
 # --- free index -------------------------------------------------------------
 if [ -z "$INDEX" ]; then
@@ -244,19 +302,25 @@ mkdir -p "$(cs_run_dir)/verdict" "$(cs_run_dir)/logs" 2>/dev/null || true
 
 cs_budget_guard
 
-: > "$(cs_run_env_file)" 2>/dev/null || true
-cs_run_env_set \
+# run.env is MERGED, not truncated. Truncating destroys the keys that later steps
+# write — POD_NAME (pod-up), METALLB_REQUESTED (configure), EXTERNAL_CEPH_ENV and
+# EXTERNAL_CEPH_ENV_DEST (configure, which `deploy` re-checks before launching) —
+# so a preflight re-run partway through a healthy run used to silently disable
+# preconditions the later steps then failed on, or worse, did not. It would also
+# wipe a Step 1b VIP reservation.
+#
+# The keys below are the ones preflight OWNS; only those are replaced, so
+# re-resolving an answer changes exactly what it should and nothing else.
+cs_run_env_put \
   "RUN_ID=$(cs_q "$RUN_ID")" \
   "NODES=$(cs_q "$NODES")" \
   "OWNER=$(cs_q "$OWNER")" \
-  "IMAGE=$(cs_q "$IMAGE")" \
   "CP=$(cs_q "$CP")" \
   "MEM_GI=$(cs_q "$MEM_GI")" \
   "DISK_GI=$(cs_q "$DISK_GI")" \
   "SUBNET=$(cs_q "$SUBNET")" \
-  "NAD=$(cs_q "$NAD")" \
   "EXPOSE=$(cs_q "$EXPOSE")" \
-  "POOL_RANGE=$(cs_q "$POOL_RANGE")" \
+  "POOL_RANGE=$(cs_q "")" \
   "INDEX=$(cs_q "$INDEX")" \
   "HARBOR=$(cs_q "$HARBOR")" \
   "MINIO_EP=$(cs_q "$MINIO_EP")" \
@@ -264,22 +328,30 @@ cs_run_env_set \
   "EXTERNAL_CEPH_ENV_FILE=$(cs_q "$EXTERNAL_CEPH_ENV")" \
   "CEPHFS_MOUNT=$(cs_q "$([ -n "$CEPHFS_GUIDE" ] && echo 1 || echo 0)")" \
   "CEPHFS_GUIDE_FILE=$(cs_q "$CEPHFS_GUIDE")" \
+  "OPERATOR_ENABLED=$(cs_q "$OPERATOR")" \
+  "HARBOR_RO_VALUES_FILE=$(cs_q "$HARBOR_RO_VALUES")" \
   "POOL=$(cs_q "$POOL")" \
   "VM_NAMES=$(cs_q "$VM_NAMES")"
+
+# POOL_RANGE is deliberately reset to empty: it is no longer a Step 0 answer but
+# the block Step 1b reserves, and a stale range from a previous resolution would
+# otherwise look like a live reservation to `configure`. It has to be WRITTEN
+# (not merely omitted) so `reserve-vips` has a line to replace.
 
 cat <<EOF
 CONFIRM — resolved prerequisites (nothing has been created yet)
   nodes         $NODES
   VMs           $VM_NAMES${POOL:+   (VirtualMachinePool $POOL)}
   shape         ${CP} vCPU / ${MEM_GI} GiB RAM / ${DISK_GI} GiB root
-  subnet        $SUBNET   (NAD $NAD)
+  subnet        $SUBNET
   owner label   owner=$OWNER
-  golden image  $IMAGE
-  expose        $EXPOSE${POOL_RANGE:+   (pool $POOL_RANGE)}
+  expose        $EXPOSE$([ "$EXPOSE" = "metallb" ] && echo "   (VIP block reserved at Step 1b from the host's IPAM; --count there sets how many)")
   Harbor        $HARBOR
   MinIO         ${MINIO_EP:-<not set — required before fetch-offline>}
   external Ceph $([ "$EXTERNAL_CEPH" = "1" ] && echo yes || echo no)${EXTERNAL_CEPH_ENV:+   (official import: $(basename "$EXTERNAL_CEPH_ENV"))}
   models mount  $([ -n "$CEPHFS_GUIDE" ] && echo "yes   ($(basename "$CEPHFS_GUIDE") -> /models on every node)" || echo "no    (Step 7 skips it)")
+  building      $([ "$OPERATOR" = "1" ] && echo "cubestack box   (k8s box + cubestack-operator + the CubeStackCluster CR)" || echo "k8s box only    (--no-operator; the run ends at verify)")
+  harbor robot  $([ "$OPERATOR" = "1" ] && echo "$(basename "$HARBOR_RO_VALUES")   (read at Step 7, never stored in the run dir)" || echo "-")
 
   run id        $RUN_ID        (--run $RUN_ID on every later step)
   run dir       $(cs_run_dir)
@@ -289,7 +361,9 @@ Secrets (SSH password, MinIO keys, Ceph keyrings) are NOT resolved here and are
 never stored in the run dir — they arrive through the Write -> configure path.
 EOF
 
-cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" "nad=$NAD" \
+cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" \
       "vms=$VM_NAMES" "ceph_env=$([ -n "$EXTERNAL_CEPH_ENV" ] && echo official || echo none)" \
       "models_mount=$([ -n "$CEPHFS_GUIDE" ] && echo on || echo off)" \
+      "operator=$([ "$OPERATOR" = "1" ] && echo on || echo off)" \
+      "harbor_ro=$([ -n "$HARBOR_RO_VALUES" ] && echo 1 || echo 0)" \
       "run_dir=$(cs_run_dir)"

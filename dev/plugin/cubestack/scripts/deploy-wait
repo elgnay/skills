@@ -49,10 +49,10 @@ CHUNK=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --run)    cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)    POD_OPT="${2:-}"; shift 2 ;;
-    --budget) BUDGET="${2:-}"; shift 2 ;;
-    --chunk)  CHUNK="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";    cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";    POD_OPT="${2:-}"; shift 2 ;;
+    --budget) cs_need_val "$@"; BUDGET="${2:-}"; shift 2 ;;
+    --chunk) cs_need_val "$@";  CHUNK="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
@@ -65,8 +65,10 @@ for v in BUDGET CHUNK; do
   [ "$n" -gt 0 ] || cs_usage_fail "$v must be greater than zero"
 done
 
-cs_budget_guard
+# The kubeconfig guard sits ABOVE the budget for reserve-vips' reason: spending
+# an attempt on a host that cannot answer would make the budget meaningless.
 cs_kubeconfig_guard
+cs_budget_guard
 cs_pod_require "$POD_OPT"
 
 # --- budget -----------------------------------------------------------------

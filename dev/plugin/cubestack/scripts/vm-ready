@@ -52,10 +52,10 @@ NAMES=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pool)      POOL="${2:-}"; shift 2 ;;
-    --expect)    EXPECT="${2:-}"; shift 2 ;;
-    --namespace|-n) NS="${2:-}"; shift 2 ;;
-    --run)       cs_run_opt "${2:-}"; shift 2 ;;
+    --pool) cs_need_val "$@";      POOL="${2:-}"; shift 2 ;;
+    --expect) cs_need_val "$@";    EXPECT="${2:-}"; shift 2 ;;
+    --namespace|-n) cs_need_val "$@"; NS="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";       cs_run_opt "${2:-}"; shift 2 ;;
     -h|--help)   usage; cs_ok "help=1" ;;
     -*)          cs_usage_fail "unknown argument: $1" ;;
     *)           NAMES="$NAMES${NAMES:+,}$1"; shift ;;
@@ -90,8 +90,10 @@ if [ -n "$POOL" ]; then
   done
 fi
 
-cs_budget_guard
+# The kubeconfig guard sits ABOVE the budget for reserve-vips' reason: spending
+# an attempt on a host that cannot answer would make the budget meaningless.
 cs_kubeconfig_guard
+cs_budget_guard
 
 # --- inspect every name -----------------------------------------------------
 # Batched: one verdict names every bad VM, so N bad VMs cost one round trip.

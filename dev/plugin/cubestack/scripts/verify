@@ -49,9 +49,9 @@ WANT_CEPH=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --run)          cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)          POD_ARG="${2:-}"; shift 2 ;;
-    --expect-nodes) EXPECT_NODES="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";          cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";          POD_ARG="${2:-}"; shift 2 ;;
+    --expect-nodes) cs_need_val "$@"; EXPECT_NODES="${2:-}"; shift 2 ;;
     --ceph)         WANT_CEPH=1; shift ;;
     -h|--help)      usage; cs_ok "help=1" ;;
     *)              cs_usage_fail "unknown argument: $1" ;;
@@ -63,8 +63,12 @@ if [ -n "$EXPECT_NODES" ]; then
   [ "$EXPECT_NODES" -gt 0 ] || cs_usage_fail "--expect-nodes must be greater than zero"
 fi
 
-cs_budget_guard
+# The kubeconfig guard sits ABOVE the budget for reserve-vips' reason: spending
+# an attempt on a host that cannot answer would make the budget meaningless. A
+# missing or unreachable KUBECONFIG is a host environment error, not a failure
+# of this step, and nothing about re-invoking would change it.
 cs_kubeconfig_guard
+cs_budget_guard
 # Sets CS_POD and fails through the verdict (never inside $( )).
 cs_pod_require "$POD_ARG"
 
@@ -74,6 +78,21 @@ kget() { cs_pod_exec "$CS_POD" kubectl --kubeconfig="$KCONF" "$@"; }
 # One resource name per line; used where a "No resources found" notice must not
 # be mistaken for a resource.
 names_only() { grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*$'; }
+
+# ip_in_range <ip> <lo> <hi> — true when ip is numerically within [lo, hi].
+# Numeric, not a string prefix: a /24 prefix test would accept 10.66.3.2071 and
+# reject nothing that matters, while a range test is exactly the assertion the
+# reservation makes.
+ip_in_range() {
+  awk -v ip="$1" -v lo="$2" -v hi="$3" 'BEGIN {
+    if (split(ip,a,".") != 4 || split(lo,l,".") != 4 || split(hi,h,".") != 4) exit 1
+    for (i = 1; i <= 4; i++) if (a[i] !~ /^[0-9]+$/ || l[i] !~ /^[0-9]+$/ || h[i] !~ /^[0-9]+$/) exit 1
+    ipn = ((a[1]*256 + a[2])*256 + a[3])*256 + a[4]
+    lon = ((l[1]*256 + l[2])*256 + l[3])*256 + l[4]
+    hin = ((h[1]*256 + h[2])*256 + h[3])*256 + h[4]
+    exit !(ipn >= lon && ipn <= hin)
+  }'
+}
 
 KCONF="$CS_KCONF"
 
@@ -168,8 +187,17 @@ CEPH_CHECK=0
 [ "$CEPH_RUN" = "1" ] && CEPH_CHECK=1
 [ "$WANT_CEPH" = "1" ] && CEPH_CHECK=1
 
+# Is MetalLB required for this run? It is the DEFAULT (SERVICE_EXPOSE_MODE=
+# metallb), and it is gated by that mode rather than by a toggle of its own - so
+# a run that resolves to nodeport installs none, silently, and the result looks
+# identical to a metallb install that failed outright. run.env carries the mode
+# `configure` applied; absent (a run dir older than this key) means ON, matching
+# the default.
+METALLB_REQ="$(cs_run_env_get METALLB_REQUESTED)"; [ -n "$METALLB_REQ" ] || METALLB_REQ=1
+
 NS_WANT="default,kube-system"
 [ "$CEPH_CHECK" = "1" ] && NS_WANT="$NS_WANT,rook-ceph"
+[ "$METALLB_REQ" = "1" ] && NS_WANT="$NS_WANT,metallb-system"
 NS_MISSING=""
 OLDIFS="$IFS"
 IFS=,
@@ -194,34 +222,91 @@ HAS_REGISTRY=0
 if printf '%s\n' "$SVC_LIST" | tr ',' '\n' | grep -qxF 'registry'; then
   HAS_REGISTRY=1
 fi
-if [ "$HAS_REGISTRY" -ne 1 ]; then
+# ...but only when the run actually asked for the registry. REGISTRY_ENABLED=false
+# is a supported key, and it removes the Service on purpose; requiring it anyway
+# would fail a cluster built exactly as requested - a false negative that sends
+# the model to rerun:deploy, which reproduces it. Absent (a run dir older than
+# this key) means ON, i.e. the behaviour above is unchanged for old runs.
+REGISTRY_REQ="$(cs_run_env_get REGISTRY_REQUESTED)"; [ -n "$REGISTRY_REQ" ] || REGISTRY_REQ=1
+if [ "$REGISTRY_REQ" = "1" ] && [ "$HAS_REGISTRY" -ne 1 ]; then
   cs_fail E_VERIFY_SERVICE "services=${SVC_LIST:--}" recover=rerun:verify \
     hint="the cluster's registry Service is absent - the registry module did not complete"
 fi
 
-# Envoy Gateway is optional (ENVOY_GATEWAY_ENABLED can be off), and its
-# data-plane Service only exists once a Gateway resource exists. So it is
-# required only when the deployed cluster really is running a Gateway: gating on
-# an addon that may legitimately not be there is exactly the false-negative trap
-# the `-l owner=` poll fell into.
-ENVOY_SVC="$(printf '%s\n' "$SVC_LIST" | tr ',' '\n' | grep -F 'envoy' | head -1)"
-ENVOY_EXPECT=0
-if [ -z "$ENVOY_SVC" ]; then
-  # names_only first: the NotFound error text itself names the CRD, so matching
-  # before filtering would report "installed" for a cluster without Gateway API.
-  GW_CRD="$(kget get crd gatewayclasses.gateway.networking.k8s.io --no-headers \
-            -o custom-columns='N:.metadata.name' 2>&1 | names_only)"
-  case "$GW_CRD" in
-    *gatewayclasses*)
-      GW_ANY="$(kget get gateway -A --no-headers -o custom-columns='N:.metadata.name' 2>&1 | names_only | head -1)"
-      [ -n "$GW_ANY" ] && ENVOY_EXPECT=1
-      ;;
-  esac
+# MetalLB. The namespace is NOT sufficient on its own: the installer creates
+# metallb-system and then populates it, so a namespace with no pool is a partial
+# install that would announce nothing and still pass a namespace-only check.
+#
+# Checked by KIND rather than by name. The installer calls the pool `primary`;
+# under the reserve-then-deploy design that name is the installer's to choose
+# again, because nothing replaces the pool after the deploy any more (the old
+# design deleted it and applied an `autoAssign: false` replacement over the whole
+# subnet, which is why a renamed pool used to be a legitimate cluster). What is
+# asserted instead is the CONTENT — the addresses — which is the property that
+# actually matters and the one the reservation exists to guarantee.
+if [ "$METALLB_REQ" = "1" ]; then
+  MLB_POOLS="$(kget get ipaddresspools.metallb.io -n metallb-system --no-headers \
+    -o custom-columns='N:.metadata.name' 2>/dev/null | names_only | tr '\n' ',' | sed 's/,$//')"
+  if [ -z "$MLB_POOLS" ]; then
+    cs_fail E_VERIFY_SERVICE "metallb=no-pool" recover=rerun:verify \
+      hint="metallb-system exists but holds no IPAddressPool - the metallb module did not complete"
+  fi
+
+  # The reservation assertions. Gated on run.env carrying POOL_RANGE, so a run
+  # dir older than Step 1b behaves exactly as it did before this was added
+  # (the REGISTRY_REQUESTED convention).
+  VIP_POOL_RANGE="$(cs_run_env_get POOL_RANGE)"
+  if [ -n "$VIP_POOL_RANGE" ]; then
+    VIP_LO="${VIP_POOL_RANGE%%-*}"
+    VIP_HI="${VIP_POOL_RANGE##*-}"
+
+    # 1. The pool on the cluster must BE the reserved block. If the installer
+    #    fell back to the example's placeholder, or a hand-edit widened it, then
+    #    MetalLB can hand out an address the host's ledger has given to a VM -
+    #    the silent in-band collision this whole design removes. A pool larger
+    #    than the block is as much a failure as an empty one.
+    MLB_ADDRS="$(kget get ipaddresspools.metallb.io -n metallb-system \
+      -o jsonpath='{range .items[*]}{.spec.addresses[*]}{"\n"}{end}' 2>/dev/null \
+      | sed '/^[[:space:]]*$/d' | tr -d ' ' | sort | tr '\n' ',' | sed 's/,$//')"
+    VIP_WANT="$(printf '%s\n' "$VIP_POOL_RANGE" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | tr -d ' ' | sort | tr '\n' ',' | sed 's/,$//')"
+    if [ "$MLB_ADDRS" != "$VIP_WANT" ]; then
+      cs_fail E_VERIFY_SERVICE "pool_want=$VIP_WANT" "pool_got=${MLB_ADDRS:--}" recover=rerun:verify \
+        hint="the cluster's MetalLB pool is not the block Step 1b reserved from the host IPAM, so it can announce an address the ledger has given to a VM; re-run reserve-vips, then configure, then deploy"
+    fi
+
+    # 2. Every LoadBalancer Service that HAS an address must sit inside the
+    #    block. One still <pending> is reported, not failed: on a k8s box the
+    #    gateway does not exist yet, and a Service that has no address has not
+    #    collided with anything.
+    VIP_PENDING=""
+    for s in $(kget get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}/{.metadata.name}={.status.loadBalancer.ingress[0].ip}{"\n"}{end}' 2>/dev/null); do
+      case "$s" in
+        *=)  VIP_PENDING="${VIP_PENDING}${VIP_PENDING:+,}${s%=*}"; continue ;;
+        *=*) ;;
+        *)   continue ;;
+      esac
+      ip="${s##*=}"
+      if ! ip_in_range "$ip" "$VIP_LO" "$VIP_HI"; then
+        cs_fail E_VERIFY_SERVICE "svc=${s%%=*}" "vip=$ip" "pool=$VIP_POOL_RANGE" recover=rerun:verify \
+          hint="a LoadBalancer Service holds an address outside the reserved block - MetalLB assigned it from a pool wider than the reservation, which is the collision this design exists to prevent"
+      fi
+    done
+  fi
 fi
-if [ -z "$ENVOY_SVC" ] && [ "$ENVOY_EXPECT" = "1" ]; then
-  cs_fail E_VERIFY_SERVICE "services=${SVC_LIST:--}" recover=rerun:verify \
-    hint="a Gateway exists but no envoy data-plane Service does; Envoy Gateway is not healthy"
-fi
+
+# The registry Service is the only addon Service checked here, and that is
+# deliberate: it is a BASE module, so its absence really does mean the deploy
+# did not complete - unless the run turned it off, which is what REGISTRY_REQ
+# carries. Addon Services generally must not be gated on - an addon may
+# legitimately be off, and failing on one that is simply not deployed is the
+# false-negative trap the `-l owner=` poll fell into.
+#
+# This used to carry an Envoy Gateway data-plane check as well, conditional on a
+# Gateway resource existing. Both envoy modules were removed from the installer
+# in dc4f3d7 (2026-09-23), which turned that check into a pure false negative:
+# GATEWAY_API_ENABLED still installs the Gateway API *CRDs*, but nothing
+# implements a data plane, so a Gateway resource exists with no envoy Service to
+# find and `verify` would fail a cluster that is behaving exactly as designed.
 SERVICES_REPORT="${SVC_LIST:--}"
 
 # --- external Ceph consumer side --------------------------------------------
@@ -316,9 +401,22 @@ EOF
 fi
 
 # --- stamp + verdict --------------------------------------------------------
-cs_stamp_write verify-ok "nodes=$NODE_TOTAL namespaces=$NS_COUNT services=$SERVICES_REPORT ceph=$CEPH_CHECK at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+cs_stamp_write verify-ok "nodes=$NODE_TOTAL namespaces=$NS_COUNT services=$SERVICES_REPORT ceph=$CEPH_CHECK vip=${VIP_LO:-none} at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
 
 set -- "nodes=$NODE_TOTAL" "namespaces=$NS_COUNT" "services=$SERVICES_REPORT"
+# Only reported when it is OFF: emitting `registry=on` on every run would change
+# the verdict string for the ordinary case, and the recorded run verdicts in the
+# skill doc are quoted verbatim.
+[ "$REGISTRY_REQ" != "1" ] && set -- "$@" "registry=off"
+# Same convention as registry=off, and for the same reason: metallb is the
+# default, so emitting `metallb=on` would churn the verdict string for the
+# ordinary case and invalidate the verbatim verdicts recorded in the skill doc.
+[ "$METALLB_REQ" != "1" ] && set -- "$@" "metallb=off"
+# The reserved block, only when this run has one — so the verdict records the
+# reservation the assertions above checked, and a reader can see which block the
+# box is bound to without going back to run.env.
+[ -n "${VIP_POOL_RANGE:-}" ] && set -- "$@" "pool_range=$VIP_POOL_RANGE" "vip=$VIP_LO"
+[ -n "${VIP_PENDING:-}" ] && set -- "$@" "vip_pending=$VIP_PENDING"
 if [ "$CEPH_CHECK" = "1" ]; then
   set -- "$@" "ceph_state=$CEPH_STATE" "sc=$SC_REPORT" "pvc=$PVC_REPORT"
   [ -n "$CEPH_USERS" ] && set -- "$@" "csi_users=$CEPH_USERS"

@@ -46,8 +46,8 @@ LINES=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --lines) LINES="${2:-}"; shift 2 ;;
-    --run)   cs_run_opt "${2:-}"; shift 2 ;;
+    --lines) cs_need_val "$@"; LINES="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";   cs_run_opt "${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     -*) cs_usage_fail "unknown argument: $1" ;;
     *)
@@ -113,6 +113,20 @@ diag_pattern() {
       echo 'KUBECONFIG|kubeconfig|unreachable|refused|cluster' ;;
     E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_CONF_FIELD_MISSING)
       echo 'values|KEY=|field|missing|redact|\*\*\*' ;;
+    E_OPERATOR_*)
+      echo 'helm|registry|OCI|chart|Chart|pull|401|403|denied|Unauthorized|Degraded|manifest|crd|CubeStackCluster' ;;
+    E_CEPH_ENV_MISSING|E_CEPH_ENV_INVALID)
+      echo 'external-ceph|CEPH_MODE|CEPH_MONITORS|keyring|env file|No such file|assignment|quote|substitution|\*\*\*' ;;
+    E_MODELS_GUIDE_INVALID)
+      echo 'guide|keyring|base64|CEPHFS|cephfs|not base64|plain client|decode' ;;
+    E_MODELS_MOUNT|E_MODELS_NO_CEPH_COMMON)
+      echo 'mount|ceph-common|apt|dpkg|udev|librabbitmq|Unmet|broken|404|fs_path|models|No space|denied' ;;
+    E_SSHPASS_INSTALL)
+      echo 'sshpass|apt|dpkg|install|package|\.deb' ;;
+    E_INTERRUPTED|E_NO_VERDICT)
+      echo 'RESULT:|Interrupt|signal|SIGINT|SIGTERM|Killed|terminated' ;;
+    E_VIP_*)
+      echo 'IPRange|iprange|iprr|IPPool|pool|Bound|Pending|RangeExhausted|RangeFragmented|RangeInvalid|forbidden|owner|VirtualMachine' ;;
     *) echo '' ;;
   esac
 }
@@ -124,8 +138,29 @@ diag_owner() {
     E_DEPLOY_*)            echo deploy-wait ;;
     E_HARBOR_*|E_MINIO_*)  echo env-probe ;;
     E_CONF_*)              echo configure ;;
+    # These must precede the E_CEPH_* arm below: `E_CEPH_ENV_INVALID` also
+    # matches `E_CEPH_*`, and its evidence is in preflight's log, not verify's
+    # (preflight lints the provider's env file at Step 0).
+    E_CEPH_ENV_*|E_MODELS_GUIDE_INVALID) echo preflight ;;
     E_VERIFY_*|E_CEPH_*)   echo verify ;;
+    # The wait-side operator codes leave their evidence in operator-wait's own
+    # log (one poll cycle per line); everything else in the family fails before
+    # or during operator-up, whose log holds the helm/Harbor exchange.
+    E_OPERATOR_COMPONENT_DEGRADED|E_OPERATOR_IMAGE_PULL|E_OPERATOR_STILL_PROVISIONING|E_OPERATOR_NO_CR)
+      echo operator-wait ;;
+    E_OPERATOR_*)          echo operator-up ;;
     E_SUBNET_UNRESOLVED|E_NO_KUBECONFIG) echo preflight ;;
+    E_MODELS_MOUNT|E_MODELS_NO_CEPH_COMMON) echo mount-models ;;
+    # env-probe is the first place sshpass is exercised, so its log holds the
+    # apt output; mount-models raises this too, but only after env-probe has.
+    E_SSHPASS_INSTALL)     echo env-probe ;;
+    # Deliberately ownerless, and that falls through to the run-wide log search
+    # below: E_INTERRUPTED can come from any script's signal trap, and
+    # E_NO_VERDICT means the script's own log is the very thing that is missing.
+    E_INTERRUPTED|E_NO_VERDICT) echo "" ;;
+    # Step 1b talks only to the host cluster, so its log is the only place the
+    # kubectl exchange with the ipam controller is recorded.
+    E_VIP_*)               echo reserve-vips ;;
     *)                     echo "" ;;
   esac
 }
@@ -139,7 +174,19 @@ diag_known_code() {
     E_DEPLOY_PRECOND_FETCH|E_DEPLOY_PRECOND_SSHPASS|E_DEPLOY_PRECOND_ENV| \
     E_DEPLOY_ALREADY_RUNNING|E_DEPLOY_STILL_RUNNING|E_VERIFY_CEPH_PROFILE| \
     E_VERIFY_CEPH_PVC_PENDING|E_CEPH_CONNECTING|E_RETRY_BUDGET|E_LOCK_HELD| \
-    E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_USAGE|E_INTERNAL)
+    E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_USAGE|E_INTERNAL| \
+    E_OPERATOR_PRECOND_VERIFY|E_OPERATOR_PRECOND_CLUSTER|E_OPERATOR_PRECOND_HELM| \
+    E_OPERATOR_HARBOR_AUTH|E_OPERATOR_HARBOR_DENIED|E_OPERATOR_HARBOR_LOGIN| \
+    E_OPERATOR_CHART_MISSING|E_OPERATOR_APPLY_FAILED|E_OPERATOR_CRD_MISSING| \
+    E_OPERATOR_NO_CR|E_OPERATOR_COMPONENT_DEGRADED|E_OPERATOR_IMAGE_PULL| \
+    E_OPERATOR_ROLLOUT|E_OPERATOR_STILL_PROVISIONING)
+      return 0 ;;
+    E_VIP_NO_POOL|E_VIP_RANGE_EXHAUSTED|E_VIP_RANGE_FRAGMENTED|E_VIP_RANGE_INVALID| \
+    E_VIP_RANGE_PENDING|E_VIP_RANGE_DENIED|E_VIP_NO_CRD|E_VIP_COUNT_IMMUTABLE| \
+    E_VIP_OWNER|E_VIP_CLAIMS_LOST|E_VIP_OFF_SUBNET|E_VIP_CLAIM)
+      return 0 ;;
+    E_CEPH_ENV_MISSING|E_CEPH_ENV_INVALID|E_MODELS_GUIDE_INVALID|E_MODELS_MOUNT| \
+    E_MODELS_NO_CEPH_COMMON|E_SSHPASS_INSTALL|E_INTERRUPTED|E_NO_VERDICT)
       return 0 ;;
   esac
   return 1
@@ -161,8 +208,16 @@ LOCAL=""
 
 # Deploy/Ceph codes leave their evidence in the pod's deploy log; everything else
 # is already on the operator side.
+#
+# E_CEPH_ENV_* is excluded from the E_CEPH_* arm deliberately: it is raised by
+# preflight's own lint of the provider's env file, on the host, and that file
+# never reaches the pod's deploy log. Matching E_CEPH_* would send it hunting the
+# pod for evidence that was never there.
 POD_FIRST=0
-case "$NAME" in E_DEPLOY_*|E_VERIFY_*|E_CEPH_*) POD_FIRST=1 ;; esac
+case "$NAME" in
+  E_DEPLOY_*|E_VERIFY_*) POD_FIRST=1 ;;
+  E_CEPH_*) case "$NAME" in E_CEPH_ENV_*) ;; *) POD_FIRST=1 ;; esac ;;
+esac
 
 OUT=""
 EVID=""

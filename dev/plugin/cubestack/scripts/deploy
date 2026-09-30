@@ -33,6 +33,9 @@ deploy [options]
   --pod NAME     bootstrap pod (default: this run's, <prefix>-<run-id>)
   --fresh        clear .deploy.state and re-run every module
   --vms a,b,c    target VM names (default: run.env VM_NAMES)
+  --skip a,b     module keys to skip, forwarded to deploy-cluster.sh (an escape
+                 hatch for an addon the target cannot satisfy; prefer the
+                 module's own toggle - see the note at the launch below)
   -h, --help     this text
 
 Launches deploy-cluster.sh detached in the pod and returns immediately.
@@ -43,19 +46,20 @@ USAGE
 POD_OPT=""
 FORCE_FRESH=0
 VMS=""
+SKIP=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --run)   cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)   POD_OPT="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";   cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";   POD_OPT="${2:-}"; shift 2 ;;
     --fresh) FORCE_FRESH=1; shift ;;
-    --vms)   VMS="${2:-}"; shift 2 ;;
+    --vms) cs_need_val "$@";   VMS="${2:-}"; shift 2 ;;
+    --skip) cs_need_val "$@";  SKIP="${2:-}"; shift 2 ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
 
-cs_budget_guard
 cs_kubeconfig_guard
 cs_pod_require "$POD_OPT"
 
@@ -160,16 +164,40 @@ RUNPID="$(probe_kv "$RUN" pid)"
 [ -n "$RUNNING" ] || RUNNING=0
 
 if [ "$LOCK" = "1" ] && [ "$RUNNING" = "1" ]; then
-  cs_fail E_DEPLOY_ALREADY_RUNNING "pod=$CS_POD" "pid=${RUNPID:-none}" recover=deploy-wait \
+  cs_fail E_DEPLOY_ALREADY_RUNNING "pod=$CS_POD" "pid=${RUNPID:-none}" recover="rerun:deploy-wait" \
     hint="a deploy is already running in the pod; wait for it with deploy-wait instead of starting a second"
 fi
 if [ "$LOCK" = "1" ]; then
   cs_note "stale .deploy.state.lock present (no live deploy process); resuming"
 fi
 
+# --- budget ----------------------------------------------------------------
+# Deliberately AFTER every precondition above, not beside the other guards.
+# A precondition failure (no conf, no fetch, no sshpass, no env-ok stamp, a
+# deploy already running) is *deterministic*: re-invoking deploy cannot clear
+# it, so charging a lifetime attempt both wastes the attempt and refuses the
+# recovery verb the verdict itself prescribes. Not hypothetical — on
+# 2026-09-23 a wiped env-ok stamp cost one of deploy's two attempts without
+# anything ever being launched. Same class as the pod-up/configure/fetch-offline
+# fixes, which already validate before guarding.
+cs_budget_guard
+
 # --- launch (detached) ------------------------------------------------------
 LAUNCH_CMD="./deployments/scripts/deploy-cluster.sh"
 [ "$FRESH" = 1 ] && LAUNCH_CMD="$LAUNCH_CMD --fresh"
+# --skip is forwarded verbatim: it is the installer's own escape hatch, and
+# re-running without it just dies at the same module again.
+#
+# Prefer the module's TOGGLE over --skip, though - they are not equivalent. A
+# skipped module leaves its toggle true in cluster.conf, so the cluster goes on
+# claiming a capability it does not have and a later `--steps verify_<module>`
+# fails on it. The RDMA case that used to be quoted here is the illustration:
+# `rdma_shared_dev_plugin` exits 1 on a cluster with no RDMA HCAs, but as of
+# 2026-09-28 the example ships RDMA_PLACEHOLDER_HCAS non-empty, so that module
+# no longer hard-fails on HCA-less VMs at all - it comes up with a placeholder
+# ConfigMap and no registered resource. RDMA_ENABLED='false' is the honest
+# switch when the hardware is genuinely absent.
+[ -n "$SKIP" ] && LAUNCH_CMD="$LAUNCH_CMD --skip $SKIP"
 
 # setsid: new session, out of the exec's kill scope. nohup + disown + </dev/null:
 # no controlling terminal, no SIGHUP, stdin cannot block. The `[d]` bracket keeps
@@ -201,4 +229,4 @@ printf '%s\n' "$NODESET" > "$NODESET_FILE" 2>/dev/null || true
 [ -n "$DRIFT" ] && cs_note "$DRIFT"
 cs_note "deploy launched (pid=$PID fresh=$FRESH); watch it with deploy-wait"
 
-cs_ok "pid=$PID" "fresh=$FRESH" "log=$CS_DEPLOY_LOG"
+cs_ok "pid=$PID" "fresh=$FRESH" "skip=${SKIP:-none}" "log=$CS_DEPLOY_LOG"

@@ -66,11 +66,11 @@ USAGE
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --values)    VALUES="${2:-}"; shift 2 ;;
-    --run)       cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)       POD_ARG="${2:-}"; shift 2 ;;
-    --conf-name) CONF_NAME="${2:-}"; shift 2 ;;
-    --external-ceph-env) EXT_ENV="${2:-}"; shift 2 ;;
+    --values) cs_need_val "$@";    VALUES="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";       cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";       POD_ARG="${2:-}"; shift 2 ;;
+    --conf-name) cs_need_val "$@"; CONF_NAME="${2:-}"; shift 2 ;;
+    --external-ceph-env) cs_need_val "$@"; EXT_ENV="${2:-}"; shift 2 ;;
     --dry-run)   DRY_RUN=1; shift ;;
     -h|--help)   usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
@@ -117,6 +117,64 @@ if [ -n "$EXT_ENV" ]; then
   case " ${CS_VALUES_KEYS} " in
     *" CEPH_MODE "*) ;;
     *) cs_usage_fail "--external-ceph-env requires CEPH_MODE='external' in $VALUES; without it the Ceph block is skipped and the env file is never read" ;;
+  esac
+fi
+
+# --- expose mode and pool ---------------------------------------------------
+# `preflight --expose` records its answer in run.env, but the rewriter reads
+# SERVICE_EXPOSE_MODE from the VALUES FILE — so until this existed the resolved
+# mode never reached cluster.conf at all, and a `--expose metallb` run quietly
+# deployed nodeport. The default is now metallb, which makes that gap
+# load-bearing: without the injection, "load balancer is the default" would be a
+# line in a doc and nothing more.
+#
+# Precedence is the same shape as CEPHFS/REGISTRY below: an explicit key in the
+# values file always wins, and run.env only fills a gap it left. The injection is
+# applied AFTER `set -a; . $POD_VALUES`, so it cannot be clobbered by the source.
+#
+# Resolved UP HERE, above the budget guard, and not where it is used: the pool
+# check below is deterministic (it reads the local values file and run.env and
+# nothing else), so it must not cost an attempt — and its recover verb is
+# `rerun:reserve-vips`, which the budget would otherwise refuse to let us run.
+EXPOSE_MODE=""
+case " ${CS_VALUES_KEYS} " in
+  *" SERVICE_EXPOSE_MODE "*) EXPOSE_MODE="$(sed -n "s/^SERVICE_EXPOSE_MODE='\([^']*\)'\$/\1/p" "$VALUES" | head -1)" ;;
+esac
+[ -n "$EXPOSE_MODE" ] || EXPOSE_MODE="$(cs_run_env_get EXPOSE)"
+[ -n "$EXPOSE_MODE" ] || EXPOSE_MODE="metallb"
+
+METALLB_POOL_EFF=""
+case " ${CS_VALUES_KEYS} " in
+  *" METALLB_POOL "*) METALLB_POOL_EFF="$(sed -n "s/^METALLB_POOL='\([^']*\)'\$/\1/p" "$VALUES" | head -1)" ;;
+esac
+[ -n "$METALLB_POOL_EFF" ] || METALLB_POOL_EFF="$(cs_run_env_get POOL_RANGE)"
+
+# A metallb run with no pool must fail HERE and say why. Every other path ends
+# in the rewriter's exit 11, whose message names the example's off-L2
+# placeholder (10.66.1.131-10.66.1.132) — which names the symptom and not the
+# cause, and points at a value no run sets any more.
+#
+# The pool is not a Step 0 answer any more: it is the block Step 1b
+# (reserve-vips) CLAIMS from the host's cubestack-ipam, so the only real cause of
+# an empty pool is that Step 1b has not run for this run id.
+if [ "$EXPOSE_MODE" != "nodeport" ] && [ -z "$METALLB_POOL_EFF" ]; then
+  cs_fail E_VIP_POOL_MISSING "expose=$EXPOSE_MODE" recover="rerun:reserve-vips" \
+    hint="Step 1b (reserve-vips) claims the metallb pool from the host's IPAM and has not run for this run id; a preflight re-run also resets it"
+fi
+
+INJECT=""
+case " ${CS_VALUES_KEYS} " in
+  *" SERVICE_EXPOSE_MODE "*) ;;
+  *) INJECT="SERVICE_EXPOSE_MODE='$EXPOSE_MODE'" ;;
+esac
+# A pool is only worth injecting if there is one to inject: the check above has
+# already guaranteed a metallb run has one, so this only skips the nodeport case,
+# where an empty METALLB_POOL would be set to nothing and reported through the
+# rewriter's generic key-list path.
+if [ "$EXPOSE_MODE" != "nodeport" ] && [ -n "$METALLB_POOL_EFF" ]; then
+  case " ${CS_VALUES_KEYS} " in
+    *" METALLB_POOL "*) ;;
+    *) INJECT="$INJECT METALLB_POOL='$METALLB_POOL_EFF'" ;;
   esac
 fi
 
@@ -223,10 +281,11 @@ if [ -n "$EXT_ENV" ]; then
   cs_run_env_set "EXTERNAL_CEPH_ENV=$(cs_q 1)" "EXTERNAL_CEPH_ENV_DEST=$(cs_q "$CEPH_ENV_DEST")"
 fi
 
+
 # --- rewrite ----------------------------------------------------------------
 out="$(cs_pod_exec "$CS_POD" bash -c "
   set -a; . $POD_VALUES; set +a
-  CS_EXT_CEPH_ENV=$EXT_ENV_FLAG python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
+  $INJECT CS_EXT_CEPH_ENV=$EXT_ENV_FLAG python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
 rc=$?
 
 case "$rc" in
@@ -243,6 +302,13 @@ case "$rc" in
           cs_fail E_CONF_VALUES_MISSING "conf=$CONF_NAME" \
           recover="fix-values:$VALUES:$keys" \
           hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+  14) # Its own branch rather than folding into the key-list case above: this
+      # failure has no "missing:" list to extract, and the two keys the user has
+      # to reconcile are known exactly. Folding it in would run the message
+      # through the uppercase-only sanitizer and hand back a garbled verb.
+      cs_fail E_CONF_VALUES_MISSING "conf=$CONF_NAME" \
+        recover="fix-values:$VALUES:REGISTRY_ENABLED,LOCAL_PATH_ENABLED" \
+        hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
   *) cs_fail E_INTERNAL "rc=$rc" recover=stop-report:user \
           hint="rewriter failed: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
 esac
@@ -314,6 +380,39 @@ if [ "$EXT_ENV_FLAG" = 1 ]; then
 fi
 cs_run_env_set "CEPHFS_REQUESTED=$(cs_q $CEPHFS_REQ)"
 
+# Record whether the in-cluster registry was asked for, for verify to gate on.
+#
+# The registry is a BASE module, so `verify` reads an absent registry Service as
+# proof the deploy did not finish. That reasoning holds only while the registry
+# is always on; REGISTRY_ENABLED=false (a supported key as of this change) turns
+# it off on purpose, and without this record verify would fail a cluster built
+# exactly as asked - the same false-negative shape the Envoy data-plane check had.
+#
+# Absent defaults to ON, i.e. today's behaviour, so an older run dir keeps
+# requiring the Service. Like CEPHFS_REQUESTED this can only ever remove a false
+# failure, never introduce a false pass.
+REGISTRY_REQ=1
+case " ${CS_VALUES_KEYS} " in
+  *" REGISTRY_ENABLED "*)
+    REGISTRY_VALUE="$(sed -n "s/^REGISTRY_ENABLED='\([^']*\)'\$/\1/p" "$VALUES" | head -1)"
+    case "$REGISTRY_VALUE" in
+      true|TRUE|True|1|yes|YES|Yes|on|ON|On) REGISTRY_REQ=1 ;;
+      *) REGISTRY_REQ=0 ;;
+    esac
+    ;;
+esac
+cs_run_env_set "REGISTRY_REQUESTED=$(cs_q $REGISTRY_REQ)"
+
+# Record the effective expose mode for verify to gate on. MetalLB is a required
+# component by default, but it is installed only in metallb mode — so `verify`
+# cannot infer the intent from the cluster: a deliberate nodeport run and a
+# metallb install that silently did nothing both present as "no metallb-system".
+# Only the run's own record tells them apart. Absent (a run dir older than this
+# key) means ON, matching the default.
+METALLB_REQ=1
+case "$EXPOSE_MODE" in nodeport|nodePort) METALLB_REQ=0 ;; esac
+cs_run_env_set "METALLB_REQUESTED=$(cs_q $METALLB_REQ)"
+
 # A config change can invalidate the SSH password env-probe already proved.
 cs_stamp_clear env-ok
 cs_stamp_write conf-ok "$CONF_NAME"
@@ -322,4 +421,5 @@ cs_note "applied: $applied"
 cs_note "byte-gate: clean (no *** artifacts)"
 [ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
 cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
-      "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ"
+      "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ" "registry=$REGISTRY_REQ" \
+      "metallb=$METALLB_REQ"

@@ -54,11 +54,11 @@ RECREATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --run)       cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)       POD_OPT="${2:-}"; shift 2 ;;
-    --subnet)    SUBNET="${2:-}"; shift 2 ;;
-    --image)     IMAGE="${2:-}"; shift 2 ;;
-    --namespace) NS="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";       cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";       POD_OPT="${2:-}"; shift 2 ;;
+    --subnet) cs_need_val "$@";    SUBNET="${2:-}"; shift 2 ;;
+    --image) cs_need_val "$@";     IMAGE="${2:-}"; shift 2 ;;
+    --namespace) cs_need_val "$@"; NS="${2:-}"; shift 2 ;;
     --recreate|--fresh) RECREATE=1; shift ;;
     -h|--help)   usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
@@ -75,12 +75,16 @@ cs_kubeconfig_guard
 # hostNetwork is involved.
 #
 # Resolved and VALIDATED before cs_budget_guard, because a bad label must not
-# cost an attempt. It once did: preflight prints both `subnet=10-66-3-0` and
+# cost an attempt. It once did: preflight printed both `subnet=10-66-3-0` and
 # `nad=vm-underlay-10-66-3-0` on the same line, the NAD name was passed here by
 # mistake, and the drift branch below deleted a Ready pod, waited out the whole
 # 180s Ready timeout on a pod that could never schedule, and spent the last of
 # the run's two pod-up attempts — leaving E_RETRY_BUDGET as the only verdict and
 # no way to recreate the pod it had just destroyed.
+#
+# preflight no longer prints a `nad=` field (the shared NAD was deleted
+# 2026-09-29; see that script's header), so that particular mistake is now
+# unreachable. The guard stays: it is cheap, and the failure it prevents is not.
 if [ -z "$SUBNET" ]; then
   SUBNET="$(cs_run_env_get SUBNET)"
 fi

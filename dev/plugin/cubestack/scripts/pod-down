@@ -9,7 +9,11 @@
 #
 # That rule is mechanical here rather than prose: without a verify-ok stamp in
 # the run dir this refuses (E_POD_DELETE_UNSAFE), and --force is the deliberate
-# override. The delete is idempotent — "already gone" is a success, not an error.
+# override. The same gate applies to Step 7's operator-ok stamp on a run that
+# installs the platform: the pod is the only host that can reach the deployed
+# cluster, so deleting it early ends the run's ability to retry the operator
+# install at all. The delete is idempotent — "already gone" is a success, not an
+# error.
 #
 # The pod's /tmp/cubestack-values.conf holds live credentials, so it is shredded
 # before the pod goes away.
@@ -26,7 +30,8 @@ usage() {
 pod-down [options]
   --run ID     the run being cleaned up (default: this run's id)
   --pod NAME   delete this pod (default: this run's, <prefix>-<run-id>)
-  --force      delete without a verify-ok stamp (the cluster was not verified)
+  --force      delete without a verify-ok stamp (the cluster was not verified),
+               and without an operator-ok stamp when the run has Step 7 on
   -h, --help   this text
 USAGE
 }
@@ -36,15 +41,13 @@ FORCE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --run)   cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)   POD_OPT="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";   cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";   POD_OPT="${2:-}"; shift 2 ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; cs_ok "help=1" ;;
     *) cs_usage_fail "unknown argument: $1" ;;
   esac
 done
-
-cs_budget_guard
 
 # The safety gate runs before anything touches the cluster: it is a local file
 # check, and "never delete the pod before the cluster is verified" must hold even
@@ -54,7 +57,27 @@ if [ "$FORCE" != 1 ] && [ -z "$(cs_stamp_read verify-ok)" ]; then
     hint="no verify-ok stamp in the run dir; the pod still holds the deploy log and admin.conf (use --force to delete anyway)"
 fi
 
+# Step 7's platform install runs from this pod too, and pod-down is what makes it
+# impossible to retry: once the pod is gone, `operator-up` and `operator-wait`
+# have no host left that can reach the deployed cluster at all. So a run that had
+# Step 7 ON must have finished it — an operator-ok stamp — before the pod goes.
+#
+# Read from run.env, not guessed: a run configured with --no-operator has no
+# platform step to wait for and must still end normally. Absent (a run dir older
+# than this key) means OFF, so an old run is never blocked by a step it never had.
+if [ "$FORCE" != 1 ] && [ "$(cs_run_env_get OPERATOR_ENABLED)" = "1" ] \
+   && [ -z "$(cs_stamp_read operator-ok)" ]; then
+  cs_fail E_POD_DELETE_UNSAFE recover="rerun:operator-wait" \
+    hint="this run installs the platform operator but has no operator-ok stamp; the pod is the only host that can reach the deployed cluster, so deleting it now makes operator-up and operator-wait unrecoverable (use --force to delete anyway)"
+fi
+
+# The kubeconfig guard, and then the budget. Both sit BELOW the two safety gates
+# above: those are local file checks that must hold even when the cluster cannot
+# be reached. Above the budget for reserve-vips' reason — spending an attempt on
+# a host that cannot answer would make the budget meaningless, and an unreachable
+# KUBECONFIG is a host environment error, not a failure of this step.
 cs_kubeconfig_guard
+cs_budget_guard
 
 # A missing run id is a usage error, NOT "nothing to delete". Reporting
 # `already=1` for it would be a success verdict for a cleanup that never
@@ -92,6 +115,18 @@ fi
 # removes it through its own cs_cleanup hook, but a hook cannot run if the
 # script is SIGKILLed - so this is the backstop, and it matters more than the
 # others: the directory holds a bare CephX key in a file named `.secret`.
+#
+# /tmp/cubestack-operator.* is operator-up's staging directory: the Helm robot
+# password, the dockerconfigjson it builds from it, and helm's registry
+# config.json one level down (which is why that loop runs to two levels). Same
+# hook-cannot-run rationale, same backstop role.
+#
+# $HOME/.config/helm/registry/config.json is a backstop for a FUTURE edit:
+# operator-up exports HELM_REGISTRY_CONFIG at the staged directory precisely so
+# helm does not write its credential file there, and nothing in the current
+# scripts creates this path. Deleting it is harmless - the pod is about to be
+# deleted anyway - and this is the last chance to remove a base64 credential
+# from the pod's home if some later change forgets.
 if cs_pod_ready "$TARGET"; then
   cs_logged kubectl -n "$CS_NS" exec "$TARGET" -- bash -c \
     'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf \
@@ -99,11 +134,13 @@ if cs_pod_ready "$TARGET"; then
        [ -f "$f" ] || continue
        shred -u "$f" 2>/dev/null || rm -f "$f"
      done
-     for f in /tmp/cubestack-cephfs.*/*; do
+     for f in /tmp/cubestack-cephfs.*/* /tmp/cubestack-operator.*/* /tmp/cubestack-operator.*/*/*; do
        [ -f "$f" ] || continue
        shred -u "$f" 2>/dev/null || rm -f "$f"
      done
-     rm -rf /tmp/cubestack-cephfs.* 2>/dev/null'
+     rm -rf /tmp/cubestack-cephfs.* /tmp/cubestack-operator.* 2>/dev/null
+     f="${HOME:-/root}/.config/helm/registry/config.json"
+     if [ -f "$f" ]; then shred -u "$f" 2>/dev/null || rm -f "$f"; fi'
 else
   cs_note "pod $TARGET is not Ready; skipping the values-file shred (deletion removes it anyway)"
 fi

@@ -72,14 +72,14 @@ DRY_RUN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --vms)        VMS="${2:-}"; shift 2 ;;
-    --run)        cs_run_opt "${2:-}"; shift 2 ;;
-    --pod)        POD_ARG="${2:-}"; shift 2 ;;
-    --guide)      GUIDE="${2:-}"; shift 2 ;;
-    --user)       SSH_USER="${2:-}"; shift 2 ;;
-    --password)   SSH_PW="${2:-}"; shift 2 ;;
-    --fs-path)    FS_PATH="${2:-}"; shift 2 ;;
-    --mountpoint) MOUNTPOINT="${2:-}"; shift 2 ;;
+    --vms) cs_need_val "$@";        VMS="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";        cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";        POD_ARG="${2:-}"; shift 2 ;;
+    --guide) cs_need_val "$@";      GUIDE="${2:-}"; shift 2 ;;
+    --user) cs_need_val "$@";       SSH_USER="${2:-}"; shift 2 ;;
+    --password) cs_need_val "$@";   SSH_PW="${2:-}"; shift 2 ;;
+    --fs-path) cs_need_val "$@";    FS_PATH="${2:-}"; shift 2 ;;
+    --mountpoint) cs_need_val "$@"; MOUNTPOINT="${2:-}"; shift 2 ;;
     --dry-run)    DRY_RUN=1; shift ;;
     -h|--help)    usage; cs_ok "help=1" ;;
     *)            cs_usage_fail "unknown argument: $1" ;;
@@ -138,8 +138,11 @@ fi
 # After the lint, for the reason configure states: a guide that fails validation
 # is a deterministic failure, so charging an attempt for it would both waste a
 # lifetime retry and refuse the re-invocation the lint itself prescribes.
-cs_budget_guard
+#
+# The kubeconfig guard sits ABOVE it for reserve-vips' reason: spending an
+# attempt on a host that cannot answer would make the budget meaningless.
 cs_kubeconfig_guard
+cs_budget_guard
 
 # --- pod --------------------------------------------------------------------
 cs_pod_require "$POD_ARG"

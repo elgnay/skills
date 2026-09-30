@@ -43,11 +43,28 @@ cs_exit_class() {
     E_DEPLOY_EXITED_NONZERO|E_DEPLOY_KUBESPRAY_SSH|E_VERIFY_CEPH_PROFILE| \
     E_VERIFY_CEPH_PVC_PENDING|E_RETRY_BUDGET|E_LOCK_HELD| \
     E_CEPH_ENV_MISSING|E_CEPH_ENV_INVALID| \
-    E_MODELS_NO_CEPH_COMMON|E_MODELS_GUIDE_INVALID)
+    E_MODELS_NO_CEPH_COMMON|E_MODELS_GUIDE_INVALID| \
+    E_OPERATOR_PRECOND_VERIFY|E_OPERATOR_PRECOND_CLUSTER|E_OPERATOR_PRECOND_HELM| \
+    E_OPERATOR_HARBOR_AUTH|E_OPERATOR_HARBOR_DENIED|E_OPERATOR_CHART_MISSING| \
+    E_OPERATOR_CRD_MISSING|E_OPERATOR_COMPONENT_DEGRADED|E_OPERATOR_IMAGE_PULL| \
+    E_VIP_NO_POOL|E_VIP_RANGE_EXHAUSTED|E_VIP_OWNER|E_VIP_CLAIMS_LOST| \
+    E_VIP_OFF_SUBNET|E_VIP_NO_CRD|E_VIP_RANGE_DENIED|E_VIP_RANGE_FRAGMENTED| \
+    E_VIP_RANGE_INVALID|E_VIP_RANGE_PENDING|E_VIP_COUNT_IMMUTABLE)
       echo 2 ;;
     # E_MODELS_MOUNT is deliberately NOT here: a mount that failed on a
     # reachable node is worth exactly one re-invocation, which is what the
     # class-1 default gives it.
+    #
+    # E_OPERATOR_HARBOR_LOGIN, E_OPERATOR_APPLY_FAILED, E_OPERATOR_NO_CR,
+    # E_OPERATOR_ROLLOUT and E_OPERATOR_STILL_PROVISIONING are deliberately NOT
+    # here either, for the same shape of reason: each is worth exactly one
+    # re-invocation. A rejected login is not the same as an unreachable Harbor;
+    # an apply that failed on a transient API error is not a deterministic one; a
+    # CR that vanished is re-applied; a Deployment that would not roll is
+    # overwhelmingly a slow image pull, which the re-invocation's own 5-minute
+    # wait re-issues; and a bring-up that hit its budget is a wait that needs
+    # re-issuing, not a run that is wrong. The class-1 default gives all five
+    # that one re-invocation.
     *) echo 1 ;;
   esac
 }
@@ -210,9 +227,24 @@ cs_fail() {
 # still bounds a pathological loop while never blocking real work.
 cs_attempt_limit() {
   case "$1" in
-    deploy-wait) echo 3 ;;
+    # deploy is invoked ONCE by a healthy run — but its own recover verbs point
+    # back at it (rerun:deploy, rerun-fresh:deploy), and it is the step most
+    # exposed to transients: image pulls, apt, a module timing out mid-run. At
+    # the old default of 2, one deterministic precondition failure left a single
+    # attempt for the actual deploy (see the ordering note in scripts/deploy).
+    # 4 = the one the flow needs, plus the two its own recoveries prescribe.
+    deploy)      echo 4 ;;
+    # deploy-wait is invoked once by a healthy run, but its own false negative —
+    # E_DEPLOY_NO_RECAP on a resumed run, where the log can never carry a recap
+    # because kubespray legitimately did not re-run — has burned an attempt on
+    # every resume. 5 covers that recurring loss plus a genuine retry.
+    deploy-wait) echo 5 ;;
     preflight|diagnose|pod-down) echo 50 ;;
-    verify)      echo 2 ;;
+    # verify is invoked ONCE by a healthy run, but Step 7's operator gate
+    # prescribes rerun:verify when there is no verify-ok stamp - so verify now
+    # has a caller that re-invokes it, the same way deploy and env-probe do.
+    # 3 = the one the flow needs plus the recovery its own caller prescribes.
+    verify)      echo 3 ;;
     # env-probe is invoked TWICE by a healthy run, not once: Step 3 proves the
     # environment, then `configure` clears the env-ok stamp ("a config change can
     # invalidate the SSH password env-probe already proved") and deploy refuses to
@@ -227,6 +259,29 @@ cs_attempt_limit() {
     # error — so one retry must not be the last. 3 = the one the flow needs plus
     # two, and it still bounds a loop.
     mount-models) echo 3 ;;
+    # operator-up is invoked once by a healthy run, but three of its own recover
+    # verbs point back at it (a transient Harbor login failure, an apply that
+    # failed on the API, a CR that vanished), and it is the step most exposed to
+    # a credential the user has just rotated. 3 = the one the flow needs plus
+    # two, and it still bounds a loop.
+    operator-up)   echo 3 ;;
+    # operator-wait is invoked once by a healthy run, but its own false negative
+    # is E_OPERATOR_STILL_PROVISIONING on a slow six-component bring-up, where
+    # the recovery it prescribes is another operator-wait. 4 covers that
+    # recurring loss plus a genuine retry.
+    operator-wait) echo 4 ;;
+    # reserve-vips runs ONCE in a healthy run (Step 1b, before the deploy). Since
+    # the rewrite on IPRangeRequest, every read it makes — reachability, the
+    # CRD/RBAC pre-checks, the owner lookup, the pool select, the request itself
+    # — happens ABOVE cs_budget_guard, so the budget guards exactly one mutation:
+    # the create. That is deliberate, not an oversight: a host that cannot answer
+    # must not be able to exhaust a budget, and the create is the only step a
+    # second invocation could plausibly get right.
+    #
+    # 3 = the one the flow needs, plus a rerun after an operator has cleared
+    # whatever the create tripped on. The failures the create can produce are
+    # all class 2, so this headroom is for the human-driven cycle, not a loop.
+    reserve-vips) echo 3 ;;
     *)           echo 2 ;;
   esac
 }
