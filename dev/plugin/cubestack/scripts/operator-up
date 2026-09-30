@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# operator-up — install the CubeStack platform operator and apply the cluster CR.
+#
+# Runs AFTER `verify` and BEFORE `pod-down`, for the same reason `mount-models`
+# does: the DEPLOYED cluster is reachable only from inside the bootstrap pod,
+# through the installer's admin.conf. pod-down deletes that pod, so this step
+# has no second chance once the run moves on.
+#
+# TWO scripts, not one. Applying the CR is a ~30 s call that returns
+# immediately; the WORK is the operator's own 30 s requeue reconciling the
+# enabled components (five of the catalog's six — see the manifest), which is
+# structurally deploy + deploy-wait rather than
+# fetch-offline. Splitting them also means the long-running half (`operator-wait`)
+# holds no credential at all — it only reads the CR. This half is the one that
+# stages a credential, installs a chart and applies a manifest.
+#
+# ONE credential, TWO artifacts, ONE source. The Harbor robot account in the
+# values file is used to (a) log helm in to the OCI chart repository and (b)
+# build the kubernetes.io/dockerconfigjson Secret the deployed cluster needs.
+# It is sourced INSIDE the pod, written with shell builtins only, and never
+# appears in an argument list on either host.
+#
+# The Harbor host is NOT a flag. `scripts/lib/cubestack-cluster.yaml` pins
+# `imageRegistry: harbor.isuanova.com/suanova`, and a chart pulled from one
+# Harbor while the CR pointed component images at another would surface as a
+# silent ImagePullBackOff on a CR that reports nothing. So the registry is a
+# constant here, and it is asserted against the manifest below.
+#
+# Idempotent throughout: `helm upgrade --install`, a client-side-dry-run Secret
+# apply, a `kubectl rollout restart` (which re-stamps the pod template, so the
+# re-render is never byte-identical and the roll always happens), and a
+# `kubectl apply` of an unchanged CR. Re-invoking is the recovery for every
+# transient failure on this path -- and, because the chart's tag is a rolling
+# `latest`, it is also the only way to pick up a republished operator image.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+# The deployed cluster's kubeconfig, inside the pod — the same path `verify`
+# uses and the same path that has been proven by real runs.
+CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
+CS_OPERATOR_REGISTRY="$CS_HARBOR_DEFAULT"
+CS_CHART_PROJECT="suanova-private"
+CS_CHART_NAME="cubestack-operator-chart"
+# Derived from the operator repo's own publish workflow, not read from Harbor
+# (the `suanova-private` project needs a credential this host does not hold):
+#
+#   push to main    -> chart <Chart.yaml version>-latest   = 1.0.0-latest
+#   push tag vX.Y.Z -> chart X.Y.Z                          (a release)
+#
+# Chart.yaml says 1.0.0 and the repo has NO release tags, so only the rolling
+# tag exists today. `--version` overrides this the moment a release is cut --
+# and if the rolling version is bumped, this constant has to move with it.
+CS_CHART_VERSION="1.0.0-latest"
+CS_RELEASE="cubestack-operator"
+CS_OPERATOR_NS="cubestack-system"
+CS_PULL_SECRET="harbor-credentials"
+# The component namespaces the pull Secret has to reach, besides the operator's
+# own. kubelet resolves imagePullSecrets ONLY from the namespace a pod runs in,
+# so a Secret in cubestack-system does nothing for a pod in lws-system: it fails
+# as ImagePullBackOff on the first component pod, which the CR reports as that
+# component Degraded and names no cause.
+#
+# Taken from the operator's catalog, not guessed: every component in the profile
+# pulls in one of these four namespaces (cubestack-controller-manager, cubepilot
+# and cubestack-portal share the operator's own cubestack-system).
+#
+# ai-gateway-system is staged even though the profile ships `aiGateway: disabled`
+# (lib/cubestack-cluster.yaml). The namespace is then simply empty and the Secret
+# unused, which costs nothing — and it is what keeps re-enabling aiGateway a
+# one-line change to the CR, rather than one that silently reintroduces the
+# ImagePullBackOff this whole block exists to prevent.
+#
+# A component added to the manifest later must have its namespace added here.
+CS_COMPONENT_NS="lws-system envoy-gateway-system ai-gateway-system"
+CS_CR_NAME="cubestack"
+CS_CR_MANIFEST="$SELF_DIR/lib/cubestack-cluster.yaml"
+
+usage() {
+  cat <<'USAGE'
+operator-up [options]
+
+  --values FILE    the Harbor robot credential (KEY='value' lines, mode 600).
+                   Default: the path preflight recorded in run.env
+                   (HARBOR_RO_VALUES_FILE), so it is normally not passed again.
+  --run ID         the run being installed into (default: this run's id)
+  --pod NAME       installer pod (default: this run's, <prefix>-<run-id>)
+  --chart OCI-REF  the operator chart (default
+                   oci://harbor.isuanova.com/suanova-private/cubestack-operator-chart)
+  --version V      chart version (default 1.0.0-latest, the rolling tag; a
+                   release publishes the bare X.Y.Z)
+  --release NAME   helm release name (default cubestack-operator)
+  --namespace NS   where the operator runs (default cubestack-system)
+  --pull-secret N  the image pull Secret to create and inject (default
+                   harbor-credentials). Created in the operator namespace AND in
+                   every component namespace: the kubelet reads pull secrets
+                   only from the pod's own namespace.
+  --cr NAME        the CubeStackCluster name (default cubestack)
+  --dry-run        validate locally and print the plan, then stop. Touches no
+                   pod and no cluster, so it never spends a retry. The
+                   credential is never printed.
+  -h, --help       this text
+
+Pulls the operator chart from Harbor OCI, creates the image pull Secret in the
+operator and component namespaces, installs the chart, ROLLS the operator onto
+the chart's current image, applies scripts/lib/cubestack-cluster.yaml (which
+enables the catalog's five other components — lws, envoyGateway,
+cubestackControllerManager, cubepilot and cubestackPortal — with aiGateway
+shipped disabled), and writes the operator-applied stamp.
+`operator-wait` then polls the CR to Ready.
+
+The roll is not optional and not conditional: the chart is the ROLLING
+1.0.0-latest one, so its image tag is always `latest` and a re-invocation would
+otherwise re-render an identical Deployment, replace no pod, and report OK while
+the box kept running the previous operator binary. The verdict names the digest
+it rolled onto (`image=sha256:...`), which is the only way to tell one build from
+another under a rolling tag.
+
+Idempotent: re-invoking is the recovery for every transient failure here, and the
+roll makes re-invoking the way to pick up a republished operator image.
+USAGE
+}
+
+VALUES=""
+POD_ARG=""
+CHART=""
+VERSION="$CS_CHART_VERSION"
+RELEASE="$CS_RELEASE"
+OP_NS="$CS_OPERATOR_NS"
+PULL_SECRET="$CS_PULL_SECRET"
+CR_NAME="$CS_CR_NAME"
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --values) cs_need_val "$@";      VALUES="${2:-}"; shift 2 ;;
+    --run) cs_need_val "$@";         cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";         POD_ARG="${2:-}"; shift 2 ;;
+    --chart) cs_need_val "$@";       CHART="${2:-}"; shift 2 ;;
+    --version) cs_need_val "$@";     VERSION="${2:-}"; shift 2 ;;
+    --release) cs_need_val "$@";     RELEASE="${2:-}"; shift 2 ;;
+    --namespace) cs_need_val "$@";   OP_NS="${2:-}"; shift 2 ;;
+    --pull-secret) cs_need_val "$@"; PULL_SECRET="${2:-}"; shift 2 ;;
+    --cr) cs_need_val "$@";          CR_NAME="${2:-}"; shift 2 ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    -h|--help)     usage; cs_ok "help=1" ;;
+    *)             cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+# The path preflight recorded wins only as a DEFAULT: an explicit --values is
+# how a caller points at a re-Written credential without re-running Step 0.
+if [ -z "$VALUES" ]; then
+  VALUES="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
+fi
+[ -n "$VALUES" ] || cs_usage_fail \
+  "--values is required (run.env has no HARBOR_RO_VALUES_FILE; pass it on preflight with --harbor-ro-values)"
+
+if [ -z "$CHART" ]; then
+  CHART="oci://$CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT/$CS_CHART_NAME"
+fi
+
+# --- deterministic validation, BEFORE the budget -----------------------------
+# The configure/pod-up rule: a usage error must never burn an attempt, and the
+# fix-values verb these checks prescribe must stay executable. Every one of
+# these is local and free.
+case "$CHART" in
+  oci://*) ;;
+  *) cs_usage_fail "--chart must be an oci:// reference (got '$CHART')" ;;
+esac
+case "$CHART" in *[[:space:]]*|*"'"*|*'"'*)
+  cs_usage_fail "--chart must not contain whitespace or quotes" ;;
+esac
+[ -n "$VERSION" ] || cs_usage_fail "--version must not be empty"
+case "$VERSION" in *[!A-Za-z0-9._+-]*) cs_usage_fail "--version is not a chart version: '$VERSION'" ;; esac
+# release/namespace/secret/CR names all become Kubernetes object names or
+# helm release names; RFC1123 lowercase is the intersection of what all four
+# accept, and it is also what keeps them safe as verdict values.
+for n in RELEASE OP_NS PULL_SECRET CR_NAME; do
+  eval "v=\${$n}"
+  [ -n "$v" ] || cs_usage_fail "$n must not be empty"
+  case "$v" in
+    *[!a-z0-9.-]*|[-.]*|*[-.])
+      cs_usage_fail "$n must be RFC1123 (lowercase alphanumerics, '-', '.'; no leading/trailing separator): '$v'" ;;
+  esac
+done
+
+# --- local validation, before anything crosses the wire ----------------------
+# The credential file: refuses an unquoted line, an unknown key, a `***`
+# artifact, and a mode-600 violation.
+cs_values_lint "$VALUES" HARBOR_RO_USER HARBOR_RO_PW
+
+# The manifest is a repo artifact. Missing, empty, or pinning a different
+# registry is a packaging defect, not a user error — so E_INTERNAL (class 4),
+# the same class mount-models uses for its staging tar.
+[ -s "$CS_CR_MANIFEST" ] || cs_fail E_INTERNAL "manifest=$CS_CR_MANIFEST" recover=stop-report:user \
+  hint="the CubeStackCluster manifest is missing or empty; the skill is not installed correctly"
+grep -q "imageRegistry: $CS_OPERATOR_REGISTRY/" "$CS_CR_MANIFEST" || cs_fail E_INTERNAL \
+  "manifest=$CS_CR_MANIFEST" "registry=$CS_OPERATOR_REGISTRY" recover=stop-report:user \
+  hint="the CR manifest does not pin imageRegistry to the registry this step pulls the chart from; the two would diverge silently"
+
+if [ "$(cs_run_env_get OPERATOR_ENABLED)" = "0" ]; then
+  cs_note "note: this run was configured with --no-operator; installing anyway because this script was invoked"
+fi
+
+# --- dry run: local, read-only, before the budget and before the pod ---------
+# The mount-models rule: a local read-only path must never spend a retry, and it
+# must be exercisable before a run has a deployed cluster to point at.
+if [ "$DRY_RUN" -eq 1 ]; then
+  cs_note "dry run — nothing will be installed, no pod contacted"
+  cs_note "  values     $VALUES"
+  cs_note "  keys      ${CS_VALUES_KEYS# }"
+  cs_note "  registry   $CS_OPERATOR_REGISTRY   (robot user present, never printed)"
+  cs_note "  chart      $CHART:$VERSION"
+  cs_note "  release    $RELEASE -n $OP_NS"
+  cs_note "  secret     $PULL_SECRET in: $OP_NS $CS_COMPONENT_NS"
+  cs_note "             (dockerconfigjson, host $CS_OPERATOR_REGISTRY; the kubelet reads"
+  cs_note "              pull secrets only from the pod's own namespace)"
+  cs_note "  CR         $CR_NAME ($(basename "$CS_CR_MANIFEST"))"
+  cs_note "  roll       deploy/$RELEASE in $OP_NS, onto whatever image the chart's"
+  cs_note "             rolling :latest tag resolves to at run time (digest reported)"
+  cs_note "  components $(grep -c '^      enabled: true' "$CS_CR_MANIFEST" 2>/dev/null || echo '?') enabled in the manifest"
+  cs_ok "dry_run=1" "chart=$VERSION" "release=$RELEASE" "namespace=$OP_NS" \
+        "pull_secret=$PULL_SECRET" "cr=$CR_NAME" "ro_user=1"
+fi
+
+# --- the pod, and every deterministic precondition, ahead of the budget ------
+# `verify` proved a deployed cluster exists for this run. Without its stamp
+# there is no cluster to install onto, and this script has no opinion of its
+# own — the stamp is the mechanical record, not a guess.
+#
+# Before the kubeconfig guard, for pod-down's reason: this is a local file
+# check, and "you skipped verify" must be the answer even when the KubeVirt
+# cluster is unreachable.
+[ -n "$(cs_stamp_read verify-ok)" ] || cs_fail E_OPERATOR_PRECOND_VERIFY recover=rerun:verify \
+  hint="no verify-ok stamp in the run dir; the cluster has not been verified for this run, so there is nothing to install onto"
+
+cs_kubeconfig_guard
+cs_pod_require "$POD_ARG"
+
+# --- pod preconditions, one exec --------------------------------------------
+# The deploy pattern: one exec answers every cheap question, so a 3-second
+# verdict replaces a failure discovered after helm has already run.
+PRE="$(cs_pod_exec "$CS_POD" bash -c '
+  K="$1"
+  if [ -f "$K" ]; then echo kconf=1; else echo kconf=0; fi
+  if command -v helm >/dev/null 2>&1; then echo helm=1; else echo helm=0; fi
+  if command -v base64 >/dev/null 2>&1; then echo base64=1; else echo base64=0; fi' \
+  _ "$CS_KCONF")"
+probe_kv() { printf '%s\n' "$PRE" | sed -n "s/^$1=//p" | tail -1; }
+
+[ "$(probe_kv kconf)" = "1" ] || cs_fail E_OPERATOR_PRECOND_CLUSTER "pod=$CS_POD" "kubeconfig=$CS_KCONF" \
+  recover=rerun:deploy \
+  hint="missing kubeconfig $CS_KCONF in pod $CS_POD - the deploy did not produce a cluster to install onto"
+MISSING=""
+[ "$(probe_kv helm)" = "1" ]   || MISSING="$MISSING${MISSING:+,}helm"
+[ "$(probe_kv base64)" = "1" ] || MISSING="$MISSING${MISSING:+,}base64"
+[ -z "$MISSING" ] || cs_fail E_OPERATOR_PRECOND_HELM "pod=$CS_POD" "missing=$MISSING" \
+  recover=stop-report:user \
+  hint="these tools are absent from the installer image, so the chart cannot be pulled or the pull Secret built: $MISSING"
+
+# --- budget -----------------------------------------------------------------
+# After the lint, the manifest checks and every precondition above, for the
+# reason configure states: a deterministic validation failure must not charge an
+# attempt AND must leave the re-invocation its own fix-values verb prescribes.
+#
+# The kubeconfig and pod guards sit ABOVE this line for reserve-vips' reason —
+# spending an attempt on a host that cannot answer would make the budget
+# meaningless. Not hypothetical: on 2026-09-30 an invocation with no exported
+# KUBECONFIG burned the run's last operator-up attempt, and the next invocation
+# reported E_RETRY_BUDGET instead — a verdict naming the wrong problem, and one
+# that cannot be recovered from without a human.
+cs_budget_guard
+
+# --- staging paths ----------------------------------------------------------
+# POD_VALUES reuses the script-scoped name `configure` invented, so pod-down's
+# existing /tmp/cubestack-values.*.conf shred glob already covers it with no
+# change. POD_DIR is this script's own and gets its own backstop there.
+POD_VALUES="/tmp/cubestack-values.$CS_SCRIPT.conf"
+POD_DIR="/tmp/cubestack-operator.$CS_SCRIPT"
+POD_PW="$POD_DIR/pw"
+POD_DCFG="$POD_DIR/dockerconfigjson"
+POD_REG="$POD_DIR/registry/config.json"
+POD_CR="$POD_DIR/cubestack-cluster.yaml"
+
+# Registered BEFORE the credential crosses the wire, so an interrupt during the
+# copy still cleans up. A hook, never a second `trap ... EXIT` — that would
+# replace the verdict trap and silently lose the guarantee.
+cs_cleanup() {
+  [ -n "${CS_POD:-}" ] || return 0
+  if [ -n "${POD_DIR:-}" ] || [ -n "${POD_VALUES:-}" ]; then
+    kubectl -n "$CS_NS" exec "$CS_POD" -- sh -c \
+      "rm -rf ${POD_DIR:-} ${POD_VALUES:-}" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# --- stage the credential into the pod --------------------------------------
+VALUES_SHA="$(cs_sha256 "$VALUES")"
+[ -n "$VALUES_SHA" ] || cs_fail E_INTERNAL "file=$VALUES" recover=stop-report:user \
+  hint="cannot hash the values file on this host (needs shasum or sha256sum); refusing to send an unverified credential"
+
+cs_logged kubectl -n "$CS_NS" cp "$VALUES" "$CS_NS/$CS_POD:$POD_VALUES" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="could not copy the values file into the pod"
+
+# cs_pod_exec_out, not cs_pod_exec: the digest's OUTPUT is inspected, and a
+# folded `command terminated with exit code 1` would sanitize into a non-empty
+# string that compares unequal for the wrong reason. Read through $( ) with
+# tail -1, never through a bare status test.
+POD_SHA="$(cs_pod_exec_out "$CS_POD" bash -c "sha256sum $POD_VALUES 2>/dev/null | cut -d' ' -f1" | tail -1)"
+[ "$POD_SHA" = "$VALUES_SHA" ] || cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" \
+  hint="the values file in the pod does not hash to the local file; refusing to install with a truncated credential"
+
+# --- build the two derived artifacts, inside the pod ------------------------
+# Everything sensitive is produced by shell BUILTINS from the sourced file, and
+# the script text references $HARBOR_RO_PW WITHOUT expanding it locally — so the
+# pod's process list shows the variable NAME, never the value.
+#
+# `. "$POD_VALUES"` deliberately WITHOUT `set -a`: the values stay shell-local,
+# so the password is never an environment variable of this shell or of any
+# grandchild. `printf` and `base64` are builtins/binaries that take the value as
+# an argument to a BUILTIN or over a pipe — never as an argv of an external
+# process that a `ps` would show.
+GEN="$(cs_pod_exec "$CS_POD" bash -c '
+  . "$1" || exit 19
+  umask 077
+  mkdir -p "$2/registry" || exit 20
+  printf "%s" "$HARBOR_RO_PW" > "$2/pw" || exit 21
+  AUTH="$(printf "%s:%s" "$HARBOR_RO_USER" "$HARBOR_RO_PW" | base64 -w0)" || exit 22
+  printf "{\"auths\":{\"%s\":{\"username\":\"%s\",\"password\":\"%s\",\"auth\":\"%s\"}}}\n" \
+    "$3" "$HARBOR_RO_USER" "$HARBOR_RO_PW" "$AUTH" > "$2/dockerconfigjson" || exit 23
+  unset AUTH
+  echo GEN_OK' _ "$POD_VALUES" "$POD_DIR" "$CS_OPERATOR_REGISTRY")"
+case "$GEN" in
+  *GEN_OK*) ;;
+  *) cs_fail E_INTERNAL "pod=$CS_POD" recover=stop-report:user \
+       hint="could not build the registry artifacts in the pod; see $(cs_log_file)" ;;
+esac
+
+# --- helm registry login ----------------------------------------------------
+# cs_pod_exec (folded), not _out: the failure TEXT carries the classification.
+# $? is read on the immediately following line.
+#
+# HELM_REGISTRY_CONFIG is exported INSIDE the remote shell and points at the
+# staged, shredded directory. That is load-bearing twice: it keeps helm's
+# credential file out of $HOME/.config/helm/registry/config.json (which nothing
+# would remove), and it means the `helm upgrade --install` below finds the same
+# credential without a second login.
+LOGIN_OUT="$(cs_pod_exec "$CS_POD" bash -c '
+  . "$1" || exit 19
+  export HELM_REGISTRY_CONFIG="$2"
+  helm registry login "$3" -u "$HARBOR_RO_USER" --password-stdin < "$4"' \
+  _ "$POD_VALUES" "$POD_REG" "$CS_OPERATOR_REGISTRY" "$POD_PW" 2>&1)"
+LOGIN_RC=$?
+
+if [ "$LOGIN_RC" != "0" ]; then
+  case "$LOGIN_OUT" in
+    *401*|*Unauthorized*|*unauthorized*|*'authentication required'*)
+      cs_fail E_OPERATOR_HARBOR_AUTH "registry=$CS_OPERATOR_REGISTRY" \
+        recover="fix-values:$VALUES:HARBOR_RO_USER,HARBOR_RO_PW" \
+        hint="Harbor rejected the robot credential; re-Write $VALUES with the right user and password, then re-invoke" ;;
+    *403*|*Forbidden*|*forbidden*|*DENIED*|*denied*)
+      cs_fail E_OPERATOR_HARBOR_DENIED "registry=$CS_OPERATOR_REGISTRY" recover=stop-report:admin \
+        hint="the robot account authenticated but is not permitted to pull from $CS_OPERATOR_REGISTRY/$CS_CHART_PROJECT (and $CS_OPERATOR_REGISTRY/suanova, $CS_OPERATOR_REGISTRY/mirrors); grant it pull on all three projects" ;;
+    *)
+      cs_fail E_OPERATOR_HARBOR_LOGIN "registry=$CS_OPERATOR_REGISTRY" "rc=$LOGIN_RC" \
+        recover=rerun:env-probe \
+        hint="helm could not reach $CS_OPERATOR_REGISTRY from the pod (not an auth rejection); env-probe is the step that proves Harbor reachability - see $(cs_log_file)" ;;
+  esac
+fi
+
+# --- namespaces + the image pull Secret, BEFORE the chart -------------------
+# This order is not optional. The operator's first reconcile resolves
+# cr.Spec.Global.ImagePullSecrets and ERRORS when the named Secret is absent, so
+# with it missing the CR never converges and names no component as the culprit —
+# the worst failure shape available. The CR sets imagePullSecrets:
+# [harbor-credentials], which the operator injects into component pods; and the
+# operator Deployment itself pulls its own image from $CS_CHART_PROJECT.
+#
+# The Secret goes into EVERY namespace a component pod will run in, not just the
+# operator's own. kubelet reads imagePullSecrets only from the pod's own
+# namespace, so the single cubestack-system copy would leave every lws, envoy and
+# ai-gateway pod in ImagePullBackOff — and the CR would report it as that
+# component Degraded, naming no cause.
+#
+# The component namespaces are created HERE, before the operator would create
+# them itself. That is safe and not a race: the operator's EnsureNamespace
+# server-side-applies its management labels onto the Namespace, and SSA merges
+# into an existing object rather than conflicting with it. Doing it up front is
+# what closes the window in which the operator creates a namespace, renders a
+# Deployment into it, and the kubelet pulls before the Secret has landed. The
+# alternative — copying the Secret in after the operator makes the namespaces —
+# is what the upstream README documents, and it leaves that window open.
+#
+# --from-file, never --docker-username/--docker-password: the flag pair puts the
+# password into kubectl's argv, visible in the pod's process list for the life
+# of the command. --from-file takes a path; the value never leaves the file, and
+# the file is inside the shredded directory.
+#
+# `create --dry-run=client -o yaml | apply -f -`, not `create`: it is idempotent,
+# so a re-invocation with a rotated credential UPDATES the Secret instead of
+# failing on "already exists". The generated YAML — which does contain the
+# base64 credential — exists only inside the pod's pipe and in the deployed
+# cluster; it never crosses the wire.
+SEC_OUT="$(cs_pod_exec "$CS_POD" bash -c '
+  K="$1"; SEC="$2"; SRC="$3"; shift 3
+  k() { kubectl --kubeconfig="$K" "$@"; }
+  for NS in "$@"; do
+    k create namespace "$NS" --dry-run=client -o yaml | k apply -f - >/dev/null || exit 30
+    k -n "$NS" create secret generic "$SEC" --type=kubernetes.io/dockerconfigjson \
+      --from-file=.dockerconfigjson="$SRC" --dry-run=client -o yaml | k apply -f - >/dev/null || exit 31
+  done
+  echo SEC_OK' _ "$CS_KCONF" "$PULL_SECRET" "$POD_DCFG" $OP_NS $CS_COMPONENT_NS 2>&1)"
+case "$SEC_OUT" in
+  *SEC_OK*) ;;
+  *) cs_fail E_OPERATOR_APPLY_FAILED "step=secret" "namespace=$OP_NS" "secret=$PULL_SECRET" \
+       recover="rerun:operator-up" \
+       hint="could not create the namespaces or the $PULL_SECRET Secret in the deployed cluster; see $(cs_log_file)" ;;
+esac
+
+# --- helm upgrade --install -------------------------------------------------
+# Through a capture file + cs_wait_cmd, never a bare $( ): a foreground child
+# defers the EXIT trap for its whole duration, so a signal arriving during a
+# 5-minute --wait would emit no verdict for 5 minutes.
+#
+# `upgrade --install`, not `install`: `install` on an existing release fails with
+# "cannot re-use a name that is still in use", which would make every
+# re-invocation a failure. On an unchanged pinned release it is a no-op.
+#
+# Deliberately NOT detached, unlike `deploy`: it is idempotent, so an interrupted
+# install is resumed by re-invoking this script, and a detached helm would race
+# that re-invocation.
+#
+# --set imagePullSecrets[0].name is ALWAYS set, even though it is a no-op if the
+# projects turn out to be anonymously pullable. The alternative is discovering
+# that at the first node pull, as a silent ImagePullBackOff reported by a CR that
+# never becomes Ready. Failing loudly is worth one redundant value.
+#
+# --set clusterCR.enabled=false pins the chart default explicitly: the chart's
+# optional clusterCR path would create a CR that a later `helm upgrade` rewrites
+# from chart values, fighting the manifest we own.
+#
+# --set image.pullPolicy=Always because the chart we install is the ROLLING one
+# (1.0.0-latest), whose appVersion -- and therefore image tag -- is `latest`. The
+# chart defaults to IfNotPresent, so a node that had ever cached the operator
+# image would keep running it across re-invocations and never notice a new build.
+# This is the operator's OWN image; the components' policy is the CR's
+# global.imagePullPolicy, set in the manifest.
+#
+# On its own that policy is NOT sufficient, and believing it was cost a full
+# retry cycle. A pull policy governs only a pod that is CREATED, and on a
+# re-invocation this helm renders a byte-identical Deployment -- so no pod is
+# created, the policy never fires, and `--wait` returns at once because the OLD
+# Deployment is already ready. The roll below is what actually advances the
+# binary; the policy only guarantees the new pod re-pulls once it is rolled.
+#
+# --timeout 5m waits on the operator Deployment only. That is the bounded,
+# useful half; the unbounded half is operator-wait's.
+HELM_OUT_FILE="$(cs_run_dir)/operator-up.helm.out"
+mkdir -p "$(dirname "$HELM_OUT_FILE")" 2>/dev/null || true
+helm_capture() { "$@" > "$HELM_OUT_FILE" 2>&1; }
+cs_wait_cmd helm_capture cs_pod_exec "$CS_POD" bash -c '
+  K="$1"; REGCFG="$2"; REL="$3"; CHART="$4"; VER="$5"; NS="$6"; PULL="$7"
+  export HELM_REGISTRY_CONFIG="$REGCFG"
+  helm upgrade --install "$REL" "$CHART" --version "$VER" -n "$NS" --create-namespace \
+    --kubeconfig="$K" --wait --timeout 5m \
+    --set imagePullSecrets[0].name="$PULL" \
+    --set image.pullPolicy=Always \
+    --set clusterCR.enabled=false' \
+  _ "$CS_KCONF" "$POD_REG" "$RELEASE" "$CHART" "$VERSION" "$OP_NS" "$PULL_SECRET"
+HELM_RC=$?
+HELM_OUT="$(cat "$HELM_OUT_FILE" 2>/dev/null)"
+cs_logged printf '%s\n' "$HELM_OUT"
+
+if [ "$HELM_RC" != "0" ]; then
+  case "$HELM_OUT" in
+    *'not found'*|*'manifest unknown'*|*'no such'*|*'unexpected status from HEAD'*)
+      cs_fail E_OPERATOR_CHART_MISSING "chart=$CHART" "version=$VERSION" recover=stop-report:user \
+        hint="the chart version is not in the OCI repository; a version typo or an unpublished chart is not fixed by a retry - the rolling tag is <Chart.yaml version>-latest and a release publishes the bare X.Y.Z, so try the other one with --version" ;;
+    *)
+      cs_fail E_OPERATOR_APPLY_FAILED "step=helm" "rc=$HELM_RC" "release=$RELEASE" \
+        recover="rerun:operator-up" \
+        hint="helm failed to install the operator: $(printf '%s' "$HELM_OUT" | tr '\n' ' ' | cut -c1-100)" ;;
+  esac
+fi
+
+# --- roll the operator onto the chart's CURRENT image ------------------------
+# Why this exists, in one sentence: a republished rolling `:latest` image is
+# invisible to `helm upgrade` when the rendered Deployment is byte-identical, and
+# the operator's component catalog and extra assets are compiled INTO its image
+# (`//go:embed all:components all:observability all:charts`), so an asset fixed
+# upstream has no effect on a box until the pod is replaced.
+#
+# The failure it prevents is a silent one. Without this, a re-invocation prints
+# `RESULT: OK applied=1` and the box goes on running the OLD binary; the only
+# symptom appears a step later, as `operator-wait` reporting a Degraded component
+# whose message describes a defect that no longer exists -- indistinguishable
+# from that defect still being live. That is exactly how the ClientTrafficPolicy
+# fix was first mistaken for a failed fix.
+#
+# Deliberately UNCONDITIONAL, not gated on comparing digests: the only registry
+# access on this path is helm's, inside the pod (the `suanova-private` project
+# needs the robot credential), so there is no current digest here to compare
+# against -- and "install the operator" should mean "run the chart's current
+# image" every time. `rollout restart` stamps the pod template with the time, so
+# the re-render can never be byte-identical again and the roll always happens.
+#
+# --timeout 5m matches the chart's own above, so the two halves are bounded
+# alike and a slow image pull is not mistaken for a hung chart. Through a capture
+# file + cs_wait_cmd for the same reason as the helm call: a foreground child
+# would defer the EXIT trap for the whole 5 minutes.
+#
+# The `app.kubernetes.io/instance` label is the chart's own, and it is the
+# release name -- note the chart's `.../name` label is `cubestack-operator-chart`,
+# not `cubestack-operator`, so selecting on that finds nothing.
+ROLL_OUT_FILE="$(cs_run_dir)/operator-up.rollout.out"
+mkdir -p "$(dirname "$ROLL_OUT_FILE")" 2>/dev/null || true
+rollout_capture() { "$@" > "$ROLL_OUT_FILE" 2>&1; }
+cs_wait_cmd rollout_capture cs_pod_exec "$CS_POD" bash -c '
+  K="$1"; REL="$2"; NS="$3"
+  k() { kubectl --kubeconfig="$K" "$@"; }
+  k -n "$NS" rollout restart "deploy/$REL" >/dev/null 2>&1 || {
+    echo "restart failed: $(k -n "$NS" get deploy "$REL" 2>&1 | tr "\n" " ")"
+    exit 41; }
+  k -n "$NS" rollout status "deploy/$REL" --timeout=5m >/dev/null 2>&1 || {
+    echo "rollout did not settle: $(k -n "$NS" get pods -l "app.kubernetes.io/instance=$REL" 2>&1 | tr "\n" " ")"
+    exit 42; }
+  IMG="$(k -n "$NS" get pods -l "app.kubernetes.io/instance=$REL" \
+           --sort-by=.metadata.creationTimestamp \
+           -o jsonpath="{.items[-1:].status.containerStatuses[0].imageID}" 2>/dev/null)"
+  case "$IMG" in
+    *@sha256:*) echo "${IMG##*@}" ;;
+    *) echo "could not read the operator pod imageID (got: ${IMG:-<empty>})"; exit 43 ;;
+  esac' \
+  _ "$CS_KCONF" "$RELEASE" "$OP_NS"
+ROLL_RC=$?
+ROLL_OUT="$(cat "$ROLL_OUT_FILE" 2>/dev/null)"
+
+if [ "$ROLL_RC" != "0" ]; then
+  cs_fail E_OPERATOR_ROLLOUT "release=$RELEASE" "namespace=$OP_NS" "rc=$ROLL_RC" \
+    recover="rerun:operator-up" \
+    hint="the operator Deployment did not roll onto the chart's current image: $(printf '%s' "$ROLL_OUT" | tr '\n' ' ' | cut -c1-140)"
+fi
+
+# The digest, not the tag: the tag is the rolling `latest` and cannot tell one
+# build from the next. Recorded in the stamp so a later run can name the binary
+# it installed, and reported in the verdict so every run prints it -- which is
+# what makes a stale operator visible at the point of failure rather than a step
+# later.
+OP_IMAGE="${ROLL_OUT//[[:space:]]/}"
+OP_IMAGE_SHORT="$(cs_image_short "$OP_IMAGE")"
+
+# --- the CRD is in the chart, and it must exist before the CR is applied -----
+# The repo tree ships no `crds/` directory; it is generated by `make helm-sync`.
+# `helm-push` depends on `helm-package`, which runs that sync before packaging,
+# so the published chart does carry it. This assertion is therefore not about a
+# KNOWN gap - it is the cheap guard on an unknown one: a chart published by some
+# other path, or one whose CRD name has moved. Without it the failure surfaces as
+# `no matches for kind "CubeStackCluster"` on the apply below, which reads as a
+# manifest bug rather than a packaging one.
+CRD_OUT="$(cs_pod_exec "$CS_POD" bash -c \
+  'kubectl --kubeconfig="$1" wait --for=condition=Established --timeout=60s \
+     crd/cubestackclusters.operator.cubestack.io' _ "$CS_KCONF" 2>&1)"
+case "$CRD_OUT" in
+  *'condition met'*|*'established'*|*'Established'*) ;;
+  *) cs_fail E_OPERATOR_CRD_MISSING "crd=cubestackclusters.operator.cubestack.io" "pod=$CS_POD" \
+       recover=stop-report:user \
+       hint="the CRD never reached Established; the published chart was packaged without the crds/ directory (make helm-sync). Re-publish the chart - nothing at run time fixes it" ;;
+esac
+
+# --- copy and apply the CR --------------------------------------------------
+# Re-copied unconditionally, per configure's rule: the pod's /tmp does not
+# survive a recreate, and a stale copy must never be what runs.
+cs_logged kubectl -n "$CS_NS" cp "$CS_CR_MANIFEST" "$CS_NS/$CS_POD:$POD_CR" || \
+  cs_fail E_OPERATOR_APPLY_FAILED "step=cr-copy" "pod=$CS_POD" recover="rerun:operator-up" \
+  hint="could not copy the CubeStackCluster manifest into the pod"
+
+# Plain `kubectl apply`, not --server-side: it is idempotent and the CR is not
+# contended. (ssaForce in the chart governs the OPERATOR's objects, not this CR.)
+CR_OUT="$(cs_pod_exec "$CS_POD" bash -c \
+  'kubectl --kubeconfig="$1" apply -f "$2" 2>&1' _ "$CS_KCONF" "$POD_CR" 2>&1)"
+case "$CR_OUT" in
+  *'configured'*|*'created'*|*'unchanged'*) ;;
+  *) cs_fail E_OPERATOR_APPLY_FAILED "step=cr" "cr=$CR_NAME" "namespace=$OP_NS" \
+       recover="rerun:operator-up" \
+       hint="could not apply the CubeStackCluster: $(printf '%s' "$CR_OUT" | tr '\n' ' ' | cut -c1-100)" ;;
+esac
+
+# The stamp is what makes operator-wait's precondition mechanical, exactly as
+# verify-ok does for pod-down.
+cs_stamp_write operator-applied \
+  "$RELEASE/$VERSION ns=$OP_NS cr=$CR_NAME image=$OP_IMAGE at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+
+cs_ok "release=$RELEASE" "version=$VERSION" "namespace=$OP_NS" "pull_secret=$PULL_SECRET" \
+      "cr=$CR_NAME" "image=$OP_IMAGE_SHORT" "applied=1"

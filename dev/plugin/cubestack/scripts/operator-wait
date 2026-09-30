@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# operator-wait — wait for the CubeStackCluster to reach Ready.
+#
+# RUN THIS AS A BACKGROUND TASK. A five-component bring-up (the manifest ships
+# the catalog's six, with `aiGateway` disabled) installs dozens of
+# objects, pulls five OCI charts and (on the nodes) a few dozen images, and the
+# operator reconciles on a 30 s requeue — minutes, not seconds, and beyond any
+# foreground tool timeout. A caller that cannot run background tasks should use
+# --chunk N and re-invoke a bounded number of times instead.
+#
+# READ-ONLY against the deployed cluster, and that is the point of splitting it
+# from `operator-up`: it stages nothing into the pod, holds no credential, and
+# has no cs_cleanup hook. A caller may re-invoke it freely.
+#
+# The Degraded rule is a RE-PASS, not a poll loop. A component is legitimately
+# Degraded for a single cycle while a fresh rollout's first health check runs, so
+# this observes Degraded twice before deciding — the same shape as verify's 30 s
+# node re-pass, and stated here so a future reader does not "simplify" it to a
+# first-sight failure.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
+CS_CYCLE=30            # seconds between poll cycles; matches the operator's requeueSeconds
+CS_DEF_BUDGET=1800     # 30 min
+CS_CR_NAME="cubestack"
+CS_OPERATOR_NS="cubestack-system"
+# The helm release, mirroring operator-up's constant. Used only to select the
+# operator's own pod when naming the running binary in a Degraded verdict --
+# this script installs nothing.
+CS_RELEASE="cubestack-operator"
+# Named only to make the image-pull hint concrete; this script never touches the
+# Secret (it holds no credential, which is the whole point of the split).
+CS_PULL_SECRET="harbor-credentials"
+# The Ready condition, then one `name=phase` line per component. The newline
+# after the condition is what makes line 1 unambiguously the condition's value
+# even when it is empty (the operator has not written status yet).
+CS_CR_JSONPATH='{.status.conditions[?(@.type=="Ready")].status}{"\n"}{range .status.components[*]}{.name}={.phase}{"\n"}{end}'
+CS_DEG_JSONPATH='{range .status.components[?(@.phase=="Degraded")]}{.name}={.message}{"\n"}{end}'
+
+usage() {
+  cat <<'USAGE'
+operator-wait [options]
+
+  --run ID          the run being waited on (default: this run's id)
+  --pod NAME        installer pod (default: this run's, <prefix>-<run-id>)
+  --namespace NS    the operator namespace (default cubestack-system)
+  --cr NAME         the CubeStackCluster name (default cubestack)
+  --budget SECONDS  give up after this long (default 1800)
+  --chunk SECONDS   return after this long with running=1 instead of blocking
+  -h, --help        this text
+
+Polls status.conditions[type=Ready] every 30 s. On success writes the operator-ok
+stamp. Verdict: ready=, components=<ready>/<total>, elapsed=.
+Designed to be run as a background task.
+USAGE
+}
+
+POD_OPT=""
+BUDGET=""
+CHUNK=""
+OP_NS="$CS_OPERATOR_NS"
+CR_NAME="$CS_CR_NAME"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) cs_need_val "$@";       cs_run_opt "${2:-}"; shift 2 ;;
+    --pod) cs_need_val "$@";       POD_OPT="${2:-}"; shift 2 ;;
+    --namespace) cs_need_val "$@"; OP_NS="${2:-}"; shift 2 ;;
+    --cr) cs_need_val "$@";        CR_NAME="${2:-}"; shift 2 ;;
+    --budget) cs_need_val "$@";    BUDGET="${2:-}"; shift 2 ;;
+    --chunk) cs_need_val "$@";     CHUNK="${2:-}"; shift 2 ;;
+    -h|--help)   usage; cs_ok "help=1" ;;
+    *) cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+for v in BUDGET CHUNK; do
+  eval "n=\${$v}"
+  [ -n "$n" ] || continue
+  cs_kv_nonnumeric "$n" && cs_usage_fail "$v must be a positive integer (got '$n')"
+  [ "$n" -gt 0 ] || cs_usage_fail "$v must be greater than zero"
+done
+
+# Without operator-up's stamp there is no CR to wait on. The stamp, not a guess —
+# the same rule verify-ok enforces for pod-down. Checked before the kubeconfig
+# guard for pod-down's reason: it is a local file check, and "you skipped
+# operator-up" must be the answer even when the cluster is unreachable.
+[ -n "$(cs_stamp_read operator-applied)" ] || cs_fail E_OPERATOR_NO_CR "cr=$CR_NAME" \
+  recover="rerun:operator-up" \
+  hint="no operator-applied stamp in the run dir; operator-up has not run for this run, so there is no CubeStackCluster to wait on"
+
+# The kubeconfig guard sits ABOVE the budget for reserve-vips' reason: spending
+# an attempt on a host that cannot answer would make the budget meaningless.
+cs_kubeconfig_guard
+cs_budget_guard
+cs_pod_require "$POD_OPT"
+
+[ -n "$BUDGET" ] || BUDGET="$CS_DEF_BUDGET"
+
+START=$SECONDS
+cs_run_mkdir
+POLL_OUT="$(cs_run_dir)/operator-wait.poll"
+
+# The redirect lives in the backgrounded CHILD, never on the cs_wait_cmd call:
+# `cs_wait_cmd cmd > file` would redirect this shell for the whole wait, and a
+# signal's E_INTERRUPTED verdict would then be captured into the file instead of
+# reaching stderr.
+#
+# cs_pod_exec_out (stderr dropped), not cs_pod_exec: the status body's OUTPUT is
+# inspected, and a folded `command terminated with exit code 1` would sanitize
+# into a non-empty garbage phase name. The explicit `cr=` line is what answers
+# "does the CR exist" without guessing from an empty string.
+poll_to_file() { "$@" > "$POLL_OUT" 2>&1; }
+pod_exec_out() { cs_wait_cmd poll_to_file cs_pod_exec_out "$@"; }
+
+# Sanitize free text for a verdict value (no spaces, no newlines).
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._:@/+,-' '_' | tr -s '_' | cut -c1-100; }
+
+DEG_SEEN=0
+ELAPSED=0
+
+while :; do
+  pod_exec_out "$CS_POD" bash -c '
+    K="$1"; NS="$2"; CR="$3"; JP="$4"
+    k() { kubectl --kubeconfig="$K" "$@"; }
+    if k -n "$NS" get cubestackcluster "$CR" >/dev/null 2>&1; then echo cr=1; else echo cr=0; exit 0; fi
+    echo "###STATUS"
+    k -n "$NS" get cubestackcluster "$CR" -o jsonpath="$JP" 2>/dev/null' \
+    _ "$CS_KCONF" "$OP_NS" "$CR_NAME" "$CS_CR_JSONPATH"
+
+  OUT="$(cat "$POLL_OUT" 2>/dev/null)"
+
+  if [ -z "$OUT" ]; then
+    # An exec that yields nothing at all is a dead or vanished pod, not a quiet
+    # cluster: fail precisely instead of sleeping out the budget.
+    if ! cs_pod_ready "$CS_POD"; then
+      cs_fail E_POD_NOT_READY "pod=$CS_POD" "reason=$(cs_pod_reason "$CS_POD")" \
+        recover=rerun:pod-up \
+        hint="the bootstrap pod stopped answering while waiting on the operator; the deployed cluster and its CR are unaffected"
+    fi
+  fi
+
+  ELAPSED=$((SECONDS - START))
+  cs_logged printf '%s\n' "--- elapsed=${ELAPSED}s"
+  cs_logged printf '%s\n' "$OUT"
+
+  CR_PRESENT="$(printf '%s\n' "$OUT" | sed -n 's/^cr=//p' | head -1)"
+  if [ "$CR_PRESENT" = "0" ]; then
+    cs_fail E_OPERATOR_NO_CR "cr=$CR_NAME" "namespace=$OP_NS" "elapsed=${ELAPSED}s" \
+      recover="rerun:operator-up" \
+      hint="the CubeStackCluster is gone from the deployed cluster; re-apply it with operator-up"
+  fi
+
+  STATUS="$(printf '%s\n' "$OUT" | sed -n '/^###STATUS$/,$p' | sed '1d')"
+  READY="$(printf '%s\n' "$STATUS" | head -1)"
+  # Anything that is not a status token (a kubectl error that reached stdout, a
+  # half-written line) means "not Ready yet", never a match. Polling on is the
+  # safe reading; the cycle is logged either way, so diagnose can see it.
+  case "$READY" in True|False|'') ;; *) READY="" ;; esac
+
+  TOTAL=0
+  READY_N=0
+  DEGRADED=""
+  while IFS= read -r line; do
+    nm="${line%%=*}"
+    ph="${line#*=}"
+    [ "$nm" != "$line" ] || continue
+    case "$nm" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    case "$ph" in Ready|Provisioning|Pending|Degraded) ;; *) continue ;; esac
+    TOTAL=$((TOTAL + 1))
+    case "$ph" in
+      Ready)    READY_N=$((READY_N + 1)) ;;
+      Degraded) DEGRADED="$DEGRADED${DEGRADED:+,}$nm" ;;
+    esac
+  done <<EOF
+$STATUS
+EOF
+
+  if [ "$READY" = "True" ] && [ -z "$DEGRADED" ]; then
+    cs_stamp_write operator-ok \
+      "ready=1 components=$READY_N/$TOTAL elapsed=${ELAPSED}s cr=$CR_NAME at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    cs_ok "ready=1" "components=$READY_N/$TOTAL" "elapsed=${ELAPSED}s" "cr=$CR_NAME"
+  fi
+
+  if [ -n "$DEGRADED" ]; then
+    if [ "$DEG_SEEN" -eq 0 ]; then
+      # First sighting. A fresh rollout's first health check can legitimately
+      # land here; one cycle later is the re-pass. Not a failure yet.
+      DEG_SEEN=1
+      cs_note "elapsed=${ELAPSED}s degraded=$DEGRADED (first sighting — re-passing before deciding)"
+    else
+      DEG_MSG="$(cs_pod_exec_out "$CS_POD" bash -c '
+        kubectl --kubeconfig="$1" -n "$2" get cubestackcluster "$3" -o jsonpath="$4" 2>/dev/null' \
+        _ "$CS_KCONF" "$OP_NS" "$CR_NAME" "$CS_DEG_JSONPATH" \
+        | tr -c 'A-Za-z0-9._:@/+,-=' '_' | tr -s '_' | cut -c1-200)"
+      FIRST_DEG="${DEGRADED%%,*}"
+      DEG_SHORT="$(sanitize "${DEG_MSG:-no-message}")"
+      # WHICH BUILD produced this verdict, and whether it is the one operator-up
+      # installed. The operator's image tag is the rolling `latest`, so only the
+      # digest separates two builds; a Degraded verdict without it cannot be told
+      # apart from one caused by a defect that was already fixed and whose image
+      # never reached the box -- which is exactly how the ClientTrafficPolicy fix
+      # was first read as a failed fix. Read from the LIVE pod (ground truth), not
+      # from a record: an operator pod that outlived its stamp is the thing being
+      # detected.
+      #
+      # Selecting on `app.kubernetes.io/instance` (the release name, chart-supplied):
+      # the chart's `.../name` label is `cubestack-operator-chart`, NOT
+      # `cubestack-operator`, so selecting on that finds nothing at all.
+      OP_IMAGE="$(cs_pod_exec_out "$CS_POD" bash -c '
+        kubectl --kubeconfig="$1" -n "$2" get pods -l "app.kubernetes.io/instance=$3" \
+          --sort-by=.metadata.creationTimestamp \
+          -o jsonpath="{.items[-1:].status.containerStatuses[0].imageID}" 2>/dev/null' \
+        _ "$CS_KCONF" "$OP_NS" "$CS_RELEASE" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$OP_IMAGE" ]; then
+        OP_LIVE_SHORT="$(cs_image_short "$OP_IMAGE")"
+      else
+        OP_LIVE_SHORT="unreadable"
+      fi
+      # The digest operator-up recorded when it last rolled. A stamp written
+      # before the roll existed carries no image= key at all, and that alone says
+      # the binary was never deliberately advanced -- so "unrecorded" is a
+      # finding, not a missing value.
+      #
+      # The presence test MUST come before the truncation: with no image= key,
+      # `${...#*image=}` returns the string unchanged, and cutting that at the
+      # first space would hand the release name to the digest parser as though it
+      # were a digest -- an "unrecorded" stamp reported as a digest mismatch.
+      OP_INSTALLED="$(cs_stamp_read operator-applied)"
+      OP_INSTALLED_SHORT=""
+      if [ "${OP_INSTALLED#*image=}" != "$OP_INSTALLED" ]; then
+        OP_INSTALLED_SHORT="${OP_INSTALLED#*image=}"
+        OP_INSTALLED_SHORT="$(cs_image_short "${OP_INSTALLED_SHORT%% *}")"
+      fi
+      if [ -z "$OP_INSTALLED_SHORT" ]; then
+        OP_INSTALLED_SHORT="unrecorded"
+        OP_STALE_HINT="; this run's operator-applied stamp records no image, so operator-up never rolled the operator and the running binary may predate the fix"
+      elif [ "$OP_LIVE_SHORT" = "unreadable" ]; then
+        # Say what is true (the pod could not be read) rather than narrating it
+        # as a mismatch, which would claim a replacement that was never observed.
+        OP_STALE_HINT="; the running operator pod could not be read, so compare its digest by hand against installed=$OP_INSTALLED_SHORT"
+      elif [ "$OP_LIVE_SHORT" != "$OP_INSTALLED_SHORT" ]; then
+        OP_STALE_HINT="; the running binary ($OP_LIVE_SHORT) is NOT the one operator-up installed ($OP_INSTALLED_SHORT), so the operator has since been replaced"
+      else
+        OP_STALE_HINT="; the running binary is the one operator-up installed, so this is not a stale-image symptom"
+      fi
+      # The verb needs the file the credential lives in. run.env recorded its
+      # PATH at Step 0; if it is missing the verb would be malformed, so fall
+      # back to the stop-and-report that is always actionable.
+      VALUES_FILE="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
+      case "$DEG_SHORT" in
+        *ImagePullBackOff*|*ErrImagePull*|*unauthorized*|*Unauthorized*|*'pull_access_denied'*|*401*|*403*)
+          # The one Degraded cause a credential re-Write CAN clear. It does not
+          # claim the credential is wrong: the operator's message is what
+          # distinguishes "wrong password" from "right password, missing project
+          # scope", and both are named in the hint.
+          #
+          # The hint names a second cause a re-Write would NOT clear - a Secret
+          # missing from a component namespace. operator-up creates those up
+          # front, so it takes an edit to that script to produce, but the two are
+          # indistinguishable from the message alone and the reader should be able
+          # to rule the cheaper one in or out.
+          # THREE causes, and only the first two are cleared by the recover= verb.
+          # The third is the one a first run is most likely to hit and the only
+          # one worth stating outright: the installer's own design has the
+          # deployed nodes pull from the IN-CLUSTER registry and never from
+          # Harbor (docs/harbor-mirror.md: "集群永远不需要访问公网"; the pod pulls
+          # to an offline tar, the module pushes to registry.cubestack.io:5000,
+          # the nodes pull from there). Nothing in a run has ever proved a NODE
+          # can resolve or route harbor.isuanova.com - env-probe only proves it
+          # from the pod. This CR asks the nodes for exactly that, so a node
+          # without egress fails here and reads identically to a bad password.
+          cs_fail E_OPERATOR_IMAGE_PULL "component=$FIRST_DEG" "message=$DEG_SHORT" \
+            recover="fix-values:${VALUES_FILE:-$(cs_run_dir)/values.conf}:HARBOR_RO_USER,HARBOR_RO_PW" \
+            hint="cannot pull its image: robot scope, $CS_PULL_SECRET missing from that ns, or nodes that cannot reach Harbor - re-Write the values file, re-run operator-up" ;;
+        *)
+          cs_fail E_OPERATOR_COMPONENT_DEGRADED "component=$FIRST_DEG" "degraded=$DEGRADED" "message=$DEG_SHORT" \
+            "image=$OP_LIVE_SHORT" "installed=$OP_INSTALLED_SHORT" \
+            recover=stop-report:user \
+            hint="the operator reports $FIRST_DEG as Degraded; its message names the cause and a retry does not clear it$OP_STALE_HINT" ;;
+      esac
+    fi
+  else
+    DEG_SEEN=0
+  fi
+
+  cs_note "elapsed=${ELAPSED}s ready=${READY_N}/${TOTAL}${DEGRADED:+ degraded=$DEGRADED}"
+
+  if [ -n "$CHUNK" ] && [ "$ELAPSED" -ge "$CHUNK" ]; then
+    # Bounded re-invocation mode: hand the caller a stable "still running" and
+    # let it decide whether to call again.
+    cs_ok "running=1" "elapsed=${ELAPSED}s" "ready=${READY_N}/${TOTAL}"
+  fi
+
+  if [ "$ELAPSED" -ge "$BUDGET" ]; then
+    cs_fail E_OPERATOR_STILL_PROVISIONING "budget=${BUDGET}s" "elapsed=${ELAPSED}s" \
+      "ready=${READY_N}/${TOTAL}" recover="rerun:operator-wait" \
+      hint="the platform is still coming up at the budget; re-run operator-wait to keep watching (the budget is never extended silently)"
+  fi
+
+  SLEEP="$CS_CYCLE"
+  if [ -n "$CHUNK" ]; then
+    LEFT=$((CHUNK - ELAPSED))
+    [ "$LEFT" -lt "$SLEEP" ] && SLEEP="$LEFT"
+  fi
+  LEFT_B=$((BUDGET - ELAPSED))
+  [ "$LEFT_B" -lt "$SLEEP" ] && SLEEP="$LEFT_B"
+  # cs_wait_cmd, not a bare `sleep`: a foreground sleep defers the EXIT trap for
+  # its whole duration, so a signal would produce no verdict for up to 30 s and
+  # the caller could not tell that from a hang.
+  [ "$SLEEP" -gt 0 ] && cs_wait_cmd sleep "$SLEEP"
+done

@@ -1,0 +1,789 @@
+#!/usr/bin/env bash
+# reserve-vips — reserve this box's VIP block from the HOST's cubestack-ipam
+# BEFORE the installer runs, and hand that range to the installer as its pool.
+#
+# WHY THIS EXISTS. MetalLB and the host's cubestack-ipam allocate from the same
+# subnet, and on a `static` IPAM pool nothing refuses a duplicate: two hosts
+# answer for one address, connectivity goes intermittent, and the only detector
+# is the DuplicateAddress audit event. The way to remove that is not to police
+# MetalLB afterwards — it is to make every address MetalLB can reach an address
+# the IPAM has already bound to this box.
+#
+# So this step runs BEFORE `configure` (Step 1b). It creates ONE IPRangeRequest
+# for a contiguous block of COUNT addresses and records the range as POOL_RANGE.
+# `configure` already falls back to that key for METALLB_POOL, so the installer
+# renders its single IPAddressPool from exactly these addresses.
+#
+# What that buys:
+#
+#   * `primary` is rendered with autoAssign unset (i.e. TRUE) and there is no
+#     installer key to change that. That is fine here, and only here: every
+#     address in the pool is already ours, so MetalLB choosing one cannot reach
+#     an address a VM owns. The pool is COUNT addresses, not the subnet.
+#   * REGISTRY_IP is deliberately left EMPTY. The installer then derives it from
+#     the pool's first address (sync-kubespray-config.sh:319 via
+#     lib-common.sh:first_pool_addr), which is our LOW reserved address, and
+#     writes it both to the registry Service's spec.loadBalancerIP and to each
+#     node's /etc/hosts. One source of truth, so nothing ever has to move it.
+#     Leaving it empty also leaves REGISTRY_IP_EXPLICIT=0, which keeps
+#     deploy-registry.sh:99-120's collision probe armed: it curls the address
+#     before the deploy commits and aborts if anything answers. On a reserved
+#     address that probe should be silent, and if it is not, the run stops with
+#     a real signal instead of 20 minutes later with a mysterious one.
+#
+#     This bullet is a property of a box with the registry ON. With
+#     REGISTRY_ENABLED=false there is no registry Service and nothing derives an
+#     address from the pool at all — the block exists solely for the consumers
+#     that appear later, which is why COUNT is 1 in that shape.
+#   * Nothing is patched after the deploy. The design this replaced deleted
+#     `primary`, applied a replacement pool and re-pinned the registry Service;
+#     that needed the delete to precede the apply (MetalLB's validating webhook
+#     refuses an overlapping pool) and left the nodes' /etc/hosts pointing at a
+#     dead address. None of those modes exist when the address never moves.
+#
+# WHY ONE RANGE REQUEST AND NOT N IPREQUESTS. `IPRequest` allocates one address,
+# lowest free, with no way to ask for one. Reserving a block through it therefore
+# meant claiming an address at a time, asking after each claim whether the
+# addresses now held ended in a run of COUNT, releasing the strays when they did
+# not, and — when a claim was refused — dropping everything and claiming a probe
+# address purely to tell "the band is full" from "the free addresses are not
+# contiguous". `IPRangeRequest` asks for the run directly, so all of that is the
+# controller's job now: one object, one read, and its two failure reasons
+# (RangeExhausted, RangeFragmented) are named rather than inferred.
+#
+# It is also the same ledger. ipam.cubestack.io reads IPRequest and
+# IPRangeRequest together (internal/controller/ledger.go), so a block can never
+# overlap a VM's address or another block.
+#
+# The request carries an `ownerRef` to the box's master node's VirtualMachine
+# (the run.env VM_NAMES entry ending in -0, or the single node's name), so
+# deleting that VM garbage-collects it and returns the addresses — the same
+# lifecycle a real VM claim has. Nothing else frees them; `--release` is the
+# escape hatch for a box torn down without its VM being deleted.
+#
+# The host kubeconfig arrives as a PATH (default: the ambient KUBECONFIG, which
+# is already the KubeVirt cluster), so no host-specific config lands in the skill.
+#
+# It touches ONLY the host cluster: there is no pod here and no deployed-cluster
+# kubeconfig, which is why it can run at Step 1b, before the bootstrap pod even
+# exists.
+#
+# PREREQUISITE. The host's cubestack-ipam must be chart 0.4.0 or later — the
+# kind did not exist before that — and whatever kubeconfig is used here needs
+# create/delete on iprangerequests. The chart ships only a Viewer role for this
+# kind, so a write role has to be granted. Both are checked below and reported
+# by name rather than as a raw kubectl error.
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/verdict.sh
+. "$SELF_DIR/lib/verdict.sh"
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+cs_init
+
+# How many contiguous addresses to reserve — the number of LoadBalancer
+# consumers the box will have, and a property of the RUN, not a policy of this
+# script. The default, two, is the shape of a box with the in-cluster registry
+# ON: the registry takes the low address (derived by the installer from the
+# pool's first address) and the envoy gateway's data plane is auto-assigned the
+# high one. A box built with REGISTRY_ENABLED=false has no registry, so its only
+# consumer is the gateway, and reserving two would strand an address for the
+# life of the box — callers in that shape pass --count 1.
+#
+# `configure` sets run.env's REGISTRY_REQUESTED from the values file, but it runs
+# at Step 4 and this script runs at Step 1b, so the count cannot be derived from
+# the run's own record here — it has to be passed in.
+#
+# It is FIRST-INVOCATION-ONLY, because `spec.count` is immutable: the API server
+# refuses a change, so a re-run that asked for a different size would die on a
+# confusing patch error. Instead the live object always wins, a re-run with no
+# --count reuses silently, and an explicit --count that disagrees fails loudly
+# with E_VIP_COUNT_IMMUTABLE. Changing the size means --release and a re-draw,
+# which may land on a different block — so it is only available before the
+# deploy has baked the range into cluster.conf.
+#
+# Any extra LoadBalancer Service beyond the count sits <pending> — visible, never
+# silent — which is the honest outcome and strictly better than handing out an
+# address a VM already owns.
+COUNT=""
+COUNT_GIVEN=0
+
+# The ceiling on an explicitly-passed --count. Not a policy: this is a VIP block
+# for one box's LoadBalancer consumers, and a slipped digit should not reserve
+# 65536 addresses out of the host's pool. It does NOT bound a count read back
+# from an existing request — that is a valid reservation somebody made.
+HARD_CAP=64
+
+# How long to wait for the controller to record a block. The controller is
+# single-pass and re-reconciles on watch events, so binding is a local ledger
+# update rather than a network operation: anything slower is a fault, not a slow
+# path. 12 sleeps of 5s.
+WAIT_TRIES=12
+WAIT_STEP=5
+
+usage() {
+  cat <<'USAGE'
+reserve-vips [options]
+
+  --run ID           the run (default: this run's id)
+  --ipam-kubeconfig P  kubeconfig for the HOST KubeVirt cluster, which is where
+                     the IPRangeRequest is created (default: $KUBECONFIG, already
+                     that cluster)
+  --ipam-pool NAME   the host IPPool to claim from (default: the only one there)
+  --owner-vm NAME    the VirtualMachine to own the request (default: the box's
+                     master node, resolved from run.env's VM_NAMES)
+  --count N          how many contiguous addresses to reserve (default 2). The
+                     number of LoadBalancer consumers the box will have: 2 for a
+                     box with the in-cluster registry on (registry + gateway),
+                     1 for one with REGISTRY_ENABLED=false, where the gateway is
+                     the only consumer and a second address would be stranded.
+                     FIRST INVOCATION ONLY: the count is immutable, so a re-run
+                     with no --count reuses the recorded one, and a --count that
+                     disagrees with it fails. To change it before the deploy,
+                     --release and re-run — the redrawn block may differ.
+  --release          give the addresses back: delete this run's request and
+                     forget the block. Destructive; never implicit. Use it when a
+                     box is going away WITHOUT its master VM being deleted — the
+                     ownerRef is the normal lifecycle and frees them on its own.
+  --dry-run          report what is already reserved and what would be requested.
+                     The block itself is the controller's choice, so it cannot be
+                     previewed. Writes nothing and spends no retry.
+  -h, --help         this text
+
+Writes POOL_RANGE (the reserved block, which `configure` feeds to the installer
+as METALLB_POOL), VIP_ADDRS, VIP_RANGE_CLAIM, VIP_RANGE_COUNT, VIP_IPAM_POOL and
+VIP_OWNER_VM.
+
+Idempotent: a re-invocation reuses the recorded block, never re-draws it. A run
+reserved by an earlier build of this script still holds its block as individual
+IPRequests; those are reused too, read-only, and are never converted.
+
+Verdict: pool_range=, addrs=, claim=, owner=, pool=, count=, reused=0|1, legacy=0|1.
+USAGE
+}
+
+IPAM_KCONF="${CUBESTACK_IPAM_KUBECONFIG:-${KUBECONFIG:-}}"
+IPAM_POOL=""
+OWNER_VM=""
+RELEASE=0
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  # cs_need_val "$@" is what makes a trailing value-taking flag (`--count` with no
+  # value) a usage error instead of a hang: `shift 2` on a one-argument argv FAILS
+  # WITHOUT SHIFTING, so $1 would stay put and the loop would spin forever.
+  case "$1" in
+    --run)             cs_need_val "$@"; cs_run_opt "${2:-}"; shift 2 ;;
+    --ipam-kubeconfig) cs_need_val "$@"; IPAM_KCONF="${2:-}"; shift 2 ;;
+    --ipam-pool)       cs_need_val "$@"; IPAM_POOL="${2:-}"; shift 2 ;;
+    --owner-vm)        cs_need_val "$@"; OWNER_VM="${2:-}"; shift 2 ;;
+    --count)           cs_need_val "$@"; COUNT="${2:-}"; COUNT_GIVEN=1; shift 2 ;;
+    --release)         RELEASE=1; shift ;;
+    --dry-run)         DRY_RUN=1; shift ;;
+    -h|--help)         usage; cs_ok "help=1" ;;
+    *)                 cs_usage_fail "unknown argument: $1" ;;
+  esac
+done
+
+# --- deterministic validation, BEFORE the budget -----------------------------
+# The configure/operator-up rule: a usage error must never burn an attempt, and
+# the recover verb these checks prescribe must stay executable.
+RUN_ID="$(cs_run_id)" || cs_usage_fail \
+  "no run id; pass --run <id> (the run dir's basename is the id)"
+
+# An ipam pool name becomes a string in the request's spec and travels in the
+# verdict; RFC1123 lowercase is the intersection of the two.
+if [ -n "$IPAM_POOL" ]; then
+  case "$IPAM_POOL" in
+    *[!a-z0-9.-]*|[-.]*|*[-.])
+      cs_usage_fail "--ipam-pool must be RFC1123 (lowercase alphanumerics, '-', '.'): '$IPAM_POOL'" ;;
+  esac
+fi
+
+# A count that is not a positive integer would not fail here — it would fail as
+# a shell arithmetic error later, or as the API server rejecting spec.count with
+# a message about a JSON type. HARD_CAP is the same bound the create applies, so
+# a --count past it is a count this step will not make rather than a bigger
+# reservation.
+if [ "$COUNT_GIVEN" -eq 1 ]; then
+  case "$COUNT" in
+    ''|*[!0-9]*) cs_usage_fail "--count must be a positive integer: '$COUNT'" ;;
+  esac
+  [ "$COUNT" -ge 1 ] || cs_usage_fail "--count must be at least 1: $COUNT"
+  [ "$COUNT" -le "$HARD_CAP" ] || cs_usage_fail "--count must be at most $HARD_CAP: $COUNT"
+fi
+
+# The owner VM: the box's MASTER node, from the run's own resolved plan. The
+# virtualMachinePool NAME would be wrong here — the owner has to be a VM object,
+# and on a pooled box the members are <pool>-0/-1/…, not the pool.
+#
+# Resolved but NOT validated here. `--release` needs no owner: it works from the
+# recorded names and the anchored prefix, and the moment release matters most is
+# the moment the owner is least available — the VM was deleted, which is what
+# garbage-collected the request, or the run dir predates VM_NAMES. Gating cleanup
+# on a resolvable owner would make the escape hatch unreachable in exactly the
+# case it exists for. The requirement is enforced below, on the paths that
+# actually create an ownerReference.
+if [ -z "$OWNER_VM" ]; then
+  # Pick the master the same way `vm-ready` does, rather than assuming position:
+  # a pooled box is <pool>-0/-1/… with -0 the master, but an explicit `NAME…`
+  # invocation may list them in any order, and choosing a worker would make a
+  # worker's deletion the thing that frees the VIPs. Falls back to the first
+  # entry, exactly as `vm-ready` falls back to FIRST_NAME.
+  VM_NAMES_RAW="$(cs_run_env_get VM_NAMES)"
+  FIRST_VM="${VM_NAMES_RAW%%,*}"
+  OWNER_VM=""
+  OLDIFS="$IFS"; IFS=,; set -f
+  for v in $VM_NAMES_RAW; do
+    case "$v" in *-0) OWNER_VM="$v"; break ;; esac
+  done
+  set +f; IFS="$OLDIFS"
+  [ -n "$OWNER_VM" ] || OWNER_VM="$FIRST_VM"
+fi
+OWNER_OK=1
+[ -n "$OWNER_VM" ] || OWNER_OK=0
+
+[ -n "$IPAM_KCONF" ] || cs_usage_fail \
+  "--ipam-kubeconfig is required (no KUBECONFIG is set; the host KubeVirt cluster is where the IPRangeRequest is created)"
+
+hget() { kubectl --kubeconfig="$IPAM_KCONF" "$@"; }
+
+names_only() { grep -E '^[A-Za-z0-9][A-Za-z0-9._-]*$'; }
+
+# The request's name. `metadata.name` is RFC1123, which is narrower than what a
+# --run id may contain, so it is sanitised the same way cs_pod_name sanitises the
+# pod name — same reasoning: a user-chosen run id must not be able to produce an
+# object the API server rejects.
+#
+# The RUN ID ITSELF IS NOT SANITISED for the ERE below. The anchored-prefix
+# property is what keeps one run's cleanup away from another's objects, and it
+# depends on the literal id: `cubestack1-vip-0` must not match a pattern built
+# for `cubestack11`, and vice versa.
+RANGE_NAME="$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' \
+  | tr -c 'a-z0-9-' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')-vips"
+
+RUN_ID_ERE="$(printf '%s' "$RUN_ID" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+# The claim names an earlier build of this script used. Nothing creates these any
+# more; they are matched only so a pre-existing run keeps working and so
+# `--release` can still clean them up.
+LEGACY_CLAIM_ERE="^${RUN_ID_ERE}-vip-[0-9]+$"
+
+list_legacy_claims() {
+  hget -n "$CS_NS" get iprequests.ipam.cubestack.io --no-headers \
+    -o custom-columns='N:.metadata.name' 2>/dev/null | names_only | grep -E "$LEGACY_CLAIM_ERE"
+}
+
+release_legacy_claim() {  # $1 = ns/name
+  hget -n "${1%%/*}" delete iprequest "${1##*/}" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+release_range() {  # $1 = name (default: this run's)
+  hget -n "$CS_NS" delete iprangerequest.ipam.cubestack.io "${1:-$RANGE_NAME}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+}
+
+# Records the state of a request into R_*. Returns non-zero when the object is
+# not there (or the API is not answering), which the caller must not read as
+# "Pending" — those are different things with different recoveries.
+#
+# One read, six fields, split on '|'. Safe because none of them can contain a
+# pipe: phases and reasons are a fixed enum, addresses are dotted quads, a pool
+# name is RFC1123 and a count is an integer.
+read_range() {
+  local out
+  out="$(hget -n "$CS_NS" get iprangerequest.ipam.cubestack.io "$RANGE_NAME" \
+    -o jsonpath='{.status.phase}|{.status.start}|{.status.end}|{.status.conditions[?(@.type=="Ready")].reason}|{.spec.count}|{.spec.poolRef}' 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  R_PHASE="${out%%|*}";  out="${out#*|}"
+  R_START="${out%%|*}";  out="${out#*|}"
+  R_END="${out%%|*}";    out="${out#*|}"
+  R_REASON="${out%%|*}"; out="${out#*|}"
+  R_COUNT="${out%%|*}"
+  R_POOLREF="${out#*|}"
+  return 0
+}
+
+range_exists() {
+  [ -n "$(hget -n "$CS_NS" get iprangerequest.ipam.cubestack.io "$RANGE_NAME" \
+    --ignore-not-found -o name 2>/dev/null)" ]
+}
+
+# Expands a block into one address per line. Callers bound it by HARD_CAP first:
+# this is only ever used for the VIP_ADDRS record, and a run.env line holding
+# 65536 addresses helps nobody.
+expand_range() {  # $1 = lo, $2 = hi
+  # /[.]/ and not "." — split()'s third argument is an ERE, where a bare "."
+  # matches any character and would split the address into single digits.
+  awk -v lo="$1" -v hi="$2" '
+    BEGIN {
+      if (split(lo, a, /[.]/) != 4 || split(hi, b, /[.]/) != 4) exit 1
+      s = a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]
+      e = b[1]*16777216 + b[2]*65536 + b[3]*256 + b[4]
+      if (e < s) exit 1
+      for (i = s; i <= e; i++)
+        printf "%d.%d.%d.%d\n", int(i/16777216)%256, int(i/65536)%256, int(i/256)%256, i%256
+    }'
+}
+
+# --- release -----------------------------------------------------------------
+# Destructive and never implicit. Run BEFORE the budget, before the expose check
+# and before the CRD check: cleanup must not be lockable out by a counter, and it
+# has to stay reachable on a run that was re-preflighted to nodeport, or on a host
+# whose ipam predates IPRangeRequest — where it is the only way the old claims are
+# ever returned.
+if [ "$RELEASE" -eq 1 ]; then
+  REC_RANGE_CLAIM="$(cs_run_env_get VIP_RANGE_CLAIM)"
+  REC_RANGE_COUNT="$(cs_run_env_get VIP_RANGE_COUNT)"
+  RECORDED="$(cs_run_env_get VIP_CLAIMS)"
+  ADDRS="$(cs_run_env_get VIP_ADDRS)"
+  # Delete by the recorded name when there is one, else by this run's own name:
+  # an invocation killed between the create and the run.env write leaves an
+  # object that nothing else would ever find.
+  release_range "${REC_RANGE_CLAIM##*/}"
+  for c in $(printf '%s' "$RECORDED" | tr ',' ' '); do
+    release_legacy_claim "$c"
+  done
+  # The probe is named separately because it deliberately does NOT match the
+  # -vip-<digits> pattern (it must not be mistaken for a block member), so a
+  # probe killed between its create and its delete would otherwise leak an
+  # address with nothing left able to find it.
+  release_legacy_claim "$CS_NS/${RUN_ID}-vip-probe"
+  for n in $(list_legacy_claims); do
+    release_legacy_claim "$CS_NS/$n"
+  done
+  cs_run_env_put "POOL_RANGE=" "VIP_ADDRS=" "VIP_RANGE_CLAIM=" "VIP_RANGE_COUNT=" \
+    "VIP_IPAM_POOL=" "VIP_OWNER_VM=" "VIP_CLAIMS="
+  cs_ok "released=1" "claim=$CS_NS/$RANGE_NAME" "count=${COUNT:-${REC_RANGE_COUNT:-}}" \
+        "addrs=${ADDRS:--}" "owner=${OWNER_VM:--}"
+fi
+
+# Past the release path, an owner is mandatory: everything below creates a
+# request, and an ownerReference is what ties its lifetime to the box.
+[ "$OWNER_OK" -eq 1 ] || cs_usage_fail \
+  "run.env records no VM_NAMES; the request's ownerReference needs the box's first node — re-run preflight, or pass --owner-vm"
+
+# Refuse a run that never asked for MetalLB. It is gated by the global
+# SERVICE_EXPOSE_MODE, not by a toggle of its own, so a nodeport run has no
+# metallb-system and therefore no pool to fill — and without this the failure
+# would surface much later as `configure` refusing an empty METALLB_POOL, which
+# names neither the cause nor the fix.
+#
+# METALLB_REQUESTED is what `configure` recorded after the values-file
+# precedence was applied, so it wins. EXPOSE is `preflight`'s record of what was
+# asked for and is the only signal an older run dir carries. Absent both means
+# the default, which is ON.
+METALLB_REQ="$(cs_run_env_get METALLB_REQUESTED)"
+if [ -z "$METALLB_REQ" ]; then
+  case "$(cs_run_env_get EXPOSE)" in
+    nodeport|nodePort) METALLB_REQ=0 ;;
+    *)                 METALLB_REQ=1 ;;
+  esac
+fi
+[ "$METALLB_REQ" = "1" ] || cs_usage_fail \
+  "this run uses SERVICE_EXPOSE_MODE=nodeport, which has no MetalLB pool to fill; reserve-vips does not apply — re-run preflight with --expose metallb if that was not intended"
+
+# The run's own subnet, used to reject a block the box's nodes are not on. A
+# label of the 4-octet /24 shape can be judged; a wider netmask cannot (the label
+# carries no prefix length) and guessing there would refuse legitimate runs.
+#
+# The shape test is the awk's `NF==4`, deliberately NOT a glob. `*-*-*-*` — the
+# obvious way to write "four parts" — matches any label with three OR MORE
+# dashes, which is exactly `10-66-3-0`: it would have rejected every real label
+# and left the off-subnet guard permanently dead. A label that does not split
+# into four numeric parts yields an empty SUBNET_NET, and the caller treats that
+# as "cannot judge" rather than as a pass.
+SUBNET="$(cs_run_env_get SUBNET)"
+SUBNET_NET=""
+case "$SUBNET" in
+  ''|*[!0-9-]*) ;;
+  *) SUBNET_NET="$(printf '%s' "$SUBNET" | tr '-' '.' \
+       | awk -F. 'NF==4 {printf "%s.%s.%s.", $1, $2, $3}')" ;;
+esac
+
+# What an earlier invocation recorded, if any.
+POOL_RANGE="$(cs_run_env_get POOL_RANGE)"
+VIP_ADDRS="$(cs_run_env_get VIP_ADDRS)"
+VIP_CLAIMS="$(cs_run_env_get VIP_CLAIMS)"
+REC_RANGE_CLAIM="$(cs_run_env_get VIP_RANGE_CLAIM)"
+REC_RANGE_COUNT="$(cs_run_env_get VIP_RANGE_COUNT)"
+
+# Set once the deploy has read the range into cluster.conf. After this, the block
+# is not merely reserved, it is in use — so it must never be re-drawn.
+DEPLOYED=0
+[ -f "$(cs_run_dir)/deploy-nodeset" ] && DEPLOYED=1
+
+# The count this invocation would ask for if it had to create the request.
+DISPLAY_COUNT="${COUNT:-${REC_RANGE_COUNT:-2}}"
+
+# --- count immutability, the local half --------------------------------------
+# spec.count cannot be changed, so a --count that disagrees with the recorded one
+# is a failure whatever the host says. Checking it here means the common mistake
+# costs no attempt and no host call — and the message is ours rather than the API
+# server's.
+if [ "$COUNT_GIVEN" -eq 1 ] && [ -n "$REC_RANGE_COUNT" ] && [ "$COUNT" != "$REC_RANGE_COUNT" ]; then
+  if [ "$DEPLOYED" -eq 1 ]; then
+    cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "recorded=$REC_RANGE_COUNT" \
+      recover=stop-report:user \
+      hint="spec.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; this run has already deployed, so its range is baked into cluster.conf and cannot change at all — re-run without --count to reuse it"
+  fi
+  cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "recorded=$REC_RANGE_COUNT" \
+    recover=stop-report:user \
+    hint="spec.count is immutable and this block is ${REC_RANGE_COUNT}, not ${COUNT}; re-run without --count to reuse it, or --release and re-run with --count ${COUNT} to draw a fresh block — the redrawn range may differ"
+fi
+
+# --- dry run -----------------------------------------------------------------
+# Before the budget, for the reason mount-models states: printing a plan must not
+# cost a retry. The host lookups here are read-only and their failure is
+# tolerated — the point is to show what would be done, not to gate on the host
+# being up.
+if [ "$DRY_RUN" -eq 1 ]; then
+  cs_note "dry run — nothing will be written"
+  cs_note "  owner      VirtualMachine $OWNER_VM in namespace $CS_NS"
+  cs_note "  ipam pool  ${IPAM_POOL:-<the only IPPool on the host cluster>}"
+  cs_note "  count      $DISPLAY_COUNT contiguous addresses (immutable once reserved)"
+  if [ -n "$REC_RANGE_CLAIM" ]; then
+    cs_note "  recorded   $REC_RANGE_CLAIM (count ${REC_RANGE_COUNT:-unknown}) — a real run would reuse it"
+  fi
+  if [ -n "$VIP_CLAIMS" ]; then
+    cs_note "  recorded   legacy IPRequests $VIP_CLAIMS covering ${POOL_RANGE:-${VIP_ADDRS:-unknown}} — a real run would reuse those, not convert them"
+  elif [ -z "$REC_RANGE_CLAIM" ] && [ "$DEPLOYED" -eq 1 ]; then
+    cs_note "  recorded   nothing, and this run has already deployed — a real run would fail with E_VIP_CLAIMS_LOST"
+  fi
+  # Deliberately not claiming to preview the block: the controller picks the
+  # lowest free run, so the addresses are not knowable before the create.
+  cs_note "  note       the block itself is the controller's choice and cannot be previewed"
+  if read_range; then
+    cs_note "  on host    $CS_NS/$RANGE_NAME phase=${R_PHASE:-Pending} ${R_START:+$R_START-$R_END} ${R_REASON:+reason=$R_REASON}"
+  else
+    cs_note "  on host    no such request yet (or the host cluster is unreachable)"
+  fi
+  cs_ok "dry_run=1" "count=$DISPLAY_COUNT" "owner=$OWNER_VM" "pool=${IPAM_POOL:-auto}"
+fi
+
+# --- the host has to be reachable, and has to serve the kind ------------------
+# All of this is deterministic with respect to a re-invocation, so it sits ABOVE
+# cs_budget_guard: spending an attempt on a host that cannot answer would make the
+# budget meaningless. The budget below therefore guards exactly one thing — the
+# create.
+if ! hget get ns "$CS_NS" >/dev/null 2>&1; then
+  cs_fail E_NO_KUBECONFIG "path=$IPAM_KCONF" recover=stop-report:admin \
+    hint="cannot reach the host KubeVirt cluster with this kubeconfig; pass --ipam-kubeconfig <path> or export KUBECONFIG"
+fi
+
+# Discovery rather than `get crd`: this proves the API SERVER SERVES the resource,
+# which is what a create needs, and it is the difference between "the CRD object
+# exists" and "this cluster can accept the request".
+if ! hget api-resources --api-group=ipam.cubestack.io --no-headers -o name 2>/dev/null \
+     | grep -qE '^iprangerequests($|\.)'; then
+  cs_fail E_VIP_NO_CRD "crd=iprangerequests.ipam.cubestack.io" "path=$IPAM_KCONF" recover=stop-report:admin \
+    hint="the host cluster does not serve iprangerequests.ipam.cubestack.io; the cubestack-ipam chart must be 0.4.0 or later — no re-invocation of this step fixes it"
+fi
+
+# The chart ships only a Viewer role for this kind, so a kubeconfig that can read
+# the pool may still be unable to reserve from it. Catch the common shape — a
+# read-only kubeconfig — before spending an attempt on a create that cannot work.
+#
+# ONLY an explicit "no" counts. `auth can-i` answers by creating a
+# SelfSubjectAccessReview, and a principal that may not create one gets an ERROR
+# rather than a denial (verified: `--as system:anonymous` prints
+# "cannot create resource selfsubjectaccessreviews" and nothing on stdout). A
+# check that failed is not a check that said no, and reading it as one would
+# abort a perfectly good run with a false E_VIP_RANGE_DENIED. Anything else falls
+# through, and a real 403 from the create maps to the same code below.
+CANI="$(hget auth can-i create iprangerequests.ipam.cubestack.io -n "$CS_NS" 2>/dev/null)"
+if [ "$CANI" = "no" ]; then
+  cs_fail E_VIP_RANGE_DENIED "crd=iprangerequests.ipam.cubestack.io" "namespace=$CS_NS" recover=stop-report:admin \
+    hint="this kubeconfig cannot create iprangerequests in $CS_NS; the cubestack-ipam chart ships only a Viewer role for this kind, so a write role must be granted to whoever runs Step 1b"
+fi
+
+cs_budget_guard
+
+# The owner must exist: an ownerReference to a missing UID is rejected by the API
+# server, and that rejection is a worse error message than this one.
+OWNER_UID="$(hget -n "$CS_NS" get vm "$OWNER_VM" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+[ -n "$OWNER_UID" ] || cs_fail E_VIP_OWNER "owner=$OWNER_VM" "namespace=$CS_NS" \
+  recover=stop-report:user \
+  hint="no VirtualMachine $OWNER_VM in namespace $CS_NS on the host cluster; the request's ownerReference needs it — check --ipam-kubeconfig and --owner-vm"
+
+# --- the block, and how a run reports on it ----------------------------------
+# Shared by every path that ends up holding a block: the off-subnet rejection,
+# the run.env record and the verdict. Taking the checks in one place is what
+# keeps the reuse path and the create path from drifting apart.
+settle_block() {  # $1 = reused (0|1), $2 = legacy (0|1)
+  local reused="$1" legacy="$2" lo hi addrs
+  lo="$R_START"; hi="$R_END"
+  POOL_RANGE="$lo-$hi"
+  OFFSUB=0
+
+  # Reject a block the box's nodes are not on. Off-L2 means MetalLB never
+  # announces, the registry VIP is unreachable, and every node pull fails with
+  # nothing naming the cause — so this is checked while it is still cheap.
+  #
+  # Two endpoints are enough: a contiguous run that starts and ends inside one
+  # /24 cannot leave it, and one that crosses the boundary fails on the far end.
+  if [ -n "$SUBNET_NET" ]; then
+    case "$lo" in "$SUBNET_NET"*) ;; *) OFFSUB=1 ;; esac
+    case "$hi" in "$SUBNET_NET"*) ;; *) OFFSUB=1 ;; esac
+    if [ "${OFFSUB:-0}" -eq 1 ]; then
+      # The request is released rather than left held: it is of no use to this
+      # box, and keeping it would strand those addresses for the life of the run.
+      release_range
+      cs_fail E_VIP_OFF_SUBNET "addrs=$POOL_RANGE" "subnet=$SUBNET" "pool=$IPAM_POOL" recover=stop-report:user \
+        hint="$IPAM_POOL allocates outside the run's subnet ($SUBNET); the VIP would be off-L2 — pass --ipam-pool with one that covers this subnet"
+    fi
+  fi
+
+  # Only for the record and for the hint that names a lost block. Bounded by
+  # HARD_CAP because a block is a VIP pool, not a subnet; a larger one still
+  # works, it just has no address-by-address record.
+  case "$R_COUNT" in
+    ''|*[!0-9]*) addrs="" ;;
+    *) if [ "$R_COUNT" -le "$HARD_CAP" ]; then
+         addrs="$(expand_range "$lo" "$hi" | tr '\n' ',' | sed 's/,$//')"
+       else addrs=""; fi ;;
+  esac
+
+  cs_run_env_put \
+    "POOL_RANGE=$(cs_q "$POOL_RANGE")" \
+    "VIP_ADDRS=$(cs_q "$addrs")" \
+    "VIP_RANGE_CLAIM=$(cs_q "$CS_NS/$RANGE_NAME")" \
+    "VIP_RANGE_COUNT=$(cs_q "$R_COUNT")" \
+    "VIP_IPAM_POOL=$(cs_q "$IPAM_POOL")" \
+    "VIP_OWNER_VM=$(cs_q "$OWNER_VM")"
+
+  cs_ok "pool_range=$POOL_RANGE" "addrs=${addrs:--}" "claim=$CS_NS/$RANGE_NAME" \
+        "owner=$OWNER_VM" "pool=$IPAM_POOL" "count=$R_COUNT" \
+        "reused=$reused" "legacy=$legacy"
+}
+
+# Waits for the controller to record a block, and turns each terminal state into
+# its own verdict. The controller is single-pass — it does not requeue — so a
+# request that never leaves Pending will never leave it, which is why that case
+# is a report for the operator and not a retry.
+await_range() {
+  local i=0
+  R_PHASE=""; R_START=""; R_END=""; R_REASON=""; R_COUNT=""; R_POOLREF=""
+  while [ "$i" -lt "$WAIT_TRIES" ]; do
+    if read_range && [ -n "$R_PHASE" ] && [ "$R_PHASE" != "Pending" ]; then
+      break
+    fi
+    sleep "$WAIT_STEP"
+    i=$((i + 1))
+  done
+
+  [ "$R_PHASE" = "Bound" ] && [ -n "$R_START" ] && return 0
+
+  # The controller's own reasons first: each names a different remedy, which is
+  # exactly what the probe this replaced could not do.
+  case "$R_REASON" in
+    RangeFragmented) cs_fail E_VIP_RANGE_FRAGMENTED "pool=$IPAM_POOL" "count=$R_COUNT" \
+      "reason=$R_REASON" recover=stop-report:admin \
+      hint="$IPAM_POOL has free addresses but none $R_COUNT contiguous — a bound address sits between them; compact or widen the pool, retrying cannot help" ;;
+    RangeExhausted)  cs_fail E_VIP_RANGE_EXHAUSTED "pool=$IPAM_POOL" "count=$R_COUNT" \
+      "reason=$R_REASON" recover=stop-report:admin \
+      hint="$IPAM_POOL has too few free addresses left for a block of $R_COUNT; the band must be widened before more VIPs can be allocated" ;;
+    PoolNotFound)    cs_fail E_VIP_NO_POOL "pool=$IPAM_POOL" "reason=$R_REASON" recover=stop-report:admin \
+      hint="the request names IPPool $IPAM_POOL and the host cluster does not have it; pass --ipam-pool, or restore the pool" ;;
+    RangeInvalid)    cs_fail E_VIP_RANGE_INVALID "pool=$IPAM_POOL" "count=$R_COUNT" \
+      "reason=$R_REASON" recover=stop-report:admin \
+      hint="the ipam controller judged the request invalid — the pool's own range definition is inconsistent, or count exceeds what it can hold; fix the pool, not the request" ;;
+  esac
+  case "$R_PHASE" in
+    Failed) cs_fail E_VIP_RANGE_INVALID "claim=$CS_NS/$RANGE_NAME" "phase=Failed" \
+      "reason=${R_REASON:-unknown}" recover=stop-report:admin \
+      hint="the IPRangeRequest failed without a reason this step recognises; read its Ready condition on the host cluster" ;;
+    Bound)  cs_fail E_VIP_RANGE_INVALID "claim=$CS_NS/$RANGE_NAME" "phase=Bound" recover=stop-report:admin \
+      hint="the request reports Bound with no status.start, so no block can be read out of it; this is a controller or CRD fault on the host" ;;
+    *)      cs_fail E_VIP_RANGE_PENDING "claim=$CS_NS/$RANGE_NAME" "phase=${R_PHASE:-unknown}" \
+      "waited=$((WAIT_TRIES * WAIT_STEP))s" recover=stop-report:admin \
+      hint="the IPRangeRequest never reached Bound; the controller is single-pass, so nothing will retry — cubestack-ipam's controller is absent, older than chart 0.4.0, or cannot write status" ;;
+  esac
+}
+
+# --- is the recorded block still real? ---------------------------------------
+# The OBJECT is the ground truth, not the run.env line: a request deleted out
+# from under us — by a VM being re-created, by hand, or by a failed earlier
+# attempt — must be found out here, not assumed.
+#
+# Everything below branches on the request existing. Its absence is the only
+# state in which anything is ever created.
+if range_exists; then
+  # The presence check proved the object is there, so a failed read here is the
+  # API failing between two calls rather than an absent object — and the two need
+  # opposite responses. One retry, then report rather than treat it as absent,
+  # which is the one reading that would destroy the reservation.
+  read_range || read_range || cs_fail E_VIP_CLAIM "claim=$CS_NS/$RANGE_NAME" \
+    recover="rerun:$CS_SCRIPT" \
+    hint="the IPRangeRequest exists but its status could not be read from the host cluster; re-invoke this step"
+  R_POOLREF="${R_POOLREF:-$IPAM_POOL}"
+
+  # The live object wins over run.env, which may be stale or may have had its
+  # lines blanked by `preflight`. An explicit --count that disagrees is the same
+  # failure as the local check above, caught here for the case where run.env lost
+  # the record but the object did not.
+  if [ "$COUNT_GIVEN" -eq 1 ] && [ -n "$R_COUNT" ] && [ "$COUNT" != "$R_COUNT" ]; then
+    if [ "$DEPLOYED" -eq 1 ]; then
+      cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "live=$R_COUNT" \
+        recover=stop-report:user \
+        hint="spec.count is immutable and the live request is $R_COUNT addresses, not $COUNT; this run has already deployed, so its range cannot change at all — re-run without --count"
+    fi
+    cs_fail E_VIP_COUNT_IMMUTABLE "claim=$CS_NS/$RANGE_NAME" "count=$COUNT" "live=$R_COUNT" \
+      recover=stop-report:user \
+      hint="spec.count is immutable and the live request is $R_COUNT addresses, not $COUNT; re-run without --count, or --release and re-run with --count $COUNT to draw a fresh block"
+  fi
+
+  # Read back before anything else so the pool name comes from the object rather
+  # than from an auto-selection that could now disagree with it — a renamed pool
+  # must not turn a healthy reservation into a failure.
+  IPAM_POOL="$R_POOLREF"
+  settle_block 1 0
+fi
+
+# --- nothing live under this run's name --------------------------------------
+# From here down, this invocation is deciding whether to re-create a lost
+# reservation or to make a new one.
+#
+# The block is recorded but its object is gone. BEFORE the deploy that is simply
+# "reserve again" — nothing has consumed the range yet. AFTER it, a re-draw is
+# the one thing this design must never do quietly: `configure` has already baked
+# the range into cluster.conf, so the addresses would be handed back to the
+# host's free pool while MetalLB kept announcing them — precisely the in-band
+# collision the whole step exists to remove. A re-draw happens to return the same
+# block only when nothing else took the freed addresses in the meantime, and that
+# is coincidence, not a guarantee.
+if [ "$DEPLOYED" -eq 1 ]; then
+  if [ -n "$REC_RANGE_CLAIM" ]; then
+    # Named from POOL_RANGE and VIP_ADDRS both, because `preflight` owns
+    # POOL_RANGE and resets it to empty on every re-run — naming a blank range
+    # would make the hint useless.
+    WANT_RANGE="${POOL_RANGE:-${VIP_ADDRS:-unknown}}"
+    cs_fail E_VIP_CLAIMS_LOST "pool_range=$WANT_RANGE" "claim=$REC_RANGE_CLAIM" "missing=$CS_NS/$RANGE_NAME" \
+      recover=stop-report:user \
+      hint="the IPRangeRequest for $WANT_RANGE is gone, but cluster.conf already names that range — re-reserving would put MetalLB off-ledger; restore it or tear the box down"
+  fi
+fi
+
+# --- a reservation from an earlier build of this script ----------------------
+# Read-only, always. Those runs hold their block as individual IPRequests and
+# this step must not convert them: creating a range request while the old claims
+# are live would make the ledger hand back a DIFFERENT run of addresses, so
+# POOL_RANGE would flip and the block the deploy baked in would move. Reusing
+# them verbatim is also what keeps a `preflight` re-run recoverable — it blanks
+# POOL_RANGE, and re-running Step 1b is the documented way to restore it.
+if [ -n "$VIP_CLAIMS" ] && [ -n "$VIP_ADDRS" ]; then
+  LIVE_OK=1
+  i=1
+  for c in $(printf '%s' "$VIP_CLAIMS" | tr ',' ' '); do
+    want="$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | sed -n "${i}p")"
+    got="$(hget -n "${c%%/*}" get iprequest "${c##*/}" -o jsonpath='{.status.assignedIP}' 2>/dev/null)"
+    [ "$got" = "$want" ] || LIVE_OK=0
+    i=$((i + 1))
+  done
+
+  if [ "$LIVE_OK" -eq 1 ]; then
+    POOL_RANGE="$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | sed -n '1p')-$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | sed -n '$p')"
+    # Restore POOL_RANGE if preflight blanked it, so `configure` — which reads
+    # exactly this key — sees the reservation without this script having to be
+    # re-run for its side effect.
+    [ "$(cs_run_env_get POOL_RANGE)" = "$POOL_RANGE" ] \
+      || cs_run_env_put "POOL_RANGE=$(cs_q "$POOL_RANGE")"
+    # Recorded as-is, so the legacy keys keep describing the legacy claims.
+    cs_ok "pool_range=$POOL_RANGE" "addrs=$VIP_ADDRS" "claim=$VIP_CLAIMS" \
+          "owner=$OWNER_VM" "pool=${VIP_IPAM_POOL:-$(cs_run_env_get VIP_IPAM_POOL)}" \
+          "count=$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | grep -c .)" \
+          "reused=1" "legacy=1"
+  fi
+
+  if [ "$DEPLOYED" -eq 1 ]; then
+    WANT_RANGE="$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | sed -n '1p')-$(printf '%s' "$VIP_ADDRS" | tr ',' '\n' | sed -n '$p')"
+    MISSING=""
+    for c in $(printf '%s' "$VIP_CLAIMS" | tr ',' ' '); do
+      [ -n "$(hget -n "${c%%/*}" get iprequest "${c##*/}" -o jsonpath='{.status.assignedIP}' 2>/dev/null)" ] \
+        || MISSING="${MISSING}${MISSING:+,}${c}"
+    done
+    cs_fail E_VIP_CLAIMS_LOST "pool_range=$WANT_RANGE" "claims=$VIP_CLAIMS" "missing=${MISSING:-unknown}" \
+      recover=stop-report:user \
+      hint="claims for $WANT_RANGE are gone, but cluster.conf already names that range — re-reserving would put MetalLB off-ledger; restore them or tear the box down"
+  fi
+
+  # Nothing has consumed the block and the claims are gone, so the recorded
+  # legacy keys describe nothing. Clearing them lets the create below record the
+  # new form without leaving two conflicting reservations in run.env.
+  cs_run_env_put "VIP_CLAIMS="
+  VIP_CLAIMS=""
+fi
+
+# --- create -------------------------------------------------------------------
+# The pool is chosen now, and only now: every path above reads the pool out of
+# the request instead, so an auto-selection that has since gone ambiguous cannot
+# break a run that already holds a block.
+if [ -n "$IPAM_POOL" ]; then
+  :
+else
+  POOL_COUNT="$(hget get ippools.ipam.cubestack.io --no-headers \
+    -o custom-columns='N:.metadata.name' 2>/dev/null | names_only | wc -l | tr -d ' ')"
+  case "$POOL_COUNT" in
+    1) IPAM_POOL="$(hget get ippools.ipam.cubestack.io --no-headers \
+         -o custom-columns='N:.metadata.name' 2>/dev/null | names_only | head -1)" ;;
+    0) cs_fail E_VIP_NO_POOL recover=stop-report:admin \
+         hint="the host cluster has no IPPool to claim from; a VIP cannot be allocated before one exists" ;;
+    *) cs_fail E_VIP_NO_POOL "pools=$POOL_COUNT" recover=stop-report:user \
+         hint="the host cluster has $POOL_COUNT IPPools and none is named; pass --ipam-pool to say which one this subnet's VIPs come from" ;;
+  esac
+fi
+
+# The count, resolved last so that everything recorded outranks the default: an
+# explicit --count, else what a previous invocation recorded, else 2.
+[ "$COUNT_GIVEN" -eq 1 ] || COUNT="${REC_RANGE_COUNT:-2}"
+
+YAML="apiVersion: ipam.cubestack.io/v1alpha1
+kind: IPRangeRequest
+metadata:
+  name: $RANGE_NAME
+  namespace: $CS_NS
+  ownerReferences:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: $OWNER_VM
+    uid: $OWNER_UID
+    controller: false
+spec:
+  poolRef: $IPAM_POOL
+  count: $COUNT"
+
+OUT="$(printf '%s' "$YAML" | hget apply -f - 2>&1)"
+case "$OUT" in
+  *'configured'*|*'created'*|*'unchanged'*) ;;
+  *)
+    # A concurrent invocation for the same run can create it between our read and
+    # our write, in which case the create is not a failure at all. Re-read once
+    # before reporting anything: the object is the ground truth, and it may now
+    # hold exactly what we were about to ask for.
+    if range_exists && read_range && [ "${R_COUNT:-}" = "$COUNT" ]; then
+      IPAM_POOL="${R_POOLREF:-$IPAM_POOL}"
+      await_range
+      settle_block 1 0
+    fi
+    case "$OUT" in
+      *forbidden*|*Forbidden*)
+        cs_fail E_VIP_RANGE_DENIED "crd=iprangerequests.ipam.cubestack.io" "namespace=$CS_NS" recover=stop-report:admin \
+          hint="this kubeconfig cannot create iprangerequests in $CS_NS; the cubestack-ipam chart ships only a Viewer role for this kind, so a write role must be granted to whoever runs Step 1b" ;;
+    esac
+    cs_fail E_VIP_CLAIM "claim=$CS_NS/$RANGE_NAME" "pool=$IPAM_POOL" \
+      recover="rerun:$CS_SCRIPT" \
+      hint="the IPRangeRequest could not be created: $(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-90)"
+    ;;
+esac
+
+await_range
+
+# A legacy reservation must not survive alongside a new one: both would be live
+# in the same ledger, holding two blocks for one box. The request just created is
+# sticky, so releasing the old claims cannot move it.
+for n in $(list_legacy_claims); do
+  release_legacy_claim "$CS_NS/$n"
+done
+release_legacy_claim "$CS_NS/${RUN_ID}-vip-probe"
+cs_run_env_put "VIP_CLAIMS="
+
+settle_block 0 0

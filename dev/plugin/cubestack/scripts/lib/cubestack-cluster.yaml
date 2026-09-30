@@ -1,0 +1,112 @@
+# CubeStackCluster — the platform profile this skill installs.
+#
+# This is a REPO ARTIFACT, copied into the bootstrap pod and applied by
+# `operator-up` (Step 7). It is a file rather than a `--set` argument list for
+# the reason the whole step is a script: "which components are enabled is
+# hardcoded" is something a reader can audit here in ten seconds, and something
+# a reviewer can diff when the profile changes. `operator-wait` then polls this
+# object's status until Ready.
+#
+# The install order is the OPERATOR'S catalog order (each component's `order`
+# field), NOT the YAML order below — lws (10) and envoyGateway (20) come up
+# before cubestackControllerManager (30), which hard-depends on both.
+#
+# The five enabled:
+#   lws                          Leader Worker Set controller + its CRDs.
+#                                cubestack hard-depends on the LWS CRDs.
+#   envoyGateway                 Gateway API CRDs, the envoy-gateway control
+#                                plane, and the "gateway" GatewayClass.
+#   cubestackControllerManager   The platform workload operator.
+#   cubepilot                    The node/storage pilot.
+#   cubestackPortal              The web portal.
+#
+# aiGateway (the envoy AI Gateway controller + its CRDs, catalog order 21) is
+# the one component this profile disables, and it is the only one it COULD drop:
+# nothing depends on it. cubestackControllerManager hard-depends on lws and
+# envoyGateway, and aiGateway requires envoyGateway's data plane — but not the
+# reverse. Leaving it on buys the platform nothing it uses and costs an extra
+# controller, its CRDs and a chart pull on every bring-up.
+#
+# The entry is kept here, disabled, rather than deleted, so the profile reads as
+# a decision instead of an omission. `operator-up` still pre-creates
+# `ai-gateway-system` and stages the pull Secret into it, so turning it back on
+# is a one-line change and needs no other edit.
+#
+# A DISABLED COMPONENT DROPS OUT OF STATUS: the operator uninstalls whatever it
+# previously managed and reports only the enabled set. `operator-wait` derives
+# its total from the CR's status rather than a hardcoded count, so it polls five
+# here, not six — which is what makes this line safe to flip either way.
+#
+# `global` keeps the operator's own documented defaults — the same values its
+# sample CR and its image-preload test use — with ONE deliberate deviation:
+# imagePullPolicy, explained below. Nothing here is a per-run choice: the cluster
+# is expected to reach Harbor directly, so component images come from
+# `<imageRegistry>/<name>` and third-party images from the mirror prefix. That is
+# why this step changes no `images.manifest` and pushes nothing into the
+# in-cluster registry.
+#
+# imagePullSecrets names a Secret the OPERATOR reads on every reconcile, in its
+# OWN namespace. `operator-up` creates it there BEFORE the chart is installed;
+# with it absent the reconcile fails before touching any component, so the CR
+# never converges and reports nothing. See that script's Secret section.
+#
+# The same Secret is ALSO copied into every component namespace, for a different
+# consumer with a different rule: the kubelet reads imagePullSecrets only from
+# the pod's own namespace, so the operator-side copy does nothing for a pod in
+# lws-system. `operator-up` covers those namespaces too.
+#
+# imagePullPolicy: Always because the platform's own images are tagged :latest —
+# the CRD's own words, "where a node that cached the image would never re-pull
+# it". The default is IfNotPresent, which on a long-lived cluster silently pins
+# whatever build the node first saw. Third-party components keep their own
+# chart's policy either way; this reaches only the platform's own images.
+apiVersion: operator.cubestack.io/v1alpha1
+kind: CubeStackCluster
+metadata:
+  name: cubestack
+  namespace: cubestack-system
+spec:
+  global:
+    imageRegistry: harbor.isuanova.com/suanova
+    externalImageRegistryPrefix: harbor.isuanova.com/mirrors
+    imagePullSecrets:
+      - harbor-credentials
+    imagePullPolicy: Always
+  components:
+    lws:
+      enabled: true
+    envoyGateway:
+      enabled: true
+    aiGateway:
+      enabled: false
+    cubestackControllerManager:
+      enabled: true
+    cubepilot:
+      enabled: true
+    cubestackPortal:
+      enabled: true
+      # The portal's login credential. This is NOT optional decoration: the
+      # portal chart gates its htpasswd Secret on this value being non-empty
+      # (`templates/portal/htpasswd.yaml` opens with
+      # `{{- if .Values.secrets.htpasswd.content -}}`), so with no `content`
+      # the Secret is never created and the portal has no account to log in
+      # with. Enabling the component is not the same as giving it a credential.
+      #
+      # The value is one `user:bcrypt-hash` line — already hashed, not a
+      # password, and not base64. This particular hash is the operator chart's
+      # own published default for its bundled clusterCR (and the example in the
+      # portal chart's README), so it is a shared, publicly known credential:
+      # fine as a default that makes a fresh box loggable, wrong for anything
+      # reachable. Replace it per-site by overriding this same path — either
+      # edit this manifest's copy, or pass values over `spec.components
+      # .cubestackPortal.values`, which the operator deep-merges LAST (after
+      # catalog defaults and global injection) so an explicit override always
+      # wins. Generate a line with: htpasswd -nB <user>
+      values:
+        secrets:
+          htpasswd:
+            content: 'admin:$2a$10$9/nTwyvmfwMdwc.OSsoZFe9gTfGfoCVdKIcSwcQWb6Qll7TmygG26'
+  # retain (the default) is stated rather than omitted: deleting this CR must
+  # not take the platform down with it. `uninstall` removes the components;
+  # either way the operator keeps CRDs and PVCs.
+  deletePolicy: retain
