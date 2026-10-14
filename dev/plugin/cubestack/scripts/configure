@@ -413,6 +413,36 @@ METALLB_REQ=1
 case "$EXPOSE_MODE" in nodeport|nodePort) METALLB_REQ=0 ;; esac
 cs_run_env_set "METALLB_REQUESTED=$(cs_q $METALLB_REQ)"
 
+# Record the two device addons for verify to gate on, by the same rule as the
+# three above.
+#
+# These matter more than they look. Both addons can complete, print their ✅, and
+# deliver nothing a workload can use - the GPU operator via its CPU fast path
+# (which leaves metax-driver in CrashLoopBackOff) and the RDMA plugin via its
+# placeholder mode - and in both cases the deployed cluster looks healthy. verify
+# cannot infer the intent from the cluster, so the run's own record is the only
+# thing that tells "this box was built without GPUs" apart from "the driver
+# never came up".
+#
+# Absent defaults to ON, which is the installer's own default for both keys
+# (`${GPU_OPERATOR_ENABLED:-true}`, `${RDMA_ENABLED:-true}` in
+# cluster.conf.example) - so this can only ever remove a false failure, never
+# introduce a false pass, and an older run dir keeps today's behaviour.
+device_req() {  # $1 = values key -> 1 when enabled (absent or true), else 0
+  case " ${CS_VALUES_KEYS} " in
+    *" $1 "*) ;;
+    *) echo 1; return ;;
+  esac
+  case "$(sed -n "s/^$1='\([^']*\)'\$/\1/p" "$VALUES" | head -1)" in
+    true|TRUE|True|1|yes|YES|Yes|on|ON|On) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
+GPU_REQ="$(device_req GPU_OPERATOR_ENABLED)"
+RDMA_REQ="$(device_req RDMA_ENABLED)"
+cs_run_env_set "GPU_OPERATOR_REQUESTED=$(cs_q "$GPU_REQ")"
+cs_run_env_set "RDMA_REQUESTED=$(cs_q "$RDMA_REQ")"
+
 # A config change can invalidate the SSH password env-probe already proved.
 cs_stamp_clear env-ok
 cs_stamp_write conf-ok "$CONF_NAME"
@@ -422,4 +452,4 @@ cs_note "byte-gate: clean (no *** artifacts)"
 [ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
 cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
       "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ" "registry=$REGISTRY_REQ" \
-      "metallb=$METALLB_REQ"
+      "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ"
