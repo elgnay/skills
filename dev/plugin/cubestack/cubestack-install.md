@@ -17,7 +17,7 @@ it.
 | Term | What it is |
 |---|---|
 | **k8s box** | Steps 1–6 + `verify` (+ `mount-models` when the run asked for it): N VMs running a verified Kubernetes cluster with the enabled addons, and the Provider's `/models` mounted on every host if a guide was given. **No CubeStack platform.** |
-| **cubestack box** | That **k8s box**, plus the platform: `cubestack-operator` installed and a `CubeStackCluster` CR applied and Ready — Step 7's `operator-up` + `operator-wait`. |
+| **cubestack box** | That **k8s box**, plus the platform: `cubestack-operator` installed and a `CubeStackCluster` CR applied and Ready — Step 7's `operator-up` + `operator-wait`, which *installs* the platform or *adopts* one the deploy already installed (see Step 7). |
 
 > **`cubestack box = k8s box + cubestack-operator`**
 
@@ -182,7 +182,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
-| 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **five** components (`aiGateway` ships disabled). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
+| 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **five** components (`aiGateway` ships disabled), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
 | 12 | Harbor read-only robot credential | **required while #11 is on** — a file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Author it with `Write` **before running `preflight`**, like the two Provider files above, so `preflight` can lint it while the user is still in the room |
 
 Then resolve everything with one read-only call and confirm the printed plan:
@@ -204,10 +204,33 @@ rather than a silent k8s-box-only install. The two flags interact in one directi
 passing the credential with `--no-operator` turns the step back **on**, because the file
 is the thing the step cannot run without.
 
-`preflight` is read-only and idempotent: it resolves the subnet, NAD, free `cubestack<N>`
+> The requirement is `preflight`'s, and it is checked there. `operator-up` asks for the file
+> separately, and only on its **install** path — an ADOPT run (see Step 7) touches Harbor not
+> at all, so it is deliberately not gated on a credential it could never act on.
+
+`preflight` is idempotent: it resolves the subnet, NAD, free `cubestack<N>`
 index (across VMs **and** pools), and from that the **run id** (the run dir) and the
 **bootstrap pod name**, then prints a `CONFIRM` block. **Re-run it the instant the user
 changes an answer** — that is what replaces "re-resolve only what changed".
+
+It creates nothing, but it is not quite read-only: it owns one piece of **run-dir
+hygiene**, because the run id is the target's *name* and names get reused. Delete a box and
+install again and you resolve the same index, hence the same run dir — which still holds the
+dead box's retry counters (lifetime counters that **no** verb resets) and its attestation
+stamps. That inheritance is not cosmetic: a stale `verify-ok` attests a k8s box that no
+longer exists and is exactly the gate `operator-up` opens on, and a run that starts one
+invocation from a budget it never spent fails with `E_RETRY_BUDGET` → `stop-report`. So when
+the run dir carries stamps **and** the live box is newer than all of them — or the box is
+gone entirely — preflight clears the counters, the stamps and the deploy's leftovers, and
+says so on its own `cs_note` line. `run_state=reset|kept` in the verdict reports which
+happened, and the `CONFIRM` block marks a reset run dir.
+
+The test is identity, not existence, which is what keeps it safe: a genuinely **resumed**
+run always has stamps *newer* than its VMs (every stamp is written after Step 1), a pool
+**scale-up** leaves the oldest replica older than the stamps, and an unreadable cluster
+clears nothing at all — a host that cannot answer is not evidence of a rebuild, the same
+rule that keeps a host error from charging a retry. `run.env` is deliberately **not**
+cleared; its keys are merged precisely so a resumed run keeps them.
 
 Because the run id *is* the resolved target, re-resolving an answer that does not change
 the target (node count, shape, expose mode) keeps the same run dir and the same pod name;
@@ -451,6 +474,47 @@ gates `02_k8s/06_k8s_deploy.sh`. Left alone, a full deploy installs **no Kuberne
 `deployments/offline-files/` tree. Re-run `configure` *and* Step 5 (the offline fetch) after a
 recreate; an image-not-found error after a recreate usually means the fetch was skipped, not that
 the image is absent.
+
+#### The device addons — `GPU_OPERATOR` and `RDMA`, and what `verify` asserts
+
+**On a run that enabled them, `verify` asserts the hardware too**, reporting `gpu=` and `rdma=`.
+This is the one place a run that quietly has no devices can be told apart from one that has them:
+
+- `gpu=<n>` — the `metax-tech.com/gpu` the nodes advertise in total. **`gpu` absent is not a
+  failure**: with no `mx-smi` in the guest the GPU module takes a documented CPU fast path and the
+  installer still calls the module OK, so a GPU-less box is a legitimate green result. What *is*
+  raised (`E_VERIFY_GPU`) is a `metax-driver` pod that is not Running/Ready — the driver ships
+  prebuilt modules per kernel, so a driver pod that will not come up is the real signature of a
+  guest whose kernel it has no module for.
+- `rdma=<n>` — the `rdma/*` resources the nodes register, read from the plugin's
+  `kube-system/rdma-devices` ConfigMap.
+- `rdma=placeholder` — **the one to read carefully.** The plugin ships
+  `RDMA_HCA_MODE='by-link'` with `RDMA_PLACEHOLDER_HCAS` by default, so an HCA-less VM comes up
+  with a ConfigMap annotated `cubestack.io/rdma-placeholder: "true"` and registers **no resource
+  at all**: the module succeeds and the cluster advertises an RDMA capability nothing can use.
+  `verify` reports it and does not fail it, because it is configured behaviour rather than a
+  fault — but it is the honest answer to "did RDMA actually land", and it is **not** a device.
+
+Both keys are gated on what the run *asked for* — `GPU_OPERATOR_REQUESTED` / `RDMA_REQUESTED`,
+written by `configure` — and the two differ in what an **absent** key means, because only one of
+them can fail on absence:
+
+- **GPU absent is read as ON, and costs nothing** — `gpu=0` is not a failure, so the worst an
+  over-eager gate does is report a number. A run dir older than the key looks around, finds nothing
+  wrong, and passes, which is the right answer for a box built without GPUs.
+- **RDMA absent means unknown, so the assertion is skipped — with a note, never silently.** A
+  missing `rdma-devices` ConfigMap is a hard `E_VERIFY_RDMA`, so assuming ON would fail a finished
+  box that deliberately runs without RDMA; worse, `recover=rerun:verify` would then loop until the
+  lifetime budget was exhausted and report `E_RETRY_BUDGET` for a box that is fine. This is exactly
+  what re-running `verify` on a box built before these keys existed does, so it says the intent was
+  not recorded and moves on. Re-run `configure` against the live values file to record it and get
+  the assertion back.
+
+That divergence from the stricter-when-absent convention `METALLB_REQUESTED` follows is deliberate,
+and the reason is narrow: metallb and the registry are on in the shipped profile, so "assume ON" is
+usually *true* there, while RDMA is the key whose absence turns into a false failure. `configure`
+records both on every new run, so the assertions still run wherever the intent is knowable — what
+they stop doing is guessing.
 
 #### MetalLB / the expose mode — the default, and required
 
@@ -1103,6 +1167,11 @@ that every `LoadBalancer` Service with an `EXTERNAL-IP` sits inside it, reportin
 Step 1b and the installer applied it during the deploy, so no Service is patched and no pool is
 replaced after the fact.
 
+**When the run enabled the device addons it asserts those too** — `gpu=` / `rdma=` in the verdict,
+where `rdma=placeholder` means the RDMA plugin came up without registering anything. The rules are
+under *The device addons* above; the short version is that a missing GPU is reported, an unhealthy
+`metax-driver` pod fails, and placeholder RDMA is reported rather than failed.
+
 **Only if Step 0 was given `--cephfs-mount-guide`** — mount `/models` on every node, *here*,
 after the k8s box is proven and before the pod goes away:
 
@@ -1125,7 +1194,34 @@ only host that can reach it.
 
 ```bash
 "$S/operator-up" --run <run-id>          # chart + Secret + CR + operator roll; ~30 s
+                                         # (adopts an existing deploy-installed platform instead)
 ```
+
+> **`operator-up` ADOPTS a platform the deploy already installed.** The installer now has its
+> own `cubestack_operator` module, which installs this same chart under this same release name
+> with the chart's optional `clusterCR` path **enabled** — so its release manifest carries a
+> `CubeStackCluster` of its own, with a wider profile (nine components, `deletePolicy:
+> uninstall`, images from the in-cluster registry). On such a box an unconditional
+> `helm upgrade --set clusterCR.enabled=false` is not an install: dropping the CR from the
+> manifest makes helm **prune** it, the operator honours `deletePolicy: uninstall`, and the
+> whole platform is torn down before `operator-up` re-applies its own CR. Measured on
+> `cubestack4` (2026-10-12): the platform went down 36 s after `operator-up`, and the run
+> still ended green.
+>
+> So the run-time state decides, never a flag. If the release already present **manages** a
+> `CubeStackCluster` and that CR is live, `operator-up` adopts it: no chart pull, no Secret,
+> no CR apply, no Harbor credential — just the roll — and it reports `adopted=1 applied=0`.
+> The box then keeps **the profile the deploy installed**, and `operator-wait` polls whatever
+> that CR's status reports rather than a hardcoded five. The skill's own five-component
+> manifest is applied only where the deploy installed no platform at all — the
+> pre-2026-10-12 shape, which is what `cubestack7` is.
+>
+> The detection is deliberately narrow: it consults only whether the release's current
+> manifest contains a `CubeStackCluster`, because that names the one dangerous state. A
+> release that manages no CR can be upgraded freely — there is nothing for helm to prune. Two
+> answers fail the run instead of guessing, because reading either as "safe to upgrade" is
+> the misreading that prunes a live platform: a manifest that could not be read, and a probe
+> that never ran.
 
 `operator-up` also **rolls the operator Deployment** onto whatever image the chart's rolling
 tag resolves to, and reports the digest as `image=sha256:…`. That is what makes re-invoking it
@@ -1137,10 +1233,10 @@ chart would leave the old binary running and the same Degraded state behind it.
 "$S/operator-wait" --run <run-id>        # run_in_background: true
 ```
 
-> **`operator-wait` MUST be a background task.** A five-component bring-up installs dozens of
-> objects and pulls five OCI charts, on the operator's own 30 s requeue — minutes, not seconds,
-> and past the 600 s foreground ceiling. The harness re-invokes you when it exits — that *is*
-> the no-polling behaviour. Do not poll, and do not re-run it in a loop.
+> **`operator-wait` MUST be a background task.** A component bring-up installs dozens of
+> objects and pulls one OCI chart per component, on the operator's own 30 s requeue — minutes,
+> not seconds, and past the 600 s foreground ceiling. The harness re-invokes you when it exits
+> — that *is* the no-polling behaviour. Do not poll, and do not re-run it in a loop.
 >
 > If background tasks are unavailable, the fallback is **not** a model loop: use
 > `--chunk 540`, which returns `RESULT: OK running=1` for a bounded number of re-invocations.
@@ -1277,6 +1373,22 @@ two-address pool. Nothing is patched and nothing is claimed here.
 ```
 
 Deletes the bootstrap pod; the k8s box lives on the VMs and is unaffected.
+
+**It rescues the deployed cluster's kubeconfig first.** `admin.conf` exists only inside the pod, so
+it is copied into the run dir and named in the verdict as `kubeconfig=`. It is written **mode 600**
+because it is a credential, not a convenience file — it carries a client certificate *and* its
+private key, and that principal is cluster-admin — and it is only kept once it validates as a
+kubeconfig, so a failed exec cannot leave kubectl's error text sitting there looking like one. The
+deploy log is deliberately **not** rescued: it is unbounded, and its ansible output can echo
+credentials.
+
+⚠ **A rescued `admin.conf` is not the same as access.** It names the cluster's API address, which is
+on the box's underlay — and this host has no route to that subnet, so `kubectl --kubeconfig <that
+file>` from here times out rather than working. The pod *was* the path to the box; reaching it again
+needs a route through the KubeVirt cluster. Treat the rescued file as what makes the cluster
+recoverable and as the record of how it was configured, not as a working kubeconfig on this machine.
+Nothing else survives the delete — without the rescue the cluster is unreachable for good, which is
+why it happens before the delete rather than after.
 
 > **`pod-down` now gates on `operator-ok` too, on a cubestack-box run.** The pod
 > is the only host that can reach the k8s box, so deleting it before the operator

@@ -35,7 +35,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Run identity** | A run is scoped to what it installs (`--run cubestack<N>`): its own run dir, stamps, retry counters, **and its own bootstrap pod name**. Two installs can therefore run at the same time without applying to, reusing, or deleting each other's pod |
 | **Storage** | **External Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Required by the minimal profile, where it is the in-cluster registry's backend; the Provider exports an `external-ceph.env` and `preflight --external-ceph-env` takes it. Independent of the model store below |
 | **Model store** | Optional **host-level CephFS mount** — the Provider's `/models` mounted read-only at `/models` on every node host, from the Provider's own mount guide. Opt-in, and independent of the CSI import |
-| **Deliverable** | **cubestack box** by default — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`lws`, `envoyGateway`, `cubestackControllerManager`, `cubepilot`, `cubestackPortal`; `aiGateway` ships `enabled: false`). `--no-operator` builds **only a k8s box**, which ends at `verify` |
+| **Deliverable** | **cubestack box** by default — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`lws`, `envoyGateway`, `cubestackControllerManager`, `cubepilot`, `cubestackPortal`; `aiGateway` ships `enabled: false`) — *or adopts the platform the deploy already installed, if it installed one*. `--no-operator` builds **only a k8s box**, which ends at `verify` |
 
 ---
 
@@ -51,7 +51,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Step 4** | Generate and byte-verify `cluster.conf` | `configure` |
 | **Step 5** | Fetch the offline package set from MinIO (tens of GiB; the script's own floor decides) | `fetch-offline` |
 | **Step 6** | Deploy — kubespray plus the enabled addon modules, then wait | `deploy` + `deploy-wait` |
-| **Step 7** | Verify the k8s box, *(opt-in: mount the Provider's `/models` on every node)*, *(default on: turn it into a cubestack box — `cubestack-operator` + `CubeStackCluster` CR)*, then auto-delete the installer pod | `verify` + `mount-models` + `operator-up` + `operator-wait` + `pod-down` |
+| **Step 7** | Verify the k8s box, *(opt-in: mount the Provider's `/models` on every node)*, *(default on: turn it into a cubestack box — `cubestack-operator` + `CubeStackCluster` CR)*, then rescue the cluster's kubeconfig and auto-delete the installer pod | `verify` + `mount-models` + `operator-up` + `operator-wait` + `pod-down` |
 
 Steps 1 and 2 are independent (the pod only needs the target **subnet label**, not the VMs), so they run concurrently and join at Step 3. `diagnose <CODE>` produces a bounded excerpt when something fails.
 
@@ -75,6 +75,8 @@ Two installs started at the same time resolve different indices, so they get dif
 Reuse still works, and still skips the fetch — *within* a run, where the name is stable, a re-invocation finds its own pod (`reused=1 fetch=present`) and takes it as-is. To point a run at a pod it did not name, pass `--pod <name>` explicitly; the name is then recorded in `run.env` so later steps follow it.
 
 Omitting `--run` is a **loud failure**, not a fallback: the run dir is not guessed and another run's state is never adopted.
+
+**The id is the target's name, so it comes back.** The normal way to rebuild a box is to delete it and install again, which resolves the same index — and the run dir is still there holding the dead box's state. That is why `preflight` owns one piece of run-dir hygiene: when the run dir carries stamps and the live box is newer than all of them (or gone), it clears the retry counters, the stamps and the deploy's leftovers first. The counters are the sharp edge, because they are **lifetime** counters no verb resets — a new run that starts one invocation from a budget it never spent fails `E_RETRY_BUDGET` → `stop-report`, naming the wrong problem. A stale `verify-ok` fails the other way: silently, by attesting a k8s box that no longer exists and opening `operator-up`'s gate. The test is identity rather than existence, so a resumed run (stamps newer than its VMs), a pool scale-up (oldest replica unchanged) and an unreadable cluster all keep their state; `run_state=reset|kept` in the verdict says which happened.
 
 ---
 
@@ -104,7 +106,8 @@ The cubestack-box step (the platform operator) **postdates all three runs**, so 
 either — and no
 five-component bring-up has been timed. What is structural: `operator-up` returns in ~30 s (a
 helm install, an apply, and a Deployment roll), and the time is the operator's own 30 s requeue
-driving five components to `Ready`, which is why `operator-wait` carries its own 1800 s budget. Treat the
+driving the profile's components to `Ready` — five for this skill's own manifest, nine on a box
+where it adopted the deploy's — which is why `operator-wait` carries its own 1800 s budget. Treat the
 first run as a first-run experiment on capacity too: five components plus the operator on a
 single-node 8 vCPU / 24 GiB VM alongside Rook/Ceph was the tightest shape this skill builds.
 **That default has since been raised** — a 1-node box now provisions 24 vCPU / 64 GiB / 200 GiB
@@ -255,6 +258,15 @@ Then, in Step 7 — after `verify`, alongside `mount-models`, before `pod-down`:
 "$S/operator-wait" --run <run-id>        # run_in_background: true
 ```
 
+`operator-up` **adopts** a platform the deploy already installed rather than installing over
+it. The installer's own `cubestack_operator` module installs the same chart under the same
+release name *with* a `CubeStackCluster` in it, so an unconditional `helm upgrade` would prune
+that CR — and its `deletePolicy: uninstall` would take the whole platform down with it. When
+the release already present manages a CR, `operator-up` skips the chart, the Secret and the CR
+apply, rolls the operator, and reports `adopted=1 applied=0`; the box keeps the profile the
+deploy installed, and no Harbor credential is needed on that path. The detection's exact rule
+is in Step 7 of [`cubestack-install.md`](cubestack-install.md).
+
 On a **metallb** run (the default) there is nothing more to do here. The VIP block was reserved back
 at **Step 1b**, before the deploy — a contiguous block of addresses reserved from the **host** KubeVirt
 cluster's cubestack-ipam as a single `IPRangeRequest` (owned by the box's master node's VM, so
@@ -304,7 +316,8 @@ explicit override always wins. Generate a line with `htpasswd -nB <user>`.
 Install **order** is not in the manifest — each component's `order` comes from the operator's
 own catalog, and the operator reconciles on a 30 s requeue. A disabled component **drops out of
 the CR's status** entirely, which is why `operator-wait` derives its total from the status rather
-than from a count here: it polls five.
+than from a count here: it polls whatever the CR reports, which is five for this skill's own
+manifest and nine on a box where it adopted the deploy's.
 
 **One credential, two jobs.** The robot account pulls the operator chart from
 `harbor.isuanova.com/suanova-private` *and* the component images from `suanova`. Probed
@@ -460,7 +473,7 @@ else is a cubestack box.
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
 | External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the path to the Provider's exported `external-ceph.env` (the hand-filled mon + keyring route still works but is no longer the recommended one) |
 | Model store on the nodes | **Disabled** (opt-in) — when enabled, supply the path to the Provider's CephFS Linux-host mount guide; Step 7 then mounts its `/models` read-only at `/models` on every node host |
-| Which box | **cubestack box** — Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`aiGateway` ships disabled). `--no-operator` builds **only a k8s box**, which ends at `verify` |
+| Which box | **cubestack box** — Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`aiGateway` ships disabled), or adopts the platform the deploy installed if it installed one. `--no-operator` builds **only a k8s box**, which ends at `verify` |
 | Harbor robot credential | **Required while the operator is on** — the `Write`-authored file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Write it **before** the `preflight` call, so `preflight` lints it while you are still there |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
