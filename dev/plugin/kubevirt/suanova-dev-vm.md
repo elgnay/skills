@@ -494,7 +494,10 @@ ibv_devinfo | grep -E 'hca_id|link_layer|state'      # link_layer: Ethernet, sta
 > **The RoCE address is not the underlay.** `10.57.128.0/24` is a separate L2 fabric with no pool and no IPAM,
 > so it is the one place a static in-guest address is correct and does **not** breach Hard rule 4. The underlay
 > still comes from the pool on DHCP; only the RoCE NIC is set by hand — and it is a per-VM choice, so take the
-> next free address in the established sequence (the existing RoCE VMs used `.11`–`.13`; `.21` and `.22` are taken).
+> next free address in the established sequence. **Live as of 2026-10-14:** `.29` `cubestack10-1`, `.30`
+> `cubestack10-2`, `.32` `vm-roce-1`, `.33` `vm-roce-2` → next free is `.34`. Check before you take one — a
+> deleted VM leaves its cloud-init Secret behind, so a bare `grep` over the Secrets finds addresses that are
+> free again (`cubestack1-cloudinit` still holds `.31` with no such VM alive).
 
 > **Do not use the `ib-vf-network` NAD.** It hands out an **InfiniBand** VF (`mellanox.com/mlx5_ib_vf`), and IB
 > VFs are a dead end for a guest — the fabric's subnet manager does not issue LIDs to VF GUIDs, so the port
@@ -537,6 +540,185 @@ event. It populates on its own — re-read it before debugging.
 > And after the reboot the node briefly advertises **no** device resources at all (`roce_vf` absent, even
 > `mlx5_ib_vf` reading `0`) until `sriov-device-plugin` restarts and re-registers; give it a minute before
 > concluding the policy broke something. The expected end state is `roce_vf: 8` **and** `mlx5_ib_vf: 16`.
+
+#### Complete worked example — `vm-roce-2` (verified end to end 2026-10-14)
+
+**Copy this pair for any new RoCE VM.** It is the smallest manifest that carries all three at once — pool-claim
+underlay, RoCE VF passthrough, and one GPU — and every claim below was read back off the live cluster, not
+inferred. For a RoCE-only VM, drop the two `hostDevices` lines and the `metax-tech.com/vfio-gpu` request; it then
+schedules to any of the three nodes instead of being pinned to `10-66-3-43`.
+
+**The five per-VM edits** (everything else is boilerplate):
+
+| # | Field | `vm-roce-2` value |
+|---|---|---|
+| 1 | `metadata.name` | `vm-roce-2` |
+| 2 | root-disk name — **both** `dataVolumeTemplates[].metadata.name` and `volumes[].dataVolume.name` | `vm-roce-2-rootdisk` |
+| 3 | `networks[underlay].multus.networkName` | `default/vm-roce-2-static` (minted; do not create it) |
+| 4 | the two cloud-init refs (`secretRef`, `networkDataSecretRef`) **and** the Secret's own name | `vm-roce-2-cloudinit` |
+| 5 | the RoCE address — **three** places in the cloud-init: the `IP="${1:-…}"` default, the `runcmd` argument, and `networkData` | `10.57.128.33` |
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: vm-roce-2
+  namespace: default
+  labels:
+    owner: elgnay
+  annotations:
+    ipam.cubestack.io/pool: dev-ip-pool      # REQUIRED — presence alone triggers the claim
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+  - metadata:
+      name: vm-roce-2-rootdisk
+    spec:
+      source:
+        pvc:
+          # Kernel 5.15.0-130 — the one metax driver-manager 0.15.3 has a prebuilt
+          # module for. Irrelevant without a GPU, but keep it if the VM may get one.
+          name: ubuntu-22.04-server-cloudimg-5.15.0-130-amd64.img
+          namespace: default
+      storage:
+        accessModes: [ReadWriteMany]         # RWX + Block is the migration prerequisite
+        storageClassName: ceph-rbd-kubevirt
+        volumeMode: Block
+        resources:
+          requests:
+            storage: 30Gi
+  template:
+    spec:
+      # No nodeSelector: the vfio-gpu request pins this to 10-66-3-43 by itself,
+      # and that node carries roce_vf too. A RoCE-only VM needs no pin at all.
+      domain:
+        cpu: { cores: 8 }
+        resources:
+          requests:
+            memory: 24Gi                     # REQUIRED — the webhook rejects a VMI with no memory
+        devices:
+          hostDevices:
+          - deviceName: metax-tech.com/vfio-gpu
+            name: gpu1                       # one entry per GPU, unique name within the VM
+          disks:
+          - disk: { bus: virtio }
+            name: rootdisk
+          - disk: { bus: virtio }
+            name: cloudinitdisk
+          interfaces:
+          - name: underlay
+            bridge: {}
+          - name: roce
+            sriov: {}                        # passthrough — not a bridge
+      networks:
+      - name: underlay
+        multus:
+          networkName: default/vm-roce-2-static   # MUST match what the pool mints
+      - name: roce
+        multus:
+          networkName: default/vm-roce-network    # the ONE shared NAD — never per-VM
+      volumes:
+      - name: rootdisk
+        dataVolume: { name: vm-roce-2-rootdisk }
+      - name: cloudinitdisk
+        cloudInitNoCloud:                    # Secret, not inline: userData caps at 2048 bytes
+          secretRef:
+            name: vm-roce-2-cloudinit        # keys must be exactly userdata / networkdata
+          networkDataSecretRef:
+            name: vm-roce-2-cloudinit
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vm-roce-2-cloudinit
+  namespace: default
+type: Opaque
+stringData:
+  userdata: |
+    #cloud-config
+    users:
+    - name: ubuntu
+      sudo: ALL=(ALL) NOPASSWD:ALL
+      shell: /bin/bash
+      lock_passwd: true
+      ssh_authorized_keys:
+      - ssh-ed25519 AAAA...  # copy from ~/.ssh/id_ed25519.pub — never retype it (§4)
+    package_update: true
+    packages: [rdma-core, ibverbs-utils, perftest]
+    write_files:
+    - path: /usr/local/bin/roce-up.sh
+      permissions: '0755'
+      content: |
+        #!/bin/bash
+        set -u
+        IP="${1:-10.57.128.33}"
+        log() { echo "[roce-up] $*"; }
+        # mlx5_ib lives in linux-modules-extra, NOT linux-modules, and is absent from
+        # the cloud image. Without it there is no verbs device, however healthy the NIC looks.
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          "linux-modules-extra-$(uname -r)" || log "WARN: modules-extra install failed"
+        depmod -a
+        modprobe mlx5_ib && log "mlx5_ib loaded" || log "WARN: modprobe failed"
+        # Find the VF by DRIVER, never by name.
+        VF=""
+        for _ in $(seq 1 40); do
+          for p in /sys/class/net/*; do
+            n=$(basename "$p")
+            d=$(basename "$(readlink -f "/sys/class/net/$n/device/driver" 2>/dev/null)" 2>/dev/null)
+            if [ "$d" = "mlx5_core" ]; then VF="$n"; break; fi
+          done
+          [ -n "$VF" ] && break
+          sleep 3
+        done
+        [ -z "$VF" ] && { log "ERROR: no mlx5_core netdev — passthrough did not land"; exit 1; }
+        ip link set "$VF" mtu 1500 && ip link set "$VF" up
+        ip -4 addr show dev "$VF" | grep -q "${IP}/" || ip addr add "${IP}/24" dev "$VF"
+        ip -br addr show "$VF"
+        lspci -nn | grep -i 9999 || log "  (no MetaX GPU on PCI)"
+        ibv_devinfo 2>/dev/null | grep -E 'hca_id|link_layer|state' || true
+    runcmd:
+    - [ bash, -c, '/usr/local/bin/roce-up.sh 10.57.128.33 2>&1 | tee /var/log/roce-up.log' ]
+  networkdata: |
+    version: 2
+    ethernets:
+      underlay:
+        match: { driver: virtio_net }     # the pool-minted bridge NIC — stays on DHCP
+        dhcp4: true
+        nameservers:
+          addresses: [223.5.5.5, 8.8.8.8]  # REQUIRED here — the NAD's DNS never reaches the guest
+      roce:
+        match: { driver: mlx5_core }       # the passthrough VF — matched by driver, never by name
+        dhcp4: false
+        accept-ra: false
+        addresses: [10.57.128.33/24]
+        mtu: 1500
+```
+
+**Verified on the live cluster** (all read back, none assumed):
+
+| What | Value |
+|---|---|
+| pool claim | `vm-roce-2-ip` → `10.66.3.212`, `Bound` |
+| VMI | `Running`, `Ready`, node `10-66-3-43`, `LIVE-MIGRATABLE: False` |
+| guest underlay | `enp1s0` `10.66.3.212/24` |
+| guest RoCE VF | `enp9s0` `10.57.128.33/24`, `rocep9s0`, `PORT_ACTIVE`, `link_layer: Ethernet` |
+| RoCEv2 GID | `/sys/class/infiniband/rocep9s0/ports/1/gids/3` → `::ffff:10.57.128.33` |
+| GPU | `08:00.0 Display controller [0380]: Device [9999:4000]` — on PCI, **no driver** (§2b) |
+
+Two gotchas this run pinned down, both of which cost a round when done by guessing:
+
+- **The VF's guest name tracks the GPU count, and the rule holds.** `vm-roce-1` (no GPU) → `enp8s0`;
+  `vm-roce-2` (1 GPU) → `enp9s0`. Exactly `enp(8+N)s0`. This is why every `match` above is by **driver** —
+  a hardcoded name breaks the moment the GPU count changes.
+- **`kubectl get vmi`'s IP column is blank until the VMI reaches `Running`**, not because of the RoCE NIC.
+  Measured: `ip=''` at 5 s and 10 s, populated at 15 s. A first start is slower still — the pool mints the NAD
+  *after* the VM, so the pod waits in `FailedCreatePodSandBox`. **Adding the RoCE interface to an existing VM
+  restarts the VMI**, which reopens that window; read `kubectl get iprequests.ipam.cubestack.io` if you are
+  checking early. The RoCE interface itself never shows an IP there — `sriov` is passthrough and only a guest
+  agent could see inside, and no golden image runs one.
 
 ### 3. Lifecycle
 
