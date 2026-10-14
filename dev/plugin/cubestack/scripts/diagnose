@@ -125,6 +125,34 @@ diag_pattern() {
       echo 'sshpass|apt|dpkg|install|package|\.deb' ;;
     E_INTERRUPTED|E_NO_VERDICT)
       echo 'RESULT:|Interrupt|signal|SIGINT|SIGTERM|Killed|terminated' ;;
+    # The GPU module's own words for both halves of the failure: the CPU fast
+    # path it announces, and the kernel it cannot find a module for. `mx-smi` is
+    # in the pattern because its absence is what triggers the fast path at all.
+    E_VERIFY_GPU)
+      echo 'metax|mx-smi|kernel_module|CrashLoop|GPU|沐曦|driver' ;;
+    # Same for the RDMA plugin: the placeholder notice, and the HCA it did not
+    # find. `rdma-devices` is the ConfigMap the module creates.
+    E_VERIFY_RDMA)
+      echo 'rdma|RDMA|roce|RoCE|hca_shared|placeholder|占位|mlx5|rdma-devices' ;;
+    # E_VERIFY_NODES has five raise sites that share one code and do not share
+    # evidence: the missing admin.conf (the deploy never got that far), an API the
+    # pod cannot reach, nodes=0, a NotReady re-pass, and a count that disagrees
+    # with the resolved plan. The pattern has to span all five, so it carries both
+    # the kubeconfig words and the node-state words rather than picking one.
+    E_VERIFY_NODES)
+      echo 'admin\.conf|kubeconfig|NotReady|unreachable|refused|Unable to connect|nodes=|no nodes' ;;
+    E_VERIFY_NAMESPACE)
+      echo 'namespace|Namespace|kube-system|absent|NotFound' ;;
+    # Both raise sites are about a component's Service/pool, not about a broken
+    # Service: the registry Service missing, the MetalLB namespace empty of a
+    # pool, a pool that is not the reserved block, and a Service whose address
+    # fell outside it.
+    E_VERIFY_SERVICE)
+      echo 'registry|metallb|MetalLB|IPAddressPool|pool_want|pool_got|pending|LoadBalancer|svc=|vip=' ;;
+    # Raised by the Ceph half of verify but evidenced by the deploy that should
+    # have imported the classes, which is why it is POD_FIRST like E_CEPH_*.
+    E_CEPH_SC_MISSING)
+      echo 'StorageClass|storageclass|ceph_rbd|cephfs|CEPH_CSI|provisioner|ceph-rbd' ;;
     E_VIP_*)
       echo 'IPRange|iprange|iprr|IPPool|pool|Bound|Pending|RangeExhausted|RangeFragmented|RangeInvalid|forbidden|owner|VirtualMachine' ;;
     *) echo '' ;;
@@ -173,7 +201,9 @@ diag_known_code() {
     E_DEPLOY_EXITED_NONZERO|E_DEPLOY_KUBESPRAY_SSH|E_DEPLOY_NO_RECAP|E_DEPLOY_PRECOND_CONF| \
     E_DEPLOY_PRECOND_FETCH|E_DEPLOY_PRECOND_SSHPASS|E_DEPLOY_PRECOND_ENV| \
     E_DEPLOY_ALREADY_RUNNING|E_DEPLOY_STILL_RUNNING|E_VERIFY_CEPH_PROFILE| \
-    E_VERIFY_CEPH_PVC_PENDING|E_CEPH_CONNECTING|E_RETRY_BUDGET|E_LOCK_HELD| \
+    E_VERIFY_CEPH_PVC_PENDING|E_VERIFY_GPU|E_VERIFY_RDMA|E_VERIFY_NODES| \
+    E_VERIFY_NAMESPACE|E_VERIFY_SERVICE|E_CEPH_SC_MISSING| \
+    E_CEPH_CONNECTING|E_RETRY_BUDGET|E_LOCK_HELD| \
     E_CONF_VALUES_MISSING|E_CONF_REDACTED|E_USAGE|E_INTERNAL| \
     E_OPERATOR_PRECOND_VERIFY|E_OPERATOR_PRECOND_CLUSTER|E_OPERATOR_PRECOND_HELM| \
     E_OPERATOR_HARBOR_AUTH|E_OPERATOR_HARBOR_DENIED|E_OPERATOR_HARBOR_LOGIN| \

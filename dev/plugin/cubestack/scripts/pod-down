@@ -3,9 +3,9 @@
 #
 # The pod is deploy tooling only: once the cluster is verified the pod has no
 # ongoing role, and leaving it running wastes a node's ~483MB image plus the
-# pod's resources. But until the cluster IS verified the pod is the only place
-# the deploy log and admin.conf exist — deleting it early destroys the evidence
-# needed to diagnose and recover.
+# pod's resources. But until the cluster IS verified the pod is where the deploy
+# log lives, and it holds the only copy of admin.conf — deleting it early destroys
+# the evidence needed to diagnose and recover.
 #
 # That rule is mechanical here rather than prose: without a verify-ok stamp in
 # the run dir this refuses (E_POD_DELETE_UNSAFE), and --force is the deliberate
@@ -14,6 +14,10 @@
 # cluster, so deleting it early ends the run's ability to retry the operator
 # install at all. The delete is idempotent — "already gone" is a success, not an
 # error.
+#
+# admin.conf is rescued into the run dir (mode 600 — it holds a cluster-admin
+# key) before the pod goes, and named in the verdict as `kubeconfig=`. The deploy
+# log is not: it is unbounded and can echo credentials.
 #
 # The pod's /tmp/cubestack-values.conf holds live credentials, so it is shredded
 # before the pod goes away.
@@ -93,9 +97,72 @@ fi
 # The local copy of the values file is a credential; it goes away either way.
 rm -f "$(cs_run_dir)/values.conf" 2>/dev/null || true
 
+# Where the cluster's kubeconfig is rescued to (see the section below). Initialised
+# here so the already-gone path can report it too.
+KCONF_DEST="$(cs_run_dir)/admin.conf"
+KCONF_REPORT=""
+
 if ! kubectl -n "$CS_NS" get pod "$TARGET" >/dev/null 2>&1; then
   cs_note "pod $TARGET is already gone"
-  cs_ok "pod=$TARGET" "deleted=0" "already=1"
+  # Nothing to rescue from - but say whether a kubeconfig survives, because "the
+  # pod is gone and so is the cluster's only handle" is the outcome worth
+  # knowing, and it is otherwise indistinguishable from a clean re-run.
+  if [ -f "$KCONF_DEST" ]; then
+    KCONF_REPORT="$KCONF_DEST"
+  else
+    cs_note "no rescued kubeconfig at $KCONF_DEST; the deployed cluster is no longer reachable from this host"
+  fi
+  set -- "pod=$TARGET" "deleted=0" "already=1"
+  [ -n "$KCONF_REPORT" ] && set -- "$@" "kubeconfig=$KCONF_REPORT"
+  cs_ok "$@"
+fi
+
+# --- rescue the deployed cluster's kubeconfig ---------------------------------
+# admin.conf is the only handle that exists on the cluster this run built, and it
+# lives only in this pod. Deleting the pod destroys the cluster's reachability for
+# good: nothing else on this host can talk to the box, and no later step can be
+# retried against it. So it is copied into the run dir first.
+#
+# It is a CREDENTIAL, not a convenience file - it carries a client certificate and
+# its private key, and that principal is cluster-admin. Two consequences, both
+# deliberate:
+#   * it is created 600 by running the capture under a `umask`, not created
+#     world-readable and chmod-ed afterwards, which would leave the key readable
+#     for the life of the copy;
+#   * it is only kept once it validates as a kubeconfig. A failed exec must not
+#     leave behind a file that is really kubectl's error text but passes for a
+#     kubeconfig by existing.
+#
+# cs_pod_exec_out (not cs_pod_exec) is load-bearing here: cs_pod_exec folds stderr
+# into stdout, so any kubectl complaint would be written INTO the kubeconfig.
+#
+# The deploy log is deliberately NOT rescued: it is unbounded, and its ansible
+# output can echo credentials. The pod's own copy is shredded below.
+if cs_pod_ready "$TARGET"; then
+  cs_run_mkdir
+  KCONF_TMP="$(cs_run_dir)/.admin.conf.tmp.$$"
+  # Redirect inside the backgrounded child, so a signal's verdict still reaches
+  # stderr rather than the capture file (diagnose's reason, same shape).
+  kconf_capture() { "$@" > "$KCONF_TMP"; }
+  ( umask 077
+    cs_wait_cmd kconf_capture cs_pod_exec_out "$TARGET" cat "$CS_KCONF"
+  ) 2>/dev/null || true
+  if [ -s "$KCONF_TMP" ] && grep -q '^apiVersion:' "$KCONF_TMP" \
+     && grep -q '^clusters:' "$KCONF_TMP"; then
+    chmod 600 "$KCONF_TMP" 2>/dev/null || true
+    if mv -f "$KCONF_TMP" "$KCONF_DEST" 2>/dev/null; then
+      KCONF_REPORT="$KCONF_DEST"
+      cs_note "rescued the deployed cluster's kubeconfig to $KCONF_DEST (mode 600, holds a cluster-admin key)"
+    else
+      rm -f "$KCONF_TMP" 2>/dev/null || true
+      cs_note "could not write $KCONF_DEST; the kubeconfig will be lost with the pod"
+    fi
+  else
+    rm -f "$KCONF_TMP" 2>/dev/null || true
+    cs_note "no kubeconfig at $CS_KCONF in the pod (or it did not validate); nothing rescued"
+  fi
+else
+  cs_note "pod $TARGET is not Ready; the kubeconfig could not be rescued and is lost with the pod"
 fi
 
 # Shred the credentials the config and fetch steps left behind, then remove each
@@ -159,4 +226,6 @@ if kubectl -n "$CS_NS" get pod "$TARGET" >/dev/null 2>&1; then
   cs_note "pod $TARGET is still terminating (bounded wait expired); the delete was accepted"
 fi
 
-cs_ok "pod=$TARGET" "deleted=1" "already=0"
+set -- "pod=$TARGET" "deleted=1" "already=0"
+[ -n "$KCONF_REPORT" ] && set -- "$@" "kubeconfig=$KCONF_REPORT"
+cs_ok "$@"

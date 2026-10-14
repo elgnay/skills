@@ -25,7 +25,6 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/lib/common.sh"
 cs_init
 
-CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
 CS_CYCLE=30            # seconds between poll cycles; matches the operator's requeueSeconds
 CS_DEF_BUDGET=1800     # 30 min
 CS_CR_NAME="cubestack"

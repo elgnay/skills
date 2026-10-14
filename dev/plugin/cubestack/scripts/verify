@@ -23,8 +23,8 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF_DIR/lib/common.sh"
 cs_init
 
-# The deployed cluster's kubeconfig, inside the pod.
-CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
+# The deployed cluster's kubeconfig, inside the pod. Defined in lib/common.sh so
+# pod-down rescues the same path this reads.
 
 usage() {
   cat <<'USAGE'
@@ -39,7 +39,9 @@ verify [options]
   -h, --help         this text
 
 On success writes the verify-ok stamp. Verdict: nodes=, namespaces=, services=,
-plus ceph_state=, sc=, pvc= when an external Ceph was imported.
+plus ceph_state=, sc=, pvc= when an external Ceph was imported, and gpu= / rdma=
+when the GPU operator and RDMA plugin are on (rdma=placeholder when the plugin
+came up in placeholder mode, i.e. with no real HCA behind it).
 USAGE
 }
 
@@ -309,6 +311,126 @@ fi
 # find and `verify` would fail a cluster that is behaving exactly as designed.
 SERVICES_REPORT="${SVC_LIST:--}"
 
+# --- device passthrough: the GPU operator and the RDMA plugin ----------------
+# Both addons can finish, print their ✅ and deliver nothing a workload can use,
+# and in both cases the deployed cluster is otherwise healthy. That is why they
+# are asserted here rather than left to the prose in this skill's doc:
+#
+#   * GPU: with no mx-smi the module takes a CPU fast path and leaves metax-driver
+#     in CrashLoopBackOff, so no node advertises metax-tech.com/gpu. The driver
+#     container ships prebuilt modules per kernel (kernel_module/<uname -r>/), so
+#     a guest kernel it does not carry is the usual cause.
+#   * RDMA: placeholder mode (RDMA_PLACEHOLDER_HCAS, which the example
+#     cluster.conf sets by DEFAULT) builds the ConfigMap from fictional HCA names
+#     and registers no extended resource at all.
+#
+# Gated on the run's own record, like REGISTRY_REQUESTED — but the two keys do NOT
+# share one default, and the reason is that only one of them can FAIL on absence.
+#
+#   * GPU — absent means ON, and that is safe: `gpu=0` is deliberately not a
+#     failure (see above), so the worst an over-eager gate can do is report a
+#     number. On a run dir older than the key it looks around and finds nothing
+#     wrong, which is the correct answer for a box built without GPUs.
+#   * RDMA — absent means **unknown**, and it is skipped rather than assumed ON.
+#     A missing ConfigMap is a hard `E_VERIFY_RDMA`, so assuming ON turns a
+#     finished box that deliberately runs without RDMA into a failure — and its
+#     `recover=rerun:verify` loops until the lifetime budget is exhausted, ending
+#     in `E_RETRY_BUDGET` for a box that is fine. Demonstrated live on cubestack3
+#     (2026-10-08), which advertises no rdma/* resource and predates the key.
+#
+# This is a deliberate divergence from the stricter-when-absent convention the
+# METALLB/REGISTRY keys follow, because those components are on in the shipped
+# profile so "assume ON" is usually true there. `configure` records RDMA_REQUESTED
+# on every new run, so the assertion still runs everywhere the intent is knowable;
+# what it stops doing is guessing.
+GPU_REQ="$(cs_run_env_get GPU_OPERATOR_REQUESTED)"; [ -n "$GPU_REQ" ] || GPU_REQ=1
+RDMA_REQ="$(cs_run_env_get RDMA_REQUESTED)"
+RDMA_KNOWN=1
+if [ -z "$RDMA_REQ" ]; then RDMA_REQ=0; RDMA_KNOWN=0; fi
+
+# Total an extended resource across every node. The caller escapes the key for
+# jsonpath, where `.` separates steps - so `metax-tech.com/gpu` must arrive as
+# `metax-tech\.com/gpu`, or the lookup descends into a `metax-tech` key that does
+# not exist. A node that does not advertise the resource contributes nothing.
+node_resource_total() {
+  kget get nodes --no-headers -o custom-columns="V:.status.allocatable.$1" 2>/dev/null \
+    | awk '{ if ($1 ~ /^[0-9]+$/) s += $1 } END { printf "%d", s + 0 }'
+}
+
+GPU_REPORT=""
+if [ "$GPU_REQ" = "1" ]; then
+  GPU_TOTAL="$(node_resource_total 'metax-tech\.com/gpu')"
+
+  # A driver pod that exists but is not fully Ready is broken in a way no
+  # configuration makes legitimate, and it is exactly what the CPU fast path
+  # leaves behind. `gpu=0` ALONE is deliberately not a failure: with no GPU node
+  # the module is documented to complete without one, so failing that would be a
+  # false negative on a box built without GPUs. The unhealthy driver is what
+  # separates that case from a real one.
+  #
+  # Matched by name across every namespace rather than in a hardcoded one: the
+  # operator's namespace is the chart's to choose. Under `-A`, kubectl's columns
+  # are NS NAME READY STATUS ... - STATUS is the FOURTH field - and READY is
+  # compared as a ratio because a container that is Running but not Ready is as
+  # broken as one that is not Running.
+  GPU_BAD="$(kget get pods -A --no-headers 2>/dev/null \
+    | awk '$2 ~ /^metax-driver-/ { split($3, r, "/"); if ($4 != "Running" || r[1] != r[2]) print $2 }' \
+    | tr '\n' ',' | sed 's/,$//')"
+  if [ -n "$GPU_BAD" ]; then
+    cs_fail E_VERIFY_GPU "gpu=$GPU_TOTAL" "unhealthy=$GPU_BAD" recover=rerun:verify \
+      hint="MetaX driver pods exist but are not Running/Ready, so the node registers no metax-tech.com/gpu; the driver ships prebuilt modules per kernel under kernel_module/<uname -r>/, so the guest's kernel is the usual cause - rebuild the VM on a golden image whose kernel it carries, then re-run verify"
+  fi
+  [ "$GPU_TOTAL" -gt 0 ] && GPU_REPORT="$GPU_TOTAL"
+fi
+
+RDMA_REPORT=""
+if [ "$RDMA_REQ" = "1" ]; then
+  # One global ConfigMap, `rdma-devices`, in the plugin's namespace - which is
+  # RDMA_NAMESPACE, and its default is kube-system.
+  if ! kget -n kube-system get cm rdma-devices >/dev/null 2>&1; then
+    cs_fail E_VERIFY_RDMA "rdma=no-configmap" recover=rerun:verify \
+      hint="the RDMA plugin's ConfigMap kube-system/rdma-devices is absent, so the module did not run - RDMA_ENABLED defaults to true, which makes this a missing addon rather than a deliberate omission"
+  fi
+
+  # The annotation is written true/false on every install, and it is the only
+  # thing that distinguishes a real resource from a fabricated one: placeholder
+  # mode brings the plugin up cleanly and registers nothing.
+  RDMA_PH="$(cs_pod_exec_out "$CS_POD" kubectl --kubeconfig="$KCONF" -n kube-system \
+    get cm rdma-devices -o 'go-template={{index .metadata.annotations "cubestack.io/rdma-placeholder"}}' \
+    | tr -dc 'a-z')"
+
+  if [ "$RDMA_PH" = "true" ]; then
+    # Reported, never failed. Placeholder mode is a documented and deliberately
+    # configured outcome - and the example cluster.conf's default on a box with
+    # no HCA - so failing it would be the false negative above. Saying nothing is
+    # the silent success this check exists to end.
+    RDMA_REPORT="placeholder"
+    cs_note "RDMA is in PLACEHOLDER mode: the ConfigMap is built from the names in RDMA_PLACEHOLDER_HCAS, no real HCA was detected, and the plugin registers NO rdma/* resource - the cluster advertises an RDMA capability nothing can use"
+  else
+    # Real mode: total the extended resources the ConfigMap actually declares, so
+    # the number reported is the one a Pod can request. Names are read from the
+    # ConfigMap rather than hardcoded because RDMA_HCA_MODE chooses them - by-link
+    # splits IB/RoCE, per-hca names one resource per device.
+    #
+    # Reported, never gated: a Resources list this fails to parse must not be
+    # able to fail a cluster. The ConfigMap's absence and the placeholder flag
+    # above are the two assertions precise enough to act on.
+    RDMA_TOTAL=0
+    for r in $(cs_pod_exec_out "$CS_POD" kubectl --kubeconfig="$KCONF" -n kube-system \
+        get cm rdma-devices -o 'go-template={{index .data "config.json"}}' 2>/dev/null \
+        | grep -oE '"(resourcePrefix|resourceName)"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | sed -E 's/.*"([^"]*)"$/\1/' | paste - - 2>/dev/null \
+        | awk -F'\t' 'NF==2 { print $1"/"$2 }'); do
+      RDMA_TOTAL=$((RDMA_TOTAL + $(node_resource_total "$(printf '%s' "$r" | sed 's/\./\\./g')")))
+    done
+    [ "$RDMA_TOTAL" -gt 0 ] && RDMA_REPORT="$RDMA_TOTAL"
+  fi
+elif [ "$RDMA_KNOWN" = "0" ]; then
+  # Not a silent skip: the point of the check is to end the silent success, so
+  # saying nothing here would be the failure mode it exists to fix.
+  cs_note "RDMA intent is not recorded in this run dir (no RDMA_REQUESTED) - skipping the RDMA assertion rather than assuming it was enabled; re-run configure to record it"
+fi
+
 # --- external Ceph consumer side --------------------------------------------
 CEPH_STATE=""
 SC_REPORT=""
@@ -412,6 +534,12 @@ set -- "nodes=$NODE_TOTAL" "namespaces=$NS_COUNT" "services=$SERVICES_REPORT"
 # default, so emitting `metallb=on` would churn the verdict string for the
 # ordinary case and invalidate the verbatim verdicts recorded in the skill doc.
 [ "$METALLB_REQ" != "1" ] && set -- "$@" "metallb=off"
+# The two device addons, and by the same non-default-only rule: a box that runs
+# neither, or whose GPU count is zero because it has no GPUs, keeps the verdict
+# string it had. What is new is that a placeholder RDMA pool is now visible at
+# all - `rdma=placeholder` is the one token a green run could never show before.
+[ -n "$GPU_REPORT" ] && set -- "$@" "gpu=$GPU_REPORT"
+[ -n "$RDMA_REPORT" ] && set -- "$@" "rdma=$RDMA_REPORT"
 # The reserved block, only when this run has one — so the verdict records the
 # reservation the assertions above checked, and a reader can see which block the
 # box is bound to without going back to run.env.

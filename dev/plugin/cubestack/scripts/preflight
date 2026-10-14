@@ -80,7 +80,9 @@ preflight [options]
   --run ID         pin the run id instead of deriving it from the target
                    (default: cubestack<N>, the resolved target). Every other
                    script takes the same flag; pass it on, or two installs
-                   running at the same time will share state.
+                   running at the same time will share state. An id of the form
+                   cubestack<N> ALSO pins the target, so resuming a run names
+                   that run's own box — pass --index as well only to override it.
   -h, --help       this text
 USAGE
 }
@@ -252,6 +254,27 @@ fi
 # offering a pool on a subnet the box's nodes are not on, which is off-L2, so
 # MetalLB never announces and every node pull fails with nothing naming the cause.
 
+# --- a pinned run id pins the target ----------------------------------------
+# The run id IS the target's name (`cubestack<N>`), so pinning one also says WHICH
+# box: `--run cubestack6` means the box called cubestack6. Without this the index
+# resolver below runs on its own and returns the first FREE index — and a box
+# that already exists is not free, so resuming cubestack6 resolves `cubestack7`
+# and the plan names a VM that does not exist. The run dir would say one thing and
+# the CONFIRM block another; the whole point of pinning an id is that they agree.
+#
+# Precedence mirrors the run-id block below: CUBESTACK_RUN beats --run, and an
+# explicit --index beats both, in either order on the command line — a derived
+# answer never overrides one a caller stated.
+if [ -z "$INDEX" ]; then
+  if [ -n "${CUBESTACK_RUN:-}" ]; then _pin="$(basename "$CUBESTACK_RUN")"; else _pin="$RUN_ID"; fi
+  case "$_pin" in
+    cubestack*)
+      _pin="${_pin#cubestack}"
+      if [ -n "$_pin" ] && ! cs_kv_nonnumeric "$_pin"; then INDEX="$_pin"; fi
+      ;;
+  esac
+fi
+
 # --- free index -------------------------------------------------------------
 if [ -z "$INDEX" ]; then
   USED_MAX="$(kubectl -n "$CS_NS" get vm,virtualmachinepool -o name 2>/dev/null \
@@ -301,6 +324,86 @@ RUN_ID="$(basename "$(cs_run_dir)")"
 mkdir -p "$(cs_run_dir)/verdict" "$(cs_run_dir)/logs" 2>/dev/null || true
 
 cs_budget_guard
+
+# --- run-dir hygiene --------------------------------------------------------
+# The run id is the target's NAME (`cubestack<N>`), and names get reused: the
+# normal way to rebuild a box is to delete it and install again, which resolves
+# the same index and therefore the same run dir. But a run dir holds per-BOX
+# state — the retry counters (lifetime counters that NO verb resets) and the
+# attestation stamps — so a re-provisioned name inherits the dead box's spent
+# budgets. The cost is not theoretical: with `configure`, `deploy`, `env-probe`
+# and `fetch-offline` each one invocation away from their limits, a single
+# transient failure in the NEW run returns E_RETRY_BUDGET -> stop-report, naming
+# a budget the new run never spent. A stale `verify-ok` is worse in the same
+# way: it attests a k8s box that no longer exists, and it is exactly the gate
+# `operator-up` opens on.
+#
+# The test is identity, not existence. "Stamps exist AND the box is newer than
+# all of them" catches the reuse; taking the OLDEST creationTimestamp across the
+# box's members is what stops a pool scale-up (a replica created just now, the
+# box itself unchanged) from looking like a rebuild. Every stamp here is written
+# AFTER Step 1, so a genuinely resumed run always has stamps NEWER than its VMs
+# and is left alone. preflight's own attempt counter is deliberately not among
+# them: it is written before the VM exists, so it would poison the comparison.
+# Nothing is cleared when the cluster cannot be read — an unanswerable host is
+# not evidence of a rebuild, the same rule that keeps a host error from charging
+# a retry budget.
+#
+# Clearing preflight's own counter is not a budget loophole: with the stamps gone
+# the test finds nothing to compare, so a second preflight keeps the state and
+# the loop can only re-open on a real rebuild — which is a new box, and a new box
+# is entitled to a fresh budget. Each reset maps 1:1 to one VM on disk.
+#
+# Same shape as `deploy`'s nodeset drift check: auto-correct, note it, stay OK.
+RUN_STATE=kept
+NEWEST_STAMP=""
+for _f in conf-ok env-ok verify-ok operator-ok operator-applied; do
+  [ -f "$(cs_run_dir)/$_f" ] || continue
+  _m="$(cs_file_mtime "$(cs_run_dir)/$_f")"
+  cs_kv_nonnumeric "${_m:-}" && continue
+  if [ -z "$NEWEST_STAMP" ] || [ "$_m" -gt "$NEWEST_STAMP" ]; then NEWEST_STAMP="$_m"; fi
+done
+
+if [ -n "$NEWEST_STAMP" ]; then
+  # One list call, filtered here. `kubectl get vm <name>` EXITS NON-ZERO for a
+  # name that does not exist, which would collapse "the box is gone" into "the
+  # cluster did not answer" — and those two take opposite actions.
+  if LIVE_VMS="$(kubectl -n "$CS_NS" get vm 2>/dev/null \
+       -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}')"; then
+    BOX_EPOCH=""
+    for _want in $(printf '%s' "${VM_NAMES:-}" | tr ',' ' '); do
+      _ts="$(printf '%s\n' "$LIVE_VMS" | awk -v n="$_want" '$1 == n { print $2; exit }')"
+      [ -n "$_ts" ] || continue
+      _e="$(cs_rfc3339_epoch "$_ts")"
+      cs_kv_nonnumeric "${_e:-}" && continue
+      if [ -z "$BOX_EPOCH" ] || [ "$_e" -lt "$BOX_EPOCH" ]; then BOX_EPOCH="$_e"; fi
+    done
+
+    STALE=0
+    if [ -z "$BOX_EPOCH" ]; then
+      # No member of the box this run dir describes is in the cluster any more.
+      # A VirtualMachinePool can outlive its replicas, so a live pool still
+      # counts as the box existing.
+      if [ -n "${POOL:-}" ] && kubectl -n "$CS_NS" get virtualmachinepool "$POOL" >/dev/null 2>&1; then
+        STALE=0
+      else
+        STALE=1
+      fi
+    elif [ "$BOX_EPOCH" -gt "$NEWEST_STAMP" ]; then
+      STALE=1
+    fi
+
+    if [ "$STALE" = "1" ]; then
+      rm -f "$(cs_run_dir)"/attempts/* 2>/dev/null || true
+      rm -f "$(cs_run_dir)/conf-ok" "$(cs_run_dir)/env-ok" "$(cs_run_dir)/verify-ok" \
+            "$(cs_run_dir)/operator-ok" "$(cs_run_dir)/operator-applied" \
+            "$(cs_run_dir)/deploy-nodeset" "$(cs_run_dir)/deploy-wait.poll" \
+            "$(cs_run_dir)/deploy.launch.out" 2>/dev/null || true
+      RUN_STATE=reset
+      cs_note "run dir carries an earlier cubestack${INDEX}'s state and the live box is newer: cleared its retry budgets and stamps"
+    fi
+  fi
+fi
 
 # run.env is MERGED, not truncated. Truncating destroys the keys that later steps
 # write — POD_NAME (pod-up), METALLB_REQUESTED (configure), EXTERNAL_CEPH_ENV and
@@ -354,7 +457,7 @@ CONFIRM — resolved prerequisites (nothing has been created yet)
   harbor robot  $([ "$OPERATOR" = "1" ] && echo "$(basename "$HARBOR_RO_VALUES")   (read at Step 7, never stored in the run dir)" || echo "-")
 
   run id        $RUN_ID        (--run $RUN_ID on every later step)
-  run dir       $(cs_run_dir)
+  run dir       $(cs_run_dir)$([ "$RUN_STATE" = "reset" ] && echo "   (RESET — held an earlier cubestack${INDEX}'s budgets and stamps; see the note above)")
   pod name      $(cs_pod_name "$RUN_ID")   (unique to this run)
 
 Secrets (SSH password, MinIO keys, Ceph keyrings) are NOT resolved here and are
@@ -366,4 +469,5 @@ cs_ok "run=$RUN_ID" "index=$INDEX" "nodes=$NODES" "subnet=$SUBNET" \
       "models_mount=$([ -n "$CEPHFS_GUIDE" ] && echo on || echo off)" \
       "operator=$([ "$OPERATOR" = "1" ] && echo on || echo off)" \
       "harbor_ro=$([ -n "$HARBOR_RO_VALUES" ] && echo 1 || echo 0)" \
+      "run_state=$RUN_STATE" \
       "run_dir=$(cs_run_dir)"
