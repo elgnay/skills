@@ -14,6 +14,14 @@ CS_POD_PREFIX="${CS_POD_PREFIX:-cubestack-install}"
 CS_IMAGE_DEFAULT="harbor.isuanova.com/cubestack/cubestack-installer-cli:latest"
 CS_HARBOR_DEFAULT="harbor.isuanova.com"
 
+# The deployed cluster's kubeconfig, as the pod sees it. Four scripts need this
+# path — `verify` and `operator-up`/`operator-wait` to reach the cluster through
+# it, `pod-down` to rescue it before deleting the pod that holds the only copy —
+# so it lives here rather than being spelled out four times and drifting apart.
+# It was four copies before this: only `pod-down`'s need was new, but a constant
+# duplicated that many times is one quick edit away from two different answers.
+CS_KCONF="/opt/cubestack-installer/deployments/kubespray/inventory/cubestack-cluster/artifacts/admin.conf"
+
 # There is deliberately NO golden-image default here. VM provisioning is delegated
 # to the sibling `suanova-dev-vm` skill (SKILL.md Step 1), and the golden image is
 # part of that skill's VM model - the same model whose default drifts whenever the
@@ -298,6 +306,23 @@ cs_sha256() {
   elif command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" 2>/dev/null | cut -d' ' -f1
   fi
+}
+
+# Epoch seconds of a file's mtime, or EMPTY when neither stat flavour works.
+# Same portability problem as cs_sha256 above and the same rule: the caller must
+# treat empty as "cannot tell", never as "zero" — a 0 would read as 1970 and make
+# every comparison below come out one way regardless of the truth.
+cs_file_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+# RFC3339 UTC (the API server's creationTimestamp, `2026-09-30T16:36:12Z`) to
+# epoch seconds, or empty if this host's `date` can do neither form. macOS
+# `date` has no -d and needs -j -u -f; GNU date takes -d. Prints nothing rather
+# than a wrong number, for the same reason as cs_file_mtime.
+cs_rfc3339_epoch() {
+  date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null \
+    || date -d "$1" +%s 2>/dev/null
 }
 
 # --- values-file validation -------------------------------------------------
