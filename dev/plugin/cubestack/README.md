@@ -35,7 +35,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Run identity** | A run is scoped to what it installs (`--run cubestack<N>`): its own run dir, stamps, retry counters, **and its own bootstrap pod name**. Two installs can therefore run at the same time without applying to, reusing, or deleting each other's pod |
 | **Storage** | **External Ceph CSI import** (Rook external mode) — consume an existing Ceph outside the cluster for RBD / CephFS. Required by the minimal profile, where it is the in-cluster registry's backend; the Provider exports an `external-ceph.env` and `preflight --external-ceph-env` takes it. Independent of the model store below |
 | **Model store** | Optional **host-level CephFS mount** — the Provider's `/models` mounted read-only at `/models` on every node host, from the Provider's own mount guide. Opt-in, and independent of the CSI import |
-| **Deliverable** | **cubestack box** by default — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`lws`, `envoyGateway`, `cubestackControllerManager`, `cubepilot`, `cubestackPortal`; `aiGateway` ships `enabled: false`) — *or adopts the platform the deploy already installed, if it installed one*. `--no-operator` builds **only a k8s box**, which ends at `verify` |
+| **Deliverable** | **cubestack box** by default — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen** components (the operator chart's own default set; `exporters.bmc` ships `enabled: false` because it needs an admin-created Secret) — *or adopts the platform the deploy already installed, if it installed one*. `--no-operator` builds **only a k8s box**, which ends at `verify` |
 
 ---
 
@@ -103,13 +103,15 @@ Three verified installs (8 vCPU / 24 GiB per VM), started from a clean state. Ru
 The optional model-store step was added after these three runs, so it has no column above. Measured separately on a 2-node cluster against the Provider's CephFS: **~20 s** when the nodes already have `ceph-common`, and about **+23 s per node** on the first run, which installs it. It runs in Step 7 and is off unless asked for.
 
 The cubestack-box step (the platform operator) **postdates all three runs**, so it has no column
-either — and no
-five-component bring-up has been timed. What is structural: `operator-up` returns in ~30 s (a
-helm install, an apply, and a Deployment roll), and the time is the operator's own 30 s requeue
-driving the profile's components to `Ready` — five for this skill's own manifest, nine on a box
-where it adopted the deploy's — which is why `operator-wait` carries its own 1800 s budget. Treat the
+either — and no twelve-component bring-up has been timed. What is structural: `operator-up` returns
+in ~30 s (a helm install, an apply, and a Deployment roll), and the time is the operator's own 30 s
+requeue driving the profile's components to `Ready` — twelve for this skill's own manifest, eleven
+on a box where it adopted the deploy's (whose CR also clears `modelBundles` and `bundles`). Those
+are the enabled counts; `exporters.metax` reports `Skipped` on a cluster with no MetaX operator and
+is then counted in neither, which is why `operator-wait` carries its own 1800 s budget. Treat the
 first run as a first-run experiment on capacity too: five components plus the operator on a
-single-node 8 vCPU / 24 GiB VM alongside Rook/Ceph was the tightest shape this skill builds.
+single-node 8 vCPU / 24 GiB VM alongside Rook/Ceph was the tightest shape this skill has been
+exercised on — and it has since been asked to carry twelve.
 **That default has since been raised** — a 1-node box now provisions 24 vCPU / 64 GiB / 200 GiB
 (see *What it asks you* below), so a new single-node run is no longer sized like the one measured
 here. The timings above remain the record of what 8/24 did.
@@ -285,21 +287,32 @@ registry's VIP is settled during the deploy and the gateway takes the block's se
 **Which components are enabled is the skill's profile, not a question.** They live in
 `scripts/lib/cubestack-cluster.yaml` — a reviewable file rather than a `--set` argument list:
 
-| Component | What it is (the CRD's own description) | Profile |
+| Component | What it is (the CRD's own description where it has one) | Profile |
 |-----------|------------|---------|
 | `lws` | LWS (`kubernetes-sigs/lws`) — workload autoscaling for LeaderWorkerSets | on |
 | `envoyGateway` | Envoy Gateway + Gateway API CRDs | on |
-| `aiGateway` | Envoy AI Gateway controller + its CRDs — **requires `envoyGateway`** | **off** |
+| `aiGateway` | Envoy AI Gateway controller + its CRDs — **requires `envoyGateway`** | on |
 | `cubestackControllerManager` | The platform's workload operator + CRDs | on |
+| `modelBundles` | Applies the bundles `spec.bundles` selects — the vendored model catalog (`InferenceRuntimeProfile` + `ModelVersion` + ConfigMaps) — through the kustomize library | on |
+| `prometheus` | Prometheus (kube-prometheus-stack, built-in required values) | on |
+| `perses` | Perses (perses-operator + Perses server instance) | on |
+| `exporters.bmc` | BMC out-of-band monitoring — **needs the `cubestack-bmc-credentials` Secret** | **off** |
+| `exporters.metax` | MetaX data exporter — a *patch* of the vendor `ClusterOperator`, `missingTarget: skip` | on |
+| `cuberouter` | CubeRouter | on |
 | `cubepilot` | CubePilot | on |
-| `cubestackPortal` | The web portal | on |
+| `cubestackPortal` | CubeStackPortal (web portal) | on |
+| `observability` | Observability assets (embedded: `PrometheusRule` / `ServiceMonitor` / `PersesDashboard` / grafana dashboards) | on |
 
-`aiGateway` is the one component the profile disables, and the only one it could: the catalog has
-six, but nothing depends on this one. `cubestackControllerManager` hard-depends on `lws` and
-`envoyGateway`, and the AI gateway needs `envoyGateway`'s data plane — never the reverse. Leaving
-it on would buy the platform nothing it uses, at the cost of an extra controller, its CRDs and a
-chart pull on every bring-up. It is kept in the file, disabled, rather than deleted, so the
-profile reads as a decision and turning it back on is a one-line change.
+That is the operator chart's **own default set** (`clusterCR.spec` in its `values.yaml`,
+mirrored at commit `083d444` and re-checked unchanged at `90be297`), minus one. The exception is
+`exporters.bmc`, and it is the only default-enabled component that **cannot converge on a fresh
+box**: it is driven entirely by the
+admin-owned Secret `cubestack-bmc-credentials` in `monitoring`, the operator reads that Secret
+but never creates it, and a missing one is a hard error rather than a skip — the component goes
+`Degraded`, which blocks the CR's `Ready` and fails the whole run. It is kept in the file,
+disabled, so the profile reads as a decision: create the Secret (at least one BMC management
+IP), then flip one line. `exporters.metax` looks like the same risk and is not — it is a patch
+with `missingTarget: skip`, so it reports `Skipped` and the cluster still reaches `Ready`.
 
 **`cubestackPortal` carries a `values` block, and enabling the component is not enough without
 it.** The portal chart creates its login Secret only when `secrets.htpasswd.content` is non-empty
@@ -316,8 +329,11 @@ explicit override always wins. Generate a line with `htpasswd -nB <user>`.
 Install **order** is not in the manifest — each component's `order` comes from the operator's
 own catalog, and the operator reconciles on a 30 s requeue. A disabled component **drops out of
 the CR's status** entirely, which is why `operator-wait` derives its total from the status rather
-than from a count here: it polls whatever the CR reports, which is five for this skill's own
-manifest and nine on a box where it adopted the deploy's.
+than from a count here: it polls whatever the CR reports — twelve for this skill's own manifest,
+eleven on a box where it adopted the deploy's — and counts only the phases that can still reach
+`Ready`. A component in the catalog's fifth phase, `Skipped` (`exporters.metax` with no MetaX
+operator present), is counted in neither number, so a "nothing to do here" component cannot
+inflate a total the wait would then never reach.
 
 **One credential, two jobs.** The robot account pulls the operator chart from
 `harbor.isuanova.com/suanova-private` *and* the component images from `suanova`. Probed
@@ -337,14 +353,16 @@ getting one right is a silent failure:**
 | The kubelet | **each pod's** namespace | `ImagePullBackOff` on that component's pods only — the CR reports that component `Degraded` |
 
 So `operator-up` writes the Secret into `cubestack-system`, `lws-system`,
-`envoy-gateway-system` and `ai-gateway-system` — the catalog's four component namespaces, read
-from the catalog rather than guessed. It creates the component namespaces
+`envoy-gateway-system`, `ai-gateway-system`, `monitoring` and `cuberouter` — the operator's own
+namespace plus the **five** its components land in, read from the catalog rather than guessed. It
+creates the component namespaces
 **up front** rather than copying the Secret in after the operator makes them (which is what the
 upstream README documents): the operator's `EnsureNamespace` is a server-side apply that merges
 into an existing namespace, so pre-creating is safe, and it closes the window in which the
-operator renders a Deployment the kubelet cannot yet pull into. `ai-gateway-system` is staged
-even though the profile disables `aiGateway`; it then stands empty, and having it ready is what
-makes re-enabling that component a one-line CR change.
+operator renders a Deployment the kubelet cannot yet pull into. The catalog's sixth component
+namespace, `metax-operator`, is deliberately absent: `exporters.metax` is a *patch* of a
+cluster-scoped object and installs no workload, so nothing there pulls an image — and the
+namespace belongs to the vendor MetaX operator (`createNamespace: false`).
 
 **Two pull policies, because the images are rolling `:latest` and the charts default to
 `IfNotPresent`** — a node that cached one would keep running that build with no signal.
@@ -388,7 +406,7 @@ addon modules push to it themselves; this CR is the first thing to ask a node fo
 directly, and `env-probe` only proves Harbor from the pod. If a node has no route it surfaces as
 `E_OPERATOR_IMAGE_PULL`, which reads like a bad credential — tell them apart by curling
 `https://harbor.isuanova.com/v2/` **from the VM**, where any HTTP status (even `401`) means the
-network is fine. Second, capacity: whether a five-component bring-up fits inside the 1800 s
+network is fine. Second, capacity: whether a twelve-component bring-up fits inside the 1800 s
 budget, and whether it fits on one VM alongside Rook/Ceph — a 1-node box used to be the 8 vCPU /
 24 GiB shape this was an open question about, and is now provisioned at 24 vCPU / 64 GiB / 200 GiB
 by default (the 8/24 figure is what the operator bring-up was *first* exercised against, not what
@@ -473,7 +491,7 @@ else is a cubestack box.
 | Node roles (multi-node) | `cubestack<N>-0` = master; `-1…` = workers |
 | External Ceph CSI | **Disabled** (opt-in) — when enabled, supply the path to the Provider's exported `external-ceph.env` (the hand-filled mon + keyring route still works but is no longer the recommended one) |
 | Model store on the nodes | **Disabled** (opt-in) — when enabled, supply the path to the Provider's CephFS Linux-host mount guide; Step 7 then mounts its `/models` read-only at `/models` on every node host |
-| Which box | **cubestack box** — Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling five components (`aiGateway` ships disabled), or adopts the platform the deploy installed if it installed one. `--no-operator` builds **only a k8s box**, which ends at `verify` |
+| Which box | **cubestack box** — Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen** components (the operator chart's own default set; `exporters.bmc` ships `enabled: false` because it needs an admin-created Secret), or adopts the platform the deploy installed if it installed one. `--no-operator` builds **only a k8s box**, which ends at `verify` |
 | Harbor robot credential | **Required while the operator is on** — the `Write`-authored file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Write it **before** the `preflight` call, so `preflight` lints it while you are still there |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.

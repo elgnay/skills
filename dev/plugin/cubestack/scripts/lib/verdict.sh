@@ -266,7 +266,7 @@ cs_attempt_limit() {
     # two, and it still bounds a loop.
     operator-up)   echo 3 ;;
     # operator-wait is invoked once by a healthy run, but its own false negative
-    # is E_OPERATOR_STILL_PROVISIONING on a slow six-component bring-up, where
+    # is E_OPERATOR_STILL_PROVISIONING on a slow twelve-component bring-up, where
     # the recovery it prescribes is another operator-wait. 4 covers that
     # recurring loss plus a genuine retry.
     operator-wait) echo 4 ;;

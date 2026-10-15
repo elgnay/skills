@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # operator-wait — wait for the CubeStackCluster to reach Ready.
 #
-# RUN THIS AS A BACKGROUND TASK. A five-component bring-up (the manifest ships
-# the catalog's six, with `aiGateway` disabled) installs dozens of
-# objects, pulls five OCI charts and (on the nodes) a few dozen images, and the
-# operator reconciles on a 30 s requeue — minutes, not seconds, and beyond any
+# RUN THIS AS A BACKGROUND TASK. A twelve-component bring-up (the manifest ships
+# twelve of the catalog's thirteen) installs dozens of objects, pulls a dozen
+# OCI charts and (on the nodes) a good many images, and the operator reconciles
+# on a 30 s requeue — minutes, not seconds, and beyond any
 # foreground tool timeout. A caller that cannot run background tasks should use
 # --chunk N and re-invoke a bounded number of times instead.
 #
@@ -171,6 +171,11 @@ while :; do
     ph="${line#*=}"
     [ "$nm" != "$line" ] || continue
     case "$nm" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    # The four phases that belong in the count. `Skipped` is the catalog's fifth
+    # and it is deliberately absent: it means "enabled, but there is nothing on
+    # this cluster for the operator to do" (`exporters.metax` with no MetaX
+    # operator). Counting it would add a component to TOTAL that can never reach
+    # Ready, so the wait would run to its budget on a healthy cluster.
     case "$ph" in Ready|Provisioning|Pending|Degraded) ;; *) continue ;; esac
     TOTAL=$((TOTAL + 1))
     case "$ph" in

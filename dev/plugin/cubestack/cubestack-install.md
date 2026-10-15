@@ -173,7 +173,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | # | Prerequisite | Default |
 |---|---|---|
 | 1 | Number of nodes | `1` |
-| 2 | VM shape | **24 vCPU / 64 GiB RAM / 200 GiB root on a 1-node box**; 8 vCPU / 24 GiB / **100 GiB root** per VM on multi-node. The default scales with the node count because a single node carries the control plane, the worker load *and* every addon (Rook/Ceph, the registry, MetalLB, five platform components) on one VM. `--cp` / `--mem` / `--disk` override it |
+| 2 | VM shape | **24 vCPU / 64 GiB RAM / 200 GiB root on a 1-node box**; 8 vCPU / 24 GiB / **100 GiB root** per VM on multi-node. The default scales with the node count because a single node carries the control plane, the worker load *and* every addon (Rook/Ceph, the registry, MetalLB, twelve platform components) on one VM. `--cp` / `--mem` / `--disk` override it |
 | 3 | Subnet | auto-selected (most capacity); NAD follows |
 | 4 | VM owner label | `owner=$USER` |
 | 5 | SSH password | `ubuntu` |
@@ -182,7 +182,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 8 | VM names | single: `cubestack<N>`; multi: pool `cubestack<N>` |
 | 9 | External Ceph | **required** — ask for the Provider's exported `external-ceph.env` path (`--external-ceph-env`). Not an optional storage extra: on the minimal profile it is what the registry's PVC binds to (see *Minimal profile*), so a run without it is not this profile |
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
-| 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **five** components (`aiGateway` ships disabled), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
+| 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
 | 12 | Harbor read-only robot credential | **required while #11 is on** — a file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Author it with `Write` **before running `preflight`**, like the two Provider files above, so `preflight` can lint it while the user is still in the room |
 
 Then resolve everything with one read-only call and confirm the printed plan:
@@ -1257,8 +1257,11 @@ only host that can reach it.
 > **`operator-up` ADOPTS a platform the deploy already installed.** The installer now has its
 > own `cubestack_operator` module, which installs this same chart under this same release name
 > with the chart's optional `clusterCR` path **enabled** — so its release manifest carries a
-> `CubeStackCluster` of its own, with a wider profile (nine components, `deletePolicy:
-> uninstall`, images from the in-cluster registry). On such a box an unconditional
+> `CubeStackCluster` of its own, pinned to the chart's defaults *minus two* (`deletePolicy:
+> uninstall`, images from the in-cluster registry). The two it drops are `exporters.bmc` — the
+> same admin-Secret reason this skill drops it — and `modelBundles` + `spec.bundles`, which it
+> clears on the grounds that model bundles are inference profiles rather than platform
+> services. On such a box an unconditional
 > `helm upgrade --set clusterCR.enabled=false` is not an install: dropping the CR from the
 > manifest makes helm **prune** it, the operator honours `deletePolicy: uninstall`, and the
 > whole platform is torn down before `operator-up` re-applies its own CR. Measured on
@@ -1269,9 +1272,12 @@ only host that can reach it.
 > `CubeStackCluster` and that CR is live, `operator-up` adopts it: no chart pull, no Secret,
 > no CR apply, no Harbor credential — just the roll — and it reports `adopted=1 applied=0`.
 > The box then keeps **the profile the deploy installed**, and `operator-wait` polls whatever
-> that CR's status reports rather than a hardcoded five. The skill's own five-component
-> manifest is applied only where the deploy installed no platform at all — the
-> pre-2026-10-12 shape, which is what `cubestack7` is.
+> that CR's status reports rather than a hardcoded count. The skill's own manifest is applied
+> only where the deploy installed no platform at all — the pre-2026-10-12 shape, which is what
+> `cubestack7` is. The two profiles are close but **not identical**: the deploy's CR has
+> `modelBundles` off and `spec.bundles` empty, and the skill's has both on. Which one a given
+> box runs is a question for the CR, not for the file — `kubectl get cubestackcluster cubestack
+> -n cubestack-system -o jsonpath='{.spec.components}'`.
 >
 > The detection is deliberately narrow: it consults only whether the release's current
 > manifest contains a `CubeStackCluster`, because that names the one dangerous state. A
@@ -1319,17 +1325,22 @@ What the pair does, in order, and why the order is not negotiable:
     CR names is absent, so the CR would never converge and would name no component at all — a
     failure with no component to point at.
   - The **kubelet** reads pull secrets only from the namespace a pod runs in, so the
-    `cubestack-system` copy does nothing for a pod in `lws-system`. The three component
+    `cubestack-system` copy does nothing for a pod in `lws-system`. The component
     namespaces are therefore created **up front**, with the Secret, rather than copied into
     after the operator makes them — the operator's `EnsureNamespace` is a server-side apply,
     so it merges its own labels into a namespace that already exists. Doing it up front is what
     closes the window where the operator renders a Deployment into a namespace the kubelet
     cannot yet pull into.
-  The namespaces come from the operator's catalog, not from guessing: its components live
-  in `cubestack-system`, `lws-system`, `envoy-gateway-system` and `ai-gateway-system`. The list is
-  the catalog's, so `ai-gateway-system` is staged even though the profile ships `aiGateway`
-  disabled — the namespace is then empty and the Secret unused, which costs nothing and keeps
-  re-enabling the component a one-line CR change. The Secret
+  The namespaces come from the operator's catalog, not from guessing. Each component's
+  `namespace` field is fixed — no CR can move one — and the profile's twelve components land in
+  exactly five namespaces besides the operator's own: `cubestack-system` holds the operator and
+  four more components (the controller-manager, cubepilot, the portal and the model bundles),
+  and the Secret goes into `lws-system`, `envoy-gateway-system`, `ai-gateway-system`,
+  `monitoring` (shared by prometheus, perses and observability) and `cuberouter`. Two catalog
+  namespaces are deliberately absent: `metax-operator`, because
+  `exporters.metax` is a *patch* of a cluster-scoped object and installs no workload, so
+  nothing there pulls an image — and the namespace belongs to the vendor MetaX operator
+  (`createNamespace: false`). The Secret
   is built from the values file inside the pod (`--from-file`, never the `--docker-password`
   flag, which would put the token in the pod's process list).
 - **Two pull policies are set, and they cover different things.** `image.pullPolicy=Always` for
@@ -1354,21 +1365,47 @@ What the pair does, in order, and why the order is not negotiable:
   (`image=sha256:…`), and records it in the `operator-applied` stamp: under a rolling tag the
   digest is the only thing that distinguishes two builds.
 - **Only then the CR**, from `scripts/lib/cubestack-cluster.yaml` — a versioned file rather than
-  a `--set` string, so "which components are enabled" is reviewable rather than an argument list:
-  `lws`, `envoyGateway`, `cubestackControllerManager`, `cubepilot`, `cubestackPortal` — plus
-  `aiGateway` listed and set `enabled: false`, the one component nothing else depends on. Install
+  a `--set` string, so "which components are enabled" is reviewable rather than an argument list.
+  The profile **mirrors the operator chart's own default** (`clusterCR.spec` in its
+  `values.yaml`): twelve of the catalog's thirteen components — `lws`, `envoyGateway`,
+  `aiGateway`, `cubestackControllerManager`, `modelBundles`, `prometheus`, `perses`,
+  `exporters.metax`, `cuberouter`, `cubepilot`, `cubestackPortal`, `observability`. Install
   *order* is not in the manifest: each component's `order` comes from
   the operator's own catalog, and the operator reconciles on a 30 s requeue.
-  The portal entry carries a `values` block holding its login credential
-  (`secrets.htpasswd.content`, one `user:bcrypt-hash` line), and it is **not decoration** — the
-  portal chart creates the htpasswd Secret only when that value is non-empty, so enabling the
-  component without it yields a UI with no account, and no verdict anywhere goes red. The shipped
-  hash is the operator chart's own published default, i.e. a publicly known credential: adequate
-  as a default that leaves a fresh box loggable, not for anything reachable. Override the same
+  **Two components need a `values` block or they install something useless**, and both are
+  carried here because the chart carries them:
+  - `cubestackPortal` — its login credential (`secrets.htpasswd.content`, one
+    `user:bcrypt-hash` line), and this is **not decoration**: the
+    portal chart creates the htpasswd Secret only when that value is non-empty, so enabling the
+    component without it yields a UI with no account, and no verdict anywhere goes red.
+  - `cubestackControllerManager` — `gateway.catalogHostname`, the hostname published models are
+    served under. With it empty the component omits `--gateway-catalog-hostname`, publishing
+    stays off, and **every InferenceService sits at `RouteReady=False`** — a green component
+    serving nothing. The shipped value is the chart's own (`ai.cubestack.dev`); point it at a
+    name your DNS actually answers for.
+  The shipped portal hash is the operator chart's own published default, i.e. a publicly known
+  credential: adequate as a default that leaves a fresh box loggable, not for anything
+  reachable. Override either
   path to replace it — the operator deep-merges `spec.components.<name>.values` **last**, after
   catalog defaults and global injection.
+- **The one component the profile disables is `exporters.bmc`, and it is the only one that
+  *cannot* converge unattended.** It is driven entirely by the admin-owned Secret
+  `cubestack-bmc-credentials` in `monitoring` (keys `username`, `password`, `hosts`) — the
+  chart's `values.bmc.*` block is dead, `values` no longer configures it — and the operator
+  reads that Secret but never creates it. A missing or unusable one is a hard error, not a
+  skip: the component reports `Degraded`, that blocks the CR's `Ready` condition, and
+  `operator-wait` fails the run with `E_OPERATOR_COMPONENT_DEGRADED`. So it ships listed but
+  off, and turning it on is: create that Secret first (at least one BMC management IP —
+  both exporter pods exit at startup on an empty host list), then flip one line in the
+  manifest. `exporters.metax` looks similar but is not: it is a `patches` entry with the
+  catalog's `missingTarget: skip`, so on a cluster with no MetaX operator it reports
+  **`Skipped`** — counted nowhere, blocking nothing — and still reaches `Ready`.
 - **`operator-wait` then polls `status.conditions[type=Ready]`** every 30 s and reports
-  `ready=1 components=<n>/<n>`. A component the operator marks `Degraded` is observed **twice**
+  `ready=1 components=<n>/<n>`. The two numbers count only the components the operator reports as
+  `Ready`, `Provisioning`, `Pending` or `Degraded` — a component in the fifth phase, `Skipped`
+  (`exporters.metax` on a cluster with no MetaX operator), is counted in neither, which is what
+  keeps "nothing to do here" from inflating the total every wait would then never reach. A
+  component the operator marks `Degraded` is observed **twice**
   before it fails — a fresh rollout's first health check legitimately lands there for one cycle,
   and failing on first sight would report a healthy bring-up as broken. A Degraded component
   whose message names an image pull or an auth failure is `E_OPERATOR_IMAGE_PULL`

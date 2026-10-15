@@ -7,40 +7,85 @@
 # a reviewer can diff when the profile changes. `operator-wait` then polls this
 # object's status until Ready.
 #
+# THIS PROFILE MIRRORS THE CHART'S OWN DEFAULT. The operator chart ships a
+# sample `CubeStackCluster` as its `clusterCR.spec`
+# (`helm/cubestack-operator-chart/values.yaml`), and this file enables every
+# component that sample enables — twelve of the catalog's thirteen. Mirrored
+# from the chart at commit 083d444 (2026-10-15) and re-checked unchanged at
+# 90be297; the sample moved twice before that (`aiGateway` and
+# `exporters.metax` were flipped on by #41 and #46), which is the drift this
+# note exists to make visible.
+#
+# THE THREE DEVIATIONS FROM THAT SAMPLE:
+#
+#   * `global.imagePullPolicy` is `Always` rather than the sample's
+#     `IfNotPresent`; see the note under `global` below.
+#
+#   * `exporters.bmc` is DISABLED, and it is the only default-enabled component
+#     that CANNOT converge on a fresh box. It is driven entirely by the
+#     admin-owned Secret `cubestack-bmc-credentials` in `monitoring` (keys
+#     `username`, `password`, `hosts`) — the chart's `values.bmc.*` block is
+#     dead, `spec.components.exporters.bmc.values` no longer configures it — and
+#     the operator reads that Secret but never creates it. A missing or unusable
+#     one is a hard error (`readComponentSettings`), not a skip: the component
+#     reports Degraded, that blocks the CR's Ready condition, and `operator-wait`
+#     fails the whole run with E_OPERATOR_COMPONENT_DEGRADED. So it ships
+#     listed-but-off. To turn it on: create that Secret first (at least one BMC
+#     management IP is required — both exporter pods exit at startup on an empty
+#     host list), then flip the line below.
+#   * `deletePolicy` is `retain` rather than the sample's `uninstall`; see the
+#     bottom of this file.
+#
+# THE INSTALLER'S OWN CR IS NARROWER THAN THIS ONE, and `operator-up` ADOPTS it
+# where it exists. The deploy's `cubestack_operator` module installs the same
+# chart with `clusterCR.enabled` on, pinned to the chart defaults minus the same
+# `exporters.bmc` and minus `modelBundles` + `spec.bundles` (it clears both, on
+# the grounds that the bundles are inference profiles rather than platform
+# services). On such a box the adopted profile is what runs and this file is the
+# fallback — used only where the deploy installed no platform at all.
+#
 # The install order is the OPERATOR'S catalog order (each component's `order`
 # field), NOT the YAML order below — lws (10) and envoyGateway (20) come up
-# before cubestackControllerManager (30), which hard-depends on both.
+# before cubestackControllerManager (30), which hard-depends on both. Exactly one
+# dependency is enforced at run time: `modelBundles` (35) declares
+# `requires: cubestack-controller-manager` and goes Degraded — not Pending — if
+# that component is off.
 #
-# The five enabled:
-#   lws                          Leader Worker Set controller + its CRDs.
-#                                cubestack hard-depends on the LWS CRDs.
-#   envoyGateway                 Gateway API CRDs, the envoy-gateway control
-#                                plane, and the "gateway" GatewayClass.
-#   cubestackControllerManager   The platform workload operator.
-#   cubepilot                    The node/storage pilot.
-#   cubestackPortal              The web portal.
-#
-# aiGateway (the envoy AI Gateway controller + its CRDs, catalog order 21) is
-# the one component this profile disables, and it is the only one it COULD drop:
-# nothing depends on it. cubestackControllerManager hard-depends on lws and
-# envoyGateway, and aiGateway requires envoyGateway's data plane — but not the
-# reverse. Leaving it on buys the platform nothing it uses and costs an extra
-# controller, its CRDs and a chart pull on every bring-up.
-#
-# The entry is kept here, disabled, rather than deleted, so the profile reads as
-# a decision instead of an omission. `operator-up` still pre-creates
-# `ai-gateway-system` and stages the pull Secret into it, so turning it back on
-# is a one-line change and needs no other edit.
-#
-# A DISABLED COMPONENT DROPS OUT OF STATUS: the operator uninstalls whatever it
-# previously managed and reports only the enabled set. `operator-wait` derives
-# its total from the CR's status rather than a hardcoded count, so it polls five
-# here, not six — which is what makes this line safe to flip either way.
+# The twelve enabled, by catalog order:
+#   lws (10)                        Leader Worker Set controller + its CRDs.
+#                                   cubestack hard-depends on the LWS CRDs.
+#   envoyGateway (20)               Gateway API CRDs, the envoy-gateway control
+#                                   plane, and the "gateway" GatewayClass.
+#   aiGateway (21)                  Envoy AI Gateway controller + its CRDs.
+#                                   Needs envoyGateway's data plane — enforced
+#                                   as a `siblingValues` injection applied only
+#                                   while it is Ready, not as a `requires`.
+#   cubestackControllerManager (30) The platform workload operator + CRDs.
+#   modelBundles (35)               Applies the model catalog `spec.bundles`
+#                                   lists. No health checks — the objects are
+#                                   custom resources whose readiness belongs to
+#                                   the controller-manager — and no inference
+#                                   pods: a bundle's InferenceService ships as
+#                                   `isvc.example.yaml`, which the operator does
+#                                   not apply.
+#   prometheus (40)                 kube-prometheus-stack, Grafana included.
+#   perses (50)                     Perses dashboards.
+#   exporters.metax (65)            A PATCH, not a workload: it flips
+#                                   `dataExporter.deploy` on the vendor MetaX
+#                                   operator's ClusterOperator. Catalog
+#                                   `missingTarget: skip`, so on a cluster with
+#                                   no MetaX operator it reports Skipped and the
+#                                   cluster still reaches Ready.
+#   cuberouter (70)                 The model router.
+#   cubepilot (80)                  The node/storage pilot.
+#   cubestackPortal (90)            The web portal.
+#   observability (100)             The dashboards and service-monitors layer
+#                                   over prometheus, perses and grafana.
 #
 # `global` keeps the operator's own documented defaults — the same values its
-# sample CR and its image-preload test use — with ONE deliberate deviation:
-# imagePullPolicy, explained below. Nothing here is a per-run choice: the cluster
-# is expected to reach Harbor directly, so component images come from
+# sample CR uses — with ONE deliberate deviation: imagePullPolicy, explained
+# below. Nothing here is a per-run choice: the cluster is expected to reach
+# Harbor directly, so component images come from
 # `<imageRegistry>/<name>` and third-party images from the mirror prefix. That is
 # why this step changes no `images.manifest` and pushes nothing into the
 # in-cluster registry.
@@ -72,14 +117,66 @@ spec:
     imagePullSecrets:
       - harbor-credentials
     imagePullPolicy: Always
+  # The model catalog `modelBundles` applies. An EXACT list: removing a name
+  # deletes the objects that bundle's apply created (its
+  # InferenceRuntimeProfile, ModelVersion and ConfigMaps — each carries a
+  # `cubestack.io/bundle` label so they can be selected), and an empty list
+  # applies nothing rather than everything. An unknown name is an error, not a
+  # silent skip. This is the chart's own list.
+  bundles:
+    - metax-sglang-dsv4-pd
+    - metax-sglang-dsv4-pd-mooncake
+    - metax-sglang-h3
+    - metax-sglang-qwen-image21
+    - metax-vllm-dsv4-flash
+    - metax-vllm-dsv4-flash-pd
+    - metax-vllm-qwen3.8-27b
+    - metax-vllm-qwen3.8-27b-s3
   components:
     lws:
       enabled: true
     envoyGateway:
       enabled: true
     aiGateway:
-      enabled: false
+      enabled: true
     cubestackControllerManager:
+      enabled: true
+      # Hostname the published models are served under, and the chart's own
+      # default. It is load-bearing rather than cosmetic: with it empty the
+      # component omits --gateway-catalog-hostname, publishing stays off, and
+      # every InferenceService sits at RouteReady=False. Point it at a name your
+      # resolving infrastructure answers for — replace it here, or pass values
+      # over `spec.components.cubestackControllerManager.values` (the operator
+      # deep-merges those LAST, after catalog defaults and global injection).
+      values:
+        gateway:
+          catalogHostname: ai.cubestack.dev
+    prometheus:
+      enabled: true
+      # Also the chart's default. Grafana has no other account, so with this
+      # cleared the UI is left on whatever the subchart generates. A shared,
+      # publicly known value — a default that makes a fresh box loggable, not a
+      # credential for anything reachable.
+      values:
+        grafana:
+          adminPassword: "admin"
+    perses:
+      enabled: true
+    exporters:
+      # DISABLED, and the one component that cannot converge unattended: it is
+      # driven by the admin-owned Secret `cubestack-bmc-credentials` in
+      # `monitoring`, which the operator reads and never creates, and a missing
+      # one makes the component Degraded — which blocks the cluster's Ready and
+      # fails `operator-wait`. Kept here as a decision rather than an omission.
+      # See this file's header for how to turn it on.
+      bmc:
+        enabled: false
+      # No values: the component patches the vendor MetaX operator's
+      # cluster-scoped ClusterOperator to enable its data exporter, and reports
+      # Skipped where that operator is not installed.
+      metax:
+        enabled: true
+    cuberouter:
       enabled: true
     cubepilot:
       enabled: true
@@ -106,7 +203,14 @@ spec:
         secrets:
           htpasswd:
             content: 'admin:$2a$10$9/nTwyvmfwMdwc.OSsoZFe9gTfGfoCVdKIcSwcQWb6Qll7TmygG26'
+    observability:
+      enabled: true
+    modelBundles:
+      enabled: true
   # retain (the default) is stated rather than omitted: deleting this CR must
   # not take the platform down with it. `uninstall` removes the components;
-  # either way the operator keeps CRDs and PVCs.
+  # either way the operator keeps CRDs and PVCs. The chart's sample CR chooses
+  # `uninstall` — that is right for a chart-managed install, where the CR is
+  # part of the release and must go with it, and wrong here, where this CR is
+  # applied by hand and lives on after the run.
   deletePolicy: retain

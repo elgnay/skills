@@ -139,10 +139,10 @@ done
 # The default shape depends on the NODE COUNT, because a 1-node box is a
 # different machine from a member of a multi-node one. A single node carries the
 # control plane, the worker load AND every addon on the same VM - Rook/Ceph, the
-# in-cluster registry, MetalLB, and (on a cubestack box) five platform components
-# - where a multi-node box spreads them. The flat 8 vCPU / 24 GiB default was
-# sized for the multi-node case and left the 1-node box as the tightest shape
-# this skill builds.
+# in-cluster registry, MetalLB, and (on a cubestack box) twelve platform
+# components - where a multi-node box spreads them. The flat 8 vCPU / 24 GiB
+# default was sized for the multi-node case and left the 1-node box as the
+# tightest shape this skill builds.
 #
 # Empty means "the caller did not say", which is exactly what lets an explicit
 # --cp/--mem/--disk win: the flag fills the variable and the default is skipped.

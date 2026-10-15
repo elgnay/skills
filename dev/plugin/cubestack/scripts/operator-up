@@ -8,9 +8,9 @@
 #
 # TWO scripts, not one. Applying the CR is a ~30 s call that returns
 # immediately; the WORK is the operator's own 30 s requeue reconciling the
-# enabled components (five of the catalog's six — see the manifest), which is
-# structurally deploy + deploy-wait rather than
-# fetch-offline. Splitting them also means the long-running half (`operator-wait`)
+# enabled components (twelve of the catalog's thirteen — see the manifest),
+# which is structurally deploy + deploy-wait rather than fetch-offline.
+# Splitting them also means the long-running half (`operator-wait`)
 # holds no credential at all — it only reads the CR. This half is the one that
 # stages a credential, installs a chart and applies a manifest.
 #
@@ -36,8 +36,9 @@
 # TWO INSTALLERS, ONE PLATFORM -- this step ADOPTS what the deploy already did.
 # The installer's `cubestack_operator` module installs this same chart under
 # this same release name with the chart's optional `clusterCR` path ENABLED, so
-# its release manifest carries a CubeStackCluster of its own: nine components,
-# `deletePolicy: uninstall`, images from the in-cluster registry. On such a box
+# its release manifest carries a CubeStackCluster of its own: the chart's
+# defaults minus two, `deletePolicy: uninstall`, images from the in-cluster
+# registry. On such a box
 # an unconditional `helm upgrade ... --set clusterCR.enabled=false` is not an
 # install. Dropping the CR from the manifest makes helm PRUNE it, the operator
 # honours `deletePolicy: uninstall`, and the whole platform is torn down before
@@ -49,9 +50,11 @@
 # there MANAGES a CubeStackCluster and that CR is live, this step adopts it: no
 # helm upgrade, no CR apply, no Harbor credential at all -- just the roll. The
 # box keeps the platform the DEPLOY installed, which is the installer's intended
-# profile. The skill's own five-component manifest is applied only on a box
+# profile. The skill's own manifest is applied only on a box
 # whose deploy installed no platform (the pre-2026-10-12 shape, and what
-# cubestack7 is).
+# cubestack7 is). The two profiles are close but not identical: the deploy's CR
+# also clears `spec.bundles` and disables `modelBundles`, and this file's does
+# not. Whoever reads a box's component list should read the CR, not this file.
 #
 # `crmanaged` -- "does the release's CURRENT manifest contain a CubeStackCluster"
 # -- is the decisive bit and the only one consulted, because it names the single
@@ -88,18 +91,24 @@ CS_PULL_SECRET="harbor-credentials"
 # as ImagePullBackOff on the first component pod, which the CR reports as that
 # component Degraded and names no cause.
 #
-# Taken from the operator's catalog, not guessed: every component in the profile
-# pulls in one of these four namespaces (cubestack-controller-manager, cubepilot
-# and cubestack-portal share the operator's own cubestack-system).
-#
-# ai-gateway-system is staged even though the profile ships `aiGateway: disabled`
-# (lib/cubestack-cluster.yaml). The namespace is then simply empty and the Secret
-# unused, which costs nothing — and it is what keeps re-enabling aiGateway a
-# one-line change to the CR, rather than one that silently reintroduces the
-# ImagePullBackOff this whole block exists to prevent.
+# Taken from the operator's catalog, not guessed. Each component's `namespace`
+# field is fixed — no CR can move one — and the profile's twelve enabled
+# components land in exactly five namespaces: the operator's own cubestack-system
+# (which cubestack-controller-manager, cubepilot, cubestack-portal and
+# model-bundles share) plus these four. `monitoring` is shared by prometheus,
+# perses and observability; `cuberouter` holds cuberouter. Two catalog
+# namespaces are deliberately NOT here:
+#   * metax-operator — `exporters.metax` installs no workload. It is a patch of
+#     a cluster-scoped CR, so nothing in that namespace pulls an image, and the
+#     namespace itself belongs to the vendor MetaX operator
+#     (`createNamespace: false`).
+#   * the namespace of `exporters.bmc`, which is `monitoring` anyway — the
+#     component is disabled in the profile.
+# Pre-creating a namespace is safe: the operator's EnsureNamespace is a
+# server-side apply that merges its own labels into one that already exists.
 #
 # A component added to the manifest later must have its namespace added here.
-CS_COMPONENT_NS="lws-system envoy-gateway-system ai-gateway-system"
+CS_COMPONENT_NS="lws-system envoy-gateway-system ai-gateway-system monitoring cuberouter"
 CS_CR_NAME="cubestack"
 CS_CR_MANIFEST="$SELF_DIR/lib/cubestack-cluster.yaml"
 
@@ -131,9 +140,10 @@ operator-up [options]
 Pulls the operator chart from Harbor OCI, creates the image pull Secret in the
 operator and component namespaces, installs the chart, ROLLS the operator onto
 the chart's current image, applies scripts/lib/cubestack-cluster.yaml (which
-enables the catalog's five other components — lws, envoyGateway,
-cubestackControllerManager, cubepilot and cubestackPortal — with aiGateway
-shipped disabled), and writes the operator-applied stamp.
+enables twelve of the catalog's thirteen components — every one the operator
+chart enables in its own default CR, with `exporters.bmc` the exception, listed
+but disabled because it needs an admin-created Secret), and writes the
+operator-applied stamp.
 `operator-wait` then polls the CR to Ready.
 
 ADOPTS an existing platform instead of installing over it. The installer's own
@@ -269,7 +279,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   cs_note "  CR         $CR_NAME ($(basename "$CS_CR_MANIFEST"))"
   cs_note "  roll       deploy/$RELEASE in $OP_NS, onto whatever image the chart's"
   cs_note "             rolling :latest tag resolves to at run time (digest reported)"
-  cs_note "  components $(grep -c '^      enabled: true' "$CS_CR_MANIFEST" 2>/dev/null || echo '?') enabled in the manifest"
+  # Any indentation, not a fixed six spaces: `exporters.metax` sits one level
+  # deeper than the other components, so an anchored pattern silently under-counts
+  # the profile by one and the dry run reports eleven enabled where the CR ships
+  # twelve.
+  cs_note "  components $(grep -c '[[:space:]]enabled: true' "$CS_CR_MANIFEST" 2>/dev/null || echo '?') enabled in the manifest"
   cs_ok "dry_run=1" "chart=$VERSION" "release=$RELEASE" "namespace=$OP_NS" \
         "pull_secret=$PULL_SECRET" "cr=$CR_NAME" "ro_user=1"
 fi
@@ -510,9 +524,9 @@ if [ "$ADOPT" -eq 0 ]; then
   #
   # The Secret goes into EVERY namespace a component pod will run in, not just the
   # operator's own. kubelet reads imagePullSecrets only from the pod's own
-  # namespace, so the single cubestack-system copy would leave every lws, envoy and
-  # ai-gateway pod in ImagePullBackOff — and the CR would report it as that
-  # component Degraded, naming no cause.
+  # namespace, so the single cubestack-system copy would leave every lws, envoy,
+  # ai-gateway, monitoring and cuberouter pod in ImagePullBackOff — and the CR
+  # would report it as that component Degraded, naming no cause.
   #
   # The component namespaces are created HERE, before the operator would create
   # them itself. That is safe and not a race: the operator's EnsureNamespace
