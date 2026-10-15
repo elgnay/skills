@@ -261,6 +261,51 @@ NODES_WORKERS='worker,<hostname>,<ip>,ubuntu,-|worker,<hostname>,<ip>,ubuntu,-'
 Multi-node: the `NODES_MASTER` line plus that single `NODES_WORKERS` line. Single-node:
 omit `NODES_WORKERS` entirely — `NODES_MASTER` alone is the single master.
 
+#### Upstream DNS — detected for you, and the one that fails silently
+
+`cluster.conf` ships `UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-127.0.0.1}"`. That variable
+is kubespray's `upstream_dns_servers`, and there it has exactly one job: the **external** zone
+of nodelocaldns (`roles/kubernetes-apps/ansible/tasks/main.yml:71` renders `upstreamForwardTarget`
+from it, and `nodelocaldns-config.yml.j2` puts it in `forward .`). So a pod's public lookups
+terminate at whatever it holds. `127.0.0.1` is a **deliberate anti-loop sentinel**, not a real
+resolver: with it empty, kubespray renders `forward . /etc/resolv.conf`, which closes the loop
+nodelocaldns → node resolv → systemd-resolved → nodelocaldns, and coredns's `loop` plugin FATALs
+the ClusterDNS until it is reverted (the installer's own 2026-10-08 incident, 18+ CrashLoopBackOff).
+
+The cost of that sentinel is the point of this section: **nothing on a node is broken.** The node
+resolves through its own resolvers, cluster-internal names are answered by coredns either way, and
+every verdict stays green — while *every pod* fails *every* name outside the cluster. It surfaces
+much later, as one component that cannot reach something.
+
+**The run handles it.** Step 3's `env-probe` reads the resolvers the VMs themselves use — while
+they are still stock, because once the install lands the VM's own resolver *is* the thing being
+configured (nodelocaldns at `169.254.25.10`) — and records them in `run.env`; Step 4's `configure`
+injects them into the config. The verdict says which happened: `dns=<csv>` (or `dns=none`) at
+Step 3, `dns=detected|values|default` at Step 4. Nothing needs editing inside the pod, and nothing
+is asked of the user.
+
+Two rules govern the automatic value, and both are there to keep a guess from being worse than
+the sentinel:
+
+- An address is adopted only from a VM that **resolved a public name with it**. A real but
+  unreachable resolver is worse than the sentinel: `127.0.0.1` is refused instantly, so a lookup
+  fails fast, while a black-holed address makes the same lookup hang for the forward timeout. If
+  resolvers are found but no VM confirmed them, `env-probe` says so on its note line and keeps the
+  sentinel. An **offline site** is the case this exists for.
+- The value is **IPs only** — it lands in a Corefile `forward` directive. A hostname or a typo is
+  refused by the rewriter (exit 15 → `E_CONF_VALUES_MISSING`, `fix-values:` naming this key)
+  rather than producing a Corefile nodelocaldns will not load.
+
+To override the detection, put the key in the values file — a key in the file always beats
+`run.env`, the same precedence `SERVICE_EXPOSE_MODE` and `METALLB_POOL` follow:
+
+```
+UPSTREAM_DNS_SERVERS='223.5.5.5 8.8.8.8'      # space-separated IPs; needs all of them reachable
+```
+
+Reach for it when the VMs have no usable resolver of their own, or when the detection found the
+wrong one — a site whose DNS is a local `10.x` server the VMs do not use, say.
+
 #### The Harbor robot credential (a second file)
 
 Step 7 pulls the operator chart from Harbor and the operator pulls every component image
@@ -1034,6 +1079,13 @@ One call covers, in fixed order: pod exec, `sshpass` (installing it if missing),
 the verdict reports `checked=<n>` so "0 of 3 probes ran" can never look like OK. On success
 it writes the `env-ok` stamp.
 
+It also **detects** (it does not check) the VMs' own upstream resolvers and records them in
+`run.env` for Step 4 to inject — the `dns=<csv>` (or `dns=none`) pair on the verdict line
+says what it found. See *Upstream DNS* under the values file for why the shipped default is
+a silent, cluster-wide pod failure; nothing about it is asked of the user, and the only
+reason to care here is that `dns=none` on a **not-offline** site is worth a word to the user
+before the deploy.
+
 A VM that rejects password auth is `E_SSH_AUTH` → `sibling-vm:rebuild:<names>` (it was
 created by this run). Do not SSH-debug it yourself.
 
@@ -1058,6 +1110,11 @@ author nor edit it.
 > which re-opens the collision the reservation closes. A metallb run with **no** pool fails here as
 > `E_VIP_POOL_MISSING` → `rerun:reserve-vips` (Step 1b), rather than at the rewriter twenty minutes
 > into the deploy.
+>
+> **`UPSTREAM_DNS_SERVERS` follows the same shape**, filling from what Step 3 detected. It is the
+> one injected key that is *optional*: with neither source holding a value, `cluster.conf` keeps its
+> `127.0.0.1` sentinel and the verdict reports `dns=default`. Unlike an empty MetalLB pool that is
+> the right answer rather than a missing one — see *Upstream DNS* under the values file.
 
 When Step 0 was given `--external-ceph-env`, `configure` also places that file — it reads the
 path from the run dir, so **you do not pass it again** — and hash-verifies the copy. It is left

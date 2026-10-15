@@ -23,11 +23,14 @@ Exit codes (mapped to failure codes by scripts/configure):
     14  the in-cluster registry left with no storage backend:
         REGISTRY_ENABLED on, LOCAL_PATH_ENABLED=false and no Ceph
                                                              -> E_CONF_VALUES_MISSING
+    15  UPSTREAM_DNS_SERVERS holds something that is not an IP address
+                                                             -> E_CONF_VALUES_MISSING
     1   anything else                                        -> E_CONF_FIELD_MISSING
 
 Never prints a value: only key names, and only as a "set" list.
 """
 
+import ipaddress
 import os
 import re
 import sys
@@ -37,11 +40,25 @@ EXIT_MISSING_KEYS = 11
 EXIT_CEPHFS_INCOMPLETE = 12
 EXIT_NO_NODES = 13
 EXIT_REGISTRY_NO_STORAGE = 14
+EXIT_BAD_UPSTREAM_DNS = 15
 
 
 def truthy(value):
     """Installer truthiness: deploy-registry.sh accepts 1/true/yes/on."""
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_ip(token):
+    """True for an IPv4 or IPv6 literal.
+
+    Deliberately not socket.inet_aton, which accepts the shorthand forms
+    (``1.2.3`` meaning ``1.2.0.3``) that a ``forward`` directive does not.
+    """
+    try:
+        ipaddress.ip_address(token)
+    except ValueError:
+        return False
+    return True
 
 
 def fail(code, message):
@@ -175,6 +192,45 @@ def main():
         if env(key):
             subst(key, env(key))
             applied.append(key)
+
+    # --- nodelocaldns upstream resolvers (opt-in: only when supplied) -------
+    #
+    # cluster.conf ships `UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-127.0.0.1}"`.
+    # That variable is kubespray's `upstream_dns_servers`, and its ONE job there is
+    # the external zone of nodelocaldns: tasks/main.yml:71 renders
+    # `upstreamForwardTarget` as the list when non-empty and `/etc/resolv.conf`
+    # when not, and nodelocaldns-config.yml.j2 puts it in `forward .`. So a pod's
+    # public lookups terminate at whatever this holds — and the shipped 127.0.0.1
+    # terminates them at a loopback port with nothing on it. (It is also
+    # systemd-resolved's FallbackDNS, resolved.conf.j2:5.) Cluster-internal names
+    # are unaffected either way, which is what makes the failure so quiet: only
+    # names that leave the cluster fail.
+    #
+    # Substituted as a LITERAL, not left as an indirection, for the addon toggles'
+    # reason: the `:-` default resolves at DEPLOY time, in a different process from
+    # the one that sources the values file, so a resolver exported by `configure`
+    # into this rewriter would simply be gone by then and the sentinel would win.
+    #
+    # "Not supplied" therefore leaves the sentinel alone — and that is the correct
+    # fallback rather than a nicety, because an EMPTY upstream is the one case the
+    # sentinel exists to prevent: it renders `forward . /etc/resolv.conf`, i.e.
+    # nodelocaldns -> node resolv -> systemd-resolved -> nodelocaldns, and
+    # coredns's `loop` plugin FATALs the ClusterDNS until it is reverted.
+    #
+    # IPs only: these land in a Corefile `forward` directive, so a hostname or
+    # typo would produce a Corefile nodelocaldns refuses to load — a cluster-wide
+    # DNS outage twelve minutes into a deploy, from a value nothing validated.
+    upstream_dns = env("UPSTREAM_DNS_SERVERS").split()
+    if upstream_dns:
+        bad = [token for token in upstream_dns if not is_ip(token)]
+        if bad:
+            fail(
+                EXIT_BAD_UPSTREAM_DNS,
+                "UPSTREAM_DNS_SERVERS must be a space-separated list of IP "
+                "addresses; got: %s" % " ".join(bad),
+            )
+        subst("UPSTREAM_DNS_SERVERS", " ".join(upstream_dns))
+        applied.append("UPSTREAM_DNS_SERVERS")
 
     # --- Addon toggles (opt-in: only when named in the values file) ---------
     #

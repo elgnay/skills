@@ -14,9 +14,25 @@
 #   2. sshpass present (install if missing) .. E_SSHPASS_INSTALL rerun:env-probe
 #   3. VM TCP port 22 ....................... E_SSH_TCP        sibling-vm:rebuild:<names>
 #   4. password SSH as the given user ....... E_SSH_AUTH       sibling-vm:rebuild:<names>
+#   4b. upstream DNS (DETECTED, never a check) — see below
 #   5. MinIO TCP ............................ E_MINIO_UNREACHABLE stop-report:admin
 #   6. Harbor DNS then port 443 ............. E_HARBOR_DNS / E_HARBOR_UNREACHABLE
 #                                                            stop-report:admin
+#
+# Class 4b is the one entry here that is not a check. `cluster.conf` ships
+# UPSTREAM_DNS_SERVERS=127.0.0.1, which kubespray writes into nodelocaldns as the
+# forwarder for everything outside the cluster — a loopback port with nothing on
+# it. The nodes keep resolving (they use their own resolvers via
+# systemd-resolved) while every POD silently fails every public lookup, so the
+# failure is invisible until something downstream needs a public name. The value
+# has to be the resolvers the VMs themselves use, and the only reliable moment to
+# read them is NOW: once the install lands, the VM's own resolver IS the thing
+# being configured (nodelocaldns at 169.254.25.10), so the address is gone. So it
+# is detected here, recorded in run.env, and injected by `configure`. It is
+# recorded even when detection finds nothing (as an empty value), because run.env
+# deliberately survives a re-provisioned box and a stale address from a previous
+# VM set is worse than no address at all. See the block itself for why an address
+# is only adopted once a VM has resolved a public name with it.
 #
 # Within a class the probes BATCH: two of three VMs failing SSH is one verdict
 # naming both (`vms=a,b`), because the recovery acts on the set. Fail fast on
@@ -50,6 +66,14 @@ env-probe --vms a@IP,b@IP [options]
 Checks, in this order: pod exec, sshpass, VM port 22, password SSH, MinIO,
 Harbor. On success writes the env-ok stamp; the verdict reports how many probes
 ran so "0 of 3" can never look like OK.
+
+It also DETECTS, rather than checks, the VMs' own upstream resolvers and records
+them as UPSTREAM_DNS_SERVERS in run.env for `configure` to inject into
+cluster.conf (the shipped 127.0.0.1 makes nodelocaldns forward public names at a
+dead loopback port, which breaks DNS for every pod while the nodes stay fine).
+An address is adopted only if a VM resolved a public name with it; anything found
+but unconfirmed is reported, not used. The verdict carries dns=<csv> or
+dns=none, and a values file that sets the key overrides all of it.
 USAGE
 }
 
@@ -258,6 +282,117 @@ if [ -n "$BAD_SSH" ]; then
 fi
 CHECKED=$((CHECKED + VM_COUNT))
 
+# --- 4b. upstream DNS (detection, not a check) ------------------------------
+# Read the resolvers the VMs themselves use, while they are still stock. Two
+# sources, because either can be the real one: `resolvectl dns` when
+# systemd-resolved is running, and /etc/resolv.conf for the images where
+# cloud-init wrote the nameservers straight into it.
+#
+# The remote command is wrapped in SINGLE quotes on purpose: it goes into a
+# double-quoted `bash -c` locally and then into another `bash -c` inside the
+# pod, so without them the `;` would split at the POD and only the first command
+# would ever reach the VM. Single quotes survive both levels literally and ssh
+# hands the whole string to the remote shell as one command. That is also why
+# the string below contains no `$`, backtick or backslash — the local shell
+# would expand those before they were ever sent.
+#
+# The same round trip also asks the VM to actually RESOLVE a public name with
+# whatever it just reported. That is not decoration: a real-but-unreachable
+# upstream is WORSE than the shipped sentinel. `forward . 127.0.0.1` is refused
+# instantly, so a pod's public lookup fails fast; a dead external address is
+# black-holed, so the same lookup hangs for the forward timeout instead — and
+# that is what an offline site would get if this were adopted on sight. So the
+# detection is only TRUSTED for a VM that demonstrably resolved. (www.baidu.com
+# is the probe because this platform is deployed in China and it is resolvable
+# from the public resolvers the VMs are given; it only gates the automatic
+# value, never a value supplied in the values file.)
+DNS_CMD="'resolvectl dns 2>/dev/null; cat /etc/resolv.conf 2>/dev/null; timeout 4 getent hosts www.baidu.com >/dev/null 2>&1 && echo CS_DNS_RESOLVES; echo CS_DNS_DONE'"
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  vip="$(printf '%s' "$VM_IPS" | cut -d, -f"$idx")"
+  ( out="$(cs_probe_ssh "$vip" "$SSH_USER" "$SSH_PW" 3 "$DNS_CMD")"
+    # `out` carries ssh's own stderr, and the known-hosts Warning names the VM's
+    # address — which the generic IPv4 scan below would happily read back as an
+    # "upstream resolver". Drop the warning lines and the VM's own address: a VM
+    # is never its own resolver.
+    printf '%s\n' "$out" \
+      | grep -vE '^(Warning:|$)' \
+      | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' \
+      | awk -F. 'NF==4 && $1<=255 && $2<=255 && $3<=255 && $4<=255 {print}' \
+      | grep -Ev '^(127\.|169\.254\.|0\.|255\.)' \
+      | grep -Fvx "$vip" \
+      | sort -u > "$TMPD/dns.$idx"
+    case "$out" in
+      *CS_DNS_RESOLVES*) printf 'yes\n' > "$TMPD/dnsq.$idx" ;;
+      *)                 printf 'no\n'  > "$TMPD/dnsq.$idx" ;;
+    esac ) &
+done
+set +f; IFS="$OLDIFS"
+wait
+# Union across the VMs that CONFIRMED, in VM order (first VM's first address
+# leads) so a run's recorded value is stable for a given VM set rather than
+# sort-dependent. DNS_SEEN keeps everything found, confirmed or not, purely so
+# the note line can name addresses the operator may want to set by hand.
+#
+# SPACE-separated, not comma: that is the installer's own format for this key
+# (cluster.conf.example documents "10.66.2.1 223.5.5.5", and
+# sync-kubespray-config.sh turns spaces into the YAML list separator). A
+# comma-joined value survives that tool by accident, so getting it wrong here
+# would look right until something else parsed it.
+UPSTREAM_DNS=""
+DNS_SEEN=""
+idx=0
+IFS=,; set -f
+for vname in $VM_NAMES; do
+  idx=$((idx + 1))
+  f="$TMPD/dns.$idx"
+  [ -f "$f" ] || continue
+  confirmed=no
+  [ "$(cat "$TMPD/dnsq.$idx" 2>/dev/null)" = yes ] && confirmed=yes
+  while read -r addr; do
+    [ -n "$addr" ] || continue
+    case " $DNS_SEEN " in
+      *" $addr "*) ;;
+      *) DNS_SEEN="$DNS_SEEN${DNS_SEEN:+ }$addr" ;;
+    esac
+    [ "$confirmed" = yes ] || continue
+    case " $UPSTREAM_DNS " in
+      *" $addr "*) ;;
+      *) UPSTREAM_DNS="$UPSTREAM_DNS${UPSTREAM_DNS:+ }$addr" ;;
+    esac
+  done < "$f"
+done
+set +f; IFS="$OLDIFS"
+# Recorded UNCONDITIONALLY, empty included: run.env survives a re-provisioned
+# box by design, so not writing here would leave a previous VM set's resolvers
+# in place for a box that never confirmed them.
+cs_run_env_put "UPSTREAM_DNS_SERVERS=$(cs_q "$UPSTREAM_DNS")"
+if [ -z "$UPSTREAM_DNS" ]; then
+  # Not fatal — a values file can still supply it, and the installer's 127.0.0.1
+  # default is the status quo rather than a new breakage. But it IS the silent
+  # one, so say it out loud on the note line, and name what was found when the
+  # reason was "found, but this VM could not resolve with it".
+  if [ -n "$DNS_SEEN" ]; then
+    cs_note "resolvers $DNS_SEEN were read from the VMs, but no VM resolved a public" \
+            "name with them, so none is recorded: a dead upstream HANGS pod lookups" \
+            "where the 127.0.0.1 sentinel fails them fast. If they are right anyway," \
+            "set UPSTREAM_DNS_SERVERS in the values file."
+  else
+    cs_note "no upstream resolver found on the VMs, so none is recorded and the" \
+            "shipped 127.0.0.1 sentinel will stand unless the values file sets" \
+            "UPSTREAM_DNS_SERVERS — with it, every public lookup made from a pod" \
+            "fails (cluster-internal names are unaffected)."
+  fi
+fi
+CHECKED=$((CHECKED + VM_COUNT))
+# The verdict carries one token per k=v pair, so the space-separated value is
+# rendered comma-separated for the LINE only; run.env and cluster.conf keep the
+# installer's space-separated form.
+DNS_VERDICT=""
+[ -n "$UPSTREAM_DNS" ] && DNS_VERDICT="${UPSTREAM_DNS// /,}"
+
 # --- 5. MinIO ---------------------------------------------------------------
 if ! cs_probe_tcp "$MINIO_IP" "$MINIO_PORT" 3; then
   cs_fail E_MINIO_UNREACHABLE "minio=$MINIO_IP:$MINIO_PORT" recover=stop-report:admin \
@@ -304,4 +439,5 @@ PW_PRESENCE="absent"
 VMSET_DIGEST="$(digest_of "$VMS|$SSH_USER|$PW_PRESENCE")"
 cs_stamp_write env-ok "vms_digest=$VMSET_DIGEST user=$SSH_USER password=$PW_PRESENCE vms=$VM_COUNT sshpass=$SSHPASS_STATE"
 
-cs_ok "checked=$CHECKED" "sshpass=$SSHPASS_STATE" "vms=$VM_COUNT" "minio=ok" "harbor=ok"
+cs_ok "checked=$CHECKED" "sshpass=$SSHPASS_STATE" "vms=$VM_COUNT" "minio=ok" "harbor=ok" \
+  "dns=${DNS_VERDICT:-none}"

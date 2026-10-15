@@ -270,14 +270,40 @@ cs_probe_tcp() {
 }
 
 # Password SSH from inside the pod. $1 = ip, $2 = user, $3 = password,
-# $4 = attempts. Prints the remote hostname on success.
+# $4 = attempts, $5 = remote command (default `hostname`). Prints the remote
+# command's output on success.
 cs_probe_ssh() {
-  local ip="$1" user="$2" pw="$3" attempts="${4:-3}" i=0 out
+  # $5 is the remote command, defaulting to `hostname` — every caller that
+  # predates it passes 4 arguments and is unaffected.
+  #
+  # Two rules for a multi-word command, both from the two `bash -c` levels it
+  # crosses (the local one and the pod's) before ssh sees it:
+  #   * Wrap it in single quotes, as the one caller that uses it does. Without
+  #     them a `;` or `&&` splits the string at the POD, so only the first
+  #     command runs over ssh and the rest runs on the pod.
+  #   * No `$`, backtick or backslash inside it, and no single quote either
+  #     (it is already inside a pair) — the LOCAL shell expands or unbalances
+  #     those before the string is sent.
+  #
+  # `UserKnownHostsFile=/dev/null` is not cosmetic and is NOT implied by
+  # `StrictHostKeyChecking=no`, which sounds like it should cover this. Verified
+  # against a really-changed key: ssh reports `REMOTE HOST IDENTIFICATION HAS
+  # CHANGED`, then disables *password* authentication outright ("to avoid
+  # man-in-the-middle attacks") and the probe fails as if the credential were
+  # wrong. The pod keeps a known_hosts for its whole life, so the one way to hit
+  # that is the one this skill recommends: a VM rebuilt under the same name —
+  # `recover=sibling-vm:rebuild` — takes its old address back (the pool
+  # allocator hands out the lowest free one), and the stale key then fails a VM
+  # that is perfectly healthy, reporting E_SSH_AUTH and pointing recovery at
+  # another rebuild. Not recording a host key at all is what makes the probe
+  # idempotent across a rebuild.
+  local ip="$1" user="$2" pw="$3" attempts="${4:-3}" cmd="${5:-hostname}" i=0 out
   while [ "$i" -lt "$attempts" ]; do
     out="$(cs_pod_exec "$CS_POD" bash -c \
-      "sshpass -p '$pw' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+      "sshpass -p '$pw' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -o ConnectTimeout=8 \
          -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-         ${user}@${ip} hostname" 2>/dev/null)"
+         ${user}@${ip} ${cmd}" 2>/dev/null)"
     case "$out" in
       ''|*'Permission denied'*|*'Connection refused'*|*'timed out'*|*'No route to host'*) ;;
       *) printf '%s' "$out"; return 0 ;;
@@ -345,6 +371,7 @@ cs_rfc3339_epoch() {
 CS_VALUES_ALLOWED="SSH_PW MINIO_EP MINIO_AK MINIO_SK NODES_MASTER NODES_WORKERS \
 METALLB_POOL REGISTRY_IP SERVICE_EXPOSE_MODE METALLB_ENABLED \
 LOCAL_PATH_ENABLED REGISTRY_ENABLED \
+UPSTREAM_DNS_SERVERS \
 K8S_ENABLED KUBE_VIP_ENABLED LWS_ENABLED NETSHOOT_ENABLED \
 RDMA_ENABLED GPU_OPERATOR_ENABLED MULTUS_ENABLED \
 CEPH_MODE CEPH_EXTERNAL_PROVISION_SMOKE CEPH_MONITORS CEPH_KEYRING CEPH_POOL CEPH_USER \

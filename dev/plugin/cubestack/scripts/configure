@@ -178,6 +178,38 @@ if [ "$EXPOSE_MODE" != "nodeport" ] && [ -n "$METALLB_POOL_EFF" ]; then
   esac
 fi
 
+# --- upstream DNS -----------------------------------------------------------
+# Same precedence shape, and for the same reason: cluster.conf ships
+# UPSTREAM_DNS_SERVERS=127.0.0.1, which kubespray hands to nodelocaldns as the
+# forwarder for every name outside the cluster. Nothing listens on a node's
+# loopback :53, so pods fail every public lookup while the nodes — which use
+# their own resolvers — stay perfectly healthy. `env-probe` reads the VMs' real
+# resolvers while they are still stock and records them in run.env; that is the
+# value that lands here.
+#
+# Left EMPTY (not defaulted) when neither source has one: the installer's `:-`
+# expansion then keeps 127.0.0.1, so an undetectable resolver reproduces the
+# documented default rather than writing an empty list, which would render as
+# `forward . /etc/resolv.conf` and send coredns into the resolve.conf →
+# systemd-resolved → nodelocaldns loop its `loop` plugin FATALs on.
+UPSTREAM_DNS_EFF=""
+case " ${CS_VALUES_KEYS} " in
+  *" UPSTREAM_DNS_SERVERS "*) UPSTREAM_DNS_EFF="$(sed -n "s/^UPSTREAM_DNS_SERVERS='\([^']*\)'\$/\1/p" "$VALUES" | head -1)" ;;
+esac
+UPSTREAM_DNS_SRC="values"
+if [ -z "$UPSTREAM_DNS_EFF" ]; then
+  UPSTREAM_DNS_EFF="$(cs_run_env_get UPSTREAM_DNS_SERVERS)"
+  UPSTREAM_DNS_SRC="detected"
+fi
+if [ -n "$UPSTREAM_DNS_EFF" ]; then
+  case " ${CS_VALUES_KEYS} " in
+    *" UPSTREAM_DNS_SERVERS "*) ;;
+    *) INJECT="$INJECT UPSTREAM_DNS_SERVERS='$UPSTREAM_DNS_EFF'" ;;
+  esac
+else
+  UPSTREAM_DNS_SRC="default"
+fi
+
 # --- budget -----------------------------------------------------------------
 # Deliberately AFTER the validation above, for the same reason pod-up validates
 # its subnet first: a rejected input file cannot be fixed by re-invoking, so
@@ -210,8 +242,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   cs_note "  values     $VALUES"
   cs_note "  keys       ${CS_VALUES_KEYS# }"
   cs_note "  ext env    ${EXT_ENV:-none}${EXT_ENV:+ -> $CONF_DIR/$CEPH_ENV_DEST}"
+  cs_note "  dns        ${UPSTREAM_DNS_EFF:-none} [$UPSTREAM_DNS_SRC]"
   cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD" \
-        "ext_env=$EXT_ENV_FLAG"
+        "ext_env=$EXT_ENV_FLAG" "dns=$UPSTREAM_DNS_SRC"
 fi
 
 # Regenerate in place; seed from the example ONLY when absent. Re-copying the
@@ -308,6 +341,13 @@ case "$rc" in
       # through the uppercase-only sanitizer and hand back a garbled verb.
       cs_fail E_CONF_VALUES_MISSING "conf=$CONF_NAME" \
         recover="fix-values:$VALUES:REGISTRY_ENABLED,LOCAL_PATH_ENABLED" \
+        hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
+  15) # A malformed resolver. Its own branch for branch-14's reason (no "missing:"
+      # list), and one more: the key to fix is a single known key, and when it
+      # came from DETECTION rather than the values file the fix is to write the
+      # key, not to edit an existing one — so naming it is the whole message.
+      cs_fail E_CONF_VALUES_MISSING "conf=$CONF_NAME" \
+        recover="fix-values:$VALUES:UPSTREAM_DNS_SERVERS" \
         hint="$(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-120)" ;;
   *) cs_fail E_INTERNAL "rc=$rc" recover=stop-report:user \
           hint="rewriter failed: $(printf '%s' "$out" | grep -m1 '^FAIL:' | cut -c1-100)" ;;
@@ -450,6 +490,17 @@ cs_stamp_write conf-ok "$CONF_NAME"
 cs_note "applied: $applied"
 cs_note "byte-gate: clean (no *** artifacts)"
 [ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
+if [ "$UPSTREAM_DNS_SRC" = default ]; then
+  # Scoped to "first configure" on purpose: an injection is what puts a value IN
+  # cluster.conf, so with nothing to inject the file is left exactly as it was —
+  # the shipped 127.0.0.1 on a fresh run, a previous run's resolvers otherwise.
+  # Claiming the sentinel outright would be a false alarm on the re-configure
+  # path, which reaches here whenever env-probe ran again after the deploy (the
+  # VMs then resolve through nodelocaldns itself, which the detection filters).
+  cs_note "upstream DNS: nothing from the values file or env-probe; cluster.conf is left unchanged — on a first configure that is the shipped 127.0.0.1, which fails every public lookup made from a pod"
+else
+  cs_note "upstream DNS: $UPSTREAM_DNS_EFF [$UPSTREAM_DNS_SRC]"
+fi
 cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
       "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ" "registry=$REGISTRY_REQ" \
-      "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ"
+      "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ" "dns=$UPSTREAM_DNS_SRC"
