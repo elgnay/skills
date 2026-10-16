@@ -120,15 +120,19 @@ through Steps 1–7 **without further approval or prompting**.
 | Harbor (platform) | `harbor.isuanova.com` — projects `suanova-private` (**private**: the operator chart), `suanova` (component images), `mirrors` (external images). Both of the latter answer anonymously, so only `suanova-private` strictly needs the credential |
 | MinIO (offline pkgs) | endpoint `http://192.168.16.6:9000`, access key `admin`, secret key `Suanova@123`, bucket `cubestack-installer`, dir `offline-files` |
 
-> **This document is aligned to the installer source at commit `1748dbe` (2026-09-28),** the
-> tree at `~/workspaces/suanova/cubestack-installer`. `:latest` is a **mutable tag** and the
-> image is not the repo, so the tag alone guarantees nothing about which of the statements below
-> still hold. Before trusting any profile claim here, check what the pod actually carries:
+> **This document is aligned to the installer *image*, not to a commit on `main`.** The image
+> exercised on 2026-10-16 (`cubestack4`) was built from branch **`optimize-online-offline`**, which
+> introduced the config split at `4df206b` (2026-10-15). `main` — at `1783137` (2026-10-13), which
+> is also what the checkout at `~/workspaces/suanova/cubestack-installer` tracks — **lags that
+> image and does not contain the split at all** (see "The config is two layers"). The checkout is
+> therefore *not* a reference for the current build, and `:latest` is a **mutable tag** besides, so
+> the tag alone guarantees nothing about which of the statements below still hold. Before trusting
+> any profile claim here, check what the pod actually carries:
 >
 > ```bash
+> kubectl exec <pod> -- ls deployments/config/   # is cluster.defaults.conf there? -> the split era
 > kubectl exec <pod> -- ls deployments/scripts/modules/03_addon/          # which modules exist
 > kubectl get pod <pod> -o jsonpath='{.status.containerStatuses[0].imageID}'   # which digest
-> kubectl exec <pod> -- grep -n 'ENVOY_GATEWAY_ENABLED\|K8S_ENABLED' deployments/config/cluster.conf.example
 > ```
 >
 > The failure mode this guards against is not a crash — it is a **green run against an installer
@@ -136,6 +140,12 @@ through Steps 1–7 **without further approval or prompting**.
 > `source` with no unknown-key validation, so config for a removed module is written, accepted
 > and ignored, and every verdict stays `OK`. See "Components the installer no longer ships"
 > under the values file.
+>
+> The config split produced the **inverse** failure too, and that is the one that actually bit: a
+> key the installer had merely *relocated* looked exactly like a key it had *deleted*, so the
+> rewriter failed loudly on a key that was still live — a **false red** (`E_CONF_FIELD_MISSING`,
+> `recover=stop-report:user`) rather than a silent green. Both directions are settled by the rule
+> in "The config is two layers".
 
 > **MinIO credentials ARE in this file — deliberately** (the row above). They are the
 > documented default: pass the endpoint to `preflight --minio-ep`, and put `admin` /
@@ -173,7 +183,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | # | Prerequisite | Default |
 |---|---|---|
 | 1 | Number of nodes | `1` |
-| 2 | VM shape | **24 vCPU / 64 GiB RAM / 200 GiB root on a 1-node box**; 8 vCPU / 24 GiB / **100 GiB root** per VM on multi-node. The default scales with the node count because a single node carries the control plane, the worker load *and* every addon (Rook/Ceph, the registry, MetalLB, twelve platform components) on one VM. `--cp` / `--mem` / `--disk` override it |
+| 2 | VM shape | **24 vCPU / 64 GiB RAM / 200 GiB root on a 1-node box**; 8 vCPU / 24 GiB / **100 GiB root** per VM on multi-node. The default scales with the node count because a single node carries the control plane, the worker load *and* every addon (Rook/Ceph, the registry, MetalLB, the platform components) on one VM. `--cp` / `--mem` / `--disk` override it |
 | 3 | Subnet | auto-selected (most capacity); NAD follows |
 | 4 | VM owner label | `owner=$USER` |
 | 5 | SSH password | `ubuntu` |
@@ -263,7 +273,9 @@ omit `NODES_WORKERS` entirely — `NODES_MASTER` alone is the single master.
 
 #### Upstream DNS — detected for you, and the one that fails silently
 
-`cluster.conf` ships `UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-127.0.0.1}"`. That variable
+The installer ships `UPSTREAM_DNS_SERVERS="${UPSTREAM_DNS_SERVERS:-127.0.0.1}"` — in the
+**defaults layer**, not in `cluster.conf.example`, since the 2026-10-15 split (see "The config is
+two layers" below). That variable
 is kubespray's `upstream_dns_servers`, and there it has exactly one job: the **external** zone
 of nodelocaldns (`roles/kubernetes-apps/ansible/tasks/main.yml:71` renders `upstreamForwardTarget`
 from it, and `nodelocaldns-config.yml.j2` puts it in `forward .`). So a pod's public lookups
@@ -283,6 +295,12 @@ configured (nodelocaldns at `169.254.25.10`) — and records them in `run.env`; 
 injects them into the config. The verdict says which happened: `dns=<csv>` (or `dns=none`) at
 Step 3, `dns=detected|values|default` at Step 4. Nothing needs editing inside the pod, and nothing
 is asked of the user.
+
+**Proven on hardware.** `cubestack4` (2026-10-16) is the first run where the whole chain is
+observed end to end: Step 3 found the VMs' resolvers, Step 4 reported `dns=detected` in
+`configure`'s verdict, and the value landed in `cluster.conf` — which is precisely the half that
+would have failed *silently* had the rewriter still been treating a relocated key as a removed
+one. `dns=default` in that verdict is the tell that the `127.0.0.1` sentinel won.
 
 Two rules govern the automatic value, and both are there to keep a guess from being worse than
 the sentinel:
@@ -342,11 +360,75 @@ If the account has **2FA enabled**, the password is the **CLI Secret** from the 
 profile, not the account's login password — a login password authenticates to the web UI and
 fails against the registry.
 
+#### The config is two layers, and "absent" does not mean "removed"
+
+Since the 2026-10-15 build (branch `optimize-online-offline`) the installer's config is **two
+files** in `deployments/config/`:
+
+| file | what it holds |
+|---|---|
+| `cluster.conf.example` | the main layer — the keys a run is expected to set (124 lines) |
+| `cluster.defaults.conf` | the advanced / defaults layer — ~200 keys, shipped as `KEY="${KEY:-…}"` (408 lines) |
+
+`load_config` sources the defaults layer **unconditionally**, after `cluster.conf`; the example's
+own header states the precedence outright: `环境变量 > cluster.conf > cluster.defaults.conf`.
+Because the defaults layer defers with `${KEY:-…}`, a literal written into `cluster.conf` wins
+either way — no value depends on the ordering.
+
+**`deployments/scripts/tools/check-modules.sh` enforces that the two layers declare DISJOINT key
+sets** (its check ⑦, `配置双层无同名声明`). That one rule is what produces the trap: a key
+*relocated* from the example into the defaults layer then looks **identical** to a key that was
+*deleted*.
+
+Those two are not the same, and the rewriter resolves the ambiguity rather than guessing:
+
+| where the key is | verdict |
+|---|---|
+| in the example's live section | rewritten in place |
+| **not** in the example, but declared in `cluster.defaults.conf` | **relocated — still live; appended at EOF** |
+| in **neither** layer | the module is gone — `E_CONF_FIELD_MISSING`, loud |
+
+`scripts/lib/cubestack-apply-conf.py` implements exactly this: it builds the set of names the
+sibling `cluster.defaults.conf` declares and consults it before failing. A missing defaults file is
+tolerated, so an image from before the split behaves the way it always did.
+
+Measured on the 2026-10-15 image — **absent from the example, declared in the defaults layer**:
+
+```
+MINIO_ENDPOINT  MINIO_ACCESS_KEY  MINIO_SECRET_KEY
+REGISTRY_IP     UPSTREAM_DNS_SERVERS  NETSHOOT_ENABLED
+```
+
+Still absent from **both** layers — and still refused, though not all by the same guard (measured
+2026-10-16):
+
+| key | what stops it |
+|---|---|
+| `LWS_ENABLED` | the **rewriter** — exit 10, `E_CONF_FIELD_MISSING`. It is still on the rewriter's key list, and there is no module left to write it for |
+| `ENVOY_GATEWAY_ENABLED`, `ENVOY_AI_GATEWAY_ENABLED`, `PROMETHEUS_ENABLED` | the **values lint** — they are no longer in the skill's allow-list, so the file is refused before the rewriter ever runs. The rewriter itself ignores them silently |
+
+`CEPHFS_FS` and its siblings are the deliberate exception to that table: they are absent from both
+layers too, but the rewriter writes them with the EOF-append flag, because they exist only inside
+the example's **commented** block.
+
+Two of the relocated six are what killed `cubestack4` (2026-10-16), one after the other:
+`MINIO_ENDPOINT` (whose keys the values file always supplies) and `UPSTREAM_DNS_SERVERS` — the
+silent one, see the section above. Neither was a configuration error. Both were the rewriter
+mistaking "moved" for "removed", and both reported `recover=stop-report:user`.
+
 #### Components the installer no longer ships
 
 `dc4f3d7` (2026-09-23) removed **Envoy Gateway, Envoy AI Gateway, Prometheus/Grafana, Perses and
-the BMC exporter**, and deleted their modules, charts, offline groups and config keys outright.
-There is no envoy or gateway-controller reference left anywhere in the installer.
+the BMC exporter** from the **installer's addon layer**, and deleted their modules, charts,
+offline groups and config keys outright: there is no envoy or gateway-controller *module* left.
+
+That is a statement about the **installer**, not about the **operator catalogue** — two different
+layers that happen to share names. Those same products still ship as *components* of
+`cubestack-operator`: `envoyGateway`, `aiGateway`, `prometheus`, `perses` appear in the
+`CubeStackCluster` CR at Step 7, and they are what put `envoy-gateway-system`, `monitoring` and
+the perses-operator objects on the box. `verify` on `cubestack4` saw exactly those namespaces. So
+"the installer dropped Envoy" and "enable the `envoyGateway` component" are both true — of
+different things.
 
 Two consequences, and the asymmetry between them is what makes this worth reading:
 
@@ -357,7 +439,7 @@ Two consequences, and the asymmetry between them is what makes this worth readin
   error, no warning, and every verdict stays green. A cluster configured for a component that no
   longer exists looks exactly like a healthy one.
 
-`GATEWAY_API_ENABLED` survives (`cluster.conf.example:114`), but read it carefully: it is a
+`GATEWAY_API_ENABLED` survives (`cluster.conf.example:93`), but read it carefully: it is a
 kubespray addon flag that installs the **Gateway API CRDs**. It is not a gateway controller, and
 nothing implements a data plane behind it.
 
@@ -470,17 +552,51 @@ Two keys that used to need mentioning no longer do: `LWS_ENABLED` and `KUBE_VIP_
 default to `false` as of 2026-09-28, so a stock deploy has neither `lws-system` nor a kube-vip
 manifests step. Do not add them to the values file to "match" an older run.
 
-**What is verified, and what is not.** Every part of this profile has been measured, but not in
-this combination: no run on the current build has yet come up with MetalLB and the registry on
-together.
+On the 2026-10-15 build those two have **parted ways**, and the difference is worth knowing before
+you reach for either:
+
+- `KUBE_VIP_ENABLED` is still declared (`cluster.conf.example:50`) and still the installer's.
+- `LWS_ENABLED` is **gone from both config layers**, because the installer's `07_gpu_lws` and
+  `24_verify_lws` modules were deleted on that branch. Supplying the key is therefore not
+  "silently ignored" — it is a hard `E_CONF_FIELD_MISSING` (exit 10) from the rewriter, which has
+  no module left to write it for. This build's run confirms it: `cubestack4` completed eleven
+  modules and no `gpu_lws` was among them. The `lws` that *does* appear in the Step 7 CR is the
+  operator's own component, a different layer — see "Components the installer no longer ships".
+
+**What is verified, and what is not.** Every part of this profile has been measured. As of
+`cubestack4` (2026-10-16) the **default** profile — MetalLB *and* the registry on together, with
+the operator — has been measured end to end as well, so the old "measured, but not in this
+combination" caveat is gone.
 
 | evidence | covers | build |
 |---|---|---|
-| `cubestack1` (2026-09-29) | the addon keys (`RDMA` / `GPU_OPERATOR` / `MULTUS` off), `K8S_ENABLED`, the external-Ceph import, and a full deploy through `verify` | **current** |
+| `cubestack4` (2026-10-16) | **the profile as shipped**: `metallb` + registry on together, the external-Ceph import, GPU on / RDMA off, the operator path, `pod-down` — with operator images from the **offline** tar | **current** |
+| `cubestack1` (2026-09-29) | the **opt-out**: `nodeport`, registry off, `--no-operator` — the addon keys, `K8S_ENABLED`, the Ceph import, a full deploy through `verify` | current |
 | `cubestack5` (2026-09-18), `cubestack9` (2026-09-24) | the metallb module and the registry behind it | superseded |
-| Step 1b, against the live host (2026-09-29) | the `IPRangeRequest` reservation | **current** |
+| Step 1b, against the live host (2026-09-29, 2026-10-16) | the `IPRangeRequest` reservation | **current** |
 
-`cubestack1` is the current-build run, and it is the profile's **opt-out** rather than the profile:
+`cubestack4` is 1 node at 32 vCPU / 64 GiB / **200 GiB** root — the single-node default shape —
+with `SERVICE_EXPOSE_MODE='metallb'`, `REGISTRY_ENABLED='1'`, the external-Ceph import, the GPU
+operator on, and `RDMA_ENABLED='false'` because the box has no RoCE NIC. It measured:
+
+- `deploy-wait` `OK recap=ok=872,changed=200,failed=0`, no module aborted, 1643 s. Eleven modules
+  ran: `k8s_deploy`, `kube_vip`, `api_local_lb`, `metallb`, `ceph`, `ceph_csi`, `k8s_registry`,
+  `gpu_operator`, `multus`, `cubestack_operator`, `dev_lab`.
+- `verify` `OK nodes=1 namespaces=12 gpu=1 ceph_state=Connected sc=ceph-block,cephfs-durable
+  pvc=9/9`, with the CephX users `.1`-suffixed.
+- Step 7: `operator-up` `OK adopted=1 applied=0`, `operator-wait` `OK ready=1 components=9/9`.
+  Read Step 7 before drawing a conclusion from that count.
+- `pod-down` `OK`.
+
+It is also **the first run to consume a Step-1b reserved block**: `vip=10.66.3.225` out of the
+`10.66.3.225-10.66.3.226` the run reserved — the outcome the `verify` pool check below exists
+to enforce.
+
+One artifact on that box is **expected to be unhealthy**, and is not a regression: the
+`model-repo` ObjectBucketClaim sits `Pending`, because the Provider's exported RGW endpoint at
+`10.66.3.47:80` refuses connections. The block layer this profile depends on is unaffected.
+
+`cubestack1` is the run that carries the profile's **opt-out** rather than the profile:
 `SERVICE_EXPOSE_MODE='nodeport'` and `REGISTRY_ENABLED='false'`, built with `--no-operator` so it
 ends at `verify`. It measured, on 1 node:
 
@@ -491,10 +607,10 @@ ends at `verify`. It measured, on 1 node:
   `metallb-system` and the registry are absent *because the run turned them off*; `cubestack-system`
   is absent because `--no-operator` skips Step 7. Neither is a fault.
 
-So it is evidence for the addon keys, `K8S_ENABLED` and the Ceph import on this build — and
-**not** evidence for the profile's metallb/registry half. That half comes from `cubestack5` and
-`cubestack9`, which predate `dc4f3d7` and `1748dbe`: they prove the *modules* work, not that the
-current build comes up with them.
+So it is evidence for the addon keys, `K8S_ENABLED` and the Ceph import **in the off position**.
+It is no longer the run that carries the profile's metallb/registry half — `cubestack4` covers
+that now, on the current build. `cubestack5` and `cubestack9` predate `dc4f3d7`, so they remain
+history for those modules and nothing more.
 
 **`verify` is a real gate on that half, though**, and it is the reason to run it rather than trust
 `deploy-wait`. Its checks default to *requiring* both (a run dir with no `METALLB_REQUESTED` /
@@ -699,15 +815,16 @@ at Step 1b, before the bootstrap pod even exists.
 > reported by name — `E_VIP_NO_CRD` and `E_VIP_RANGE_DENIED`, both `stop-report:admin` — because
 > neither is something a re-invocation fixes.
 
-> **Status: the module is verified, and the reservation step is verified against the live host —
-> but no install has yet run with it.** Both existing metallb runs used the superseded build —
-> `cubestack5` (2026-09-18, the first metallb run) and `cubestack9` (2026-09-24, pool
-> `10.66.3.225-.230`) — and both came up with `metallb-system` really installed, an
-> `IPAddressPool primary` and a matching `L2Advertisement primary`, and a working in-cluster
+> **Status: verified end to end.** `cubestack4` (2026-10-16) is the first install to go out with
+> `metallb` as the **default** and actually consume a block Step 1b had reserved — `vip=10.66.3.225`
+> out of the `10.66.3.225-10.66.3.226` it reserved — so the module, the reservation step and the
+> `verify` pool gate all now have a current-build run behind them. The two earlier metallb runs
+> used the superseded build — `cubestack5` (2026-09-18, the first metallb run) and `cubestack9`
+> (2026-09-24, pool `10.66.3.225-.230`) — and both came up with `metallb-system` really installed,
+> an `IPAddressPool primary` and a matching `L2Advertisement primary`, and a working in-cluster
 > registry: on `cubestack9` the registry took `10.66.3.225` — **the pool's first address, with
 > `REGISTRY_IP` left empty, exactly as described above** — and answered HTTP 200 on `/v2/`.
-> `01_metallb.sh` is untouched by `dc4f3d7` and `1748dbe`, so that module behaviour still holds;
-> those runs are evidence for the module, not for the current build as a whole.
+> `01_metallb.sh` is untouched by `dc4f3d7`, so that module behaviour still holds.
 >
 > **What Step 1b itself has been shown to do** (2026-09-29, against the live host cluster, using
 > scratch run ids that were released afterwards — `cubestack2` and its `IPRequest` were read-only
@@ -721,17 +838,17 @@ at Step 1b, before the bootstrap pod even exists.
 > re-reserving. A run reserved by the earlier build was reused read-only (`legacy=1`) and did **not**
 > create a request.
 >
-> **Still unexercised: the install.** No run has yet gone out with metallb as the default, and no
-> `configure`→`deploy` has consumed a reserved block. `cubestack1` (2026-09-29) is the run that
-> established the failure mode this section opens with, and it was a *nodeport* run — the old
-> default. The first default-mode run is therefore a first-run experiment: check `metallb-system`,
-> the pool CR (its `addresses` must be exactly the reserved block) and the registry endpoint
-> directly. `verify` asserts the first two for you, but that gate has never been exercised against a
-> cluster that actually has them.
+> **The install has now been exercised.** `cubestack4` went out with `metallb` as the default and
+> consumed a reserved block through `configure`→`deploy`, and `verify` passed the pool gate, which
+> asserts the `IPAddressPool`'s `addresses` are exactly the reserved block. The run this paragraph
+> used to point at — `cubestack1` (2026-09-29) — was a *nodeport* run and is what established the
+> failure mode this section opens with. On a first run of your own, still read the registry endpoint
+> directly: `verify` covers `metallb-system` and the pool, but nothing probes the registry's HTTP
+> answer.
 >
-> **Arithmetic worth watching on that first run:** `deploy-registry.sh`'s collision probe fires for
-> the first time on a reserved address. Silence is the pass. A third LoadBalancer Service against a
-> two-address pool sits `<pending>` — visible, never silent — which is the honest outcome.
+> **Arithmetic worth watching:** `deploy-registry.sh`'s collision probe fires for the first time on
+> a reserved address. Silence is the pass. A third LoadBalancer Service against a two-address pool
+> sits `<pending>` — visible, never silent — which is the honest outcome.
 >
 > **The controller leaves it alone, and no longer needs watching.** cubestack-ipam is create-only for
 > this kind — its RBAC is get/list/watch plus a status update — so it can neither adopt nor delete a
@@ -1372,6 +1489,16 @@ What the pair does, in order, and why the order is not negotiable:
   `exporters.metax`, `cuberouter`, `cubepilot`, `cubestackPortal`, `observability`. Install
   *order* is not in the manifest: each component's `order` comes from
   the operator's own catalog, and the operator reconciles on a 30 s requeue.
+
+  **On `cubestack4` this manifest was never applied.** `operator-up` reported `adopted=1
+  applied=0` — the deploy had already installed a CR, so the skill adopted it rather than replacing
+  it, and `operator-wait` graded *that* CR: `ready=1 components=9/9`. Read that number against the
+  counting rules: a component the CR disables drops out of the status entirely, and one in the
+  catalog's `Skipped` phase is counted in neither side of the fraction. Nine countable-and-Ready is
+  therefore consistent with a twelve-component set whose remaining entries had nothing to do — it is
+  **not** evidence that the enabled set is smaller, and it is **not** evidence that *this* manifest
+  installs cleanly. The install path remains the less-travelled half of Step 7.
+
   **Two components need a `values` block or they install something useless**, and both are
   carried here because the chart carries them:
   - `cubestackPortal` — its login credential (`secrets.htpasswd.content`, one

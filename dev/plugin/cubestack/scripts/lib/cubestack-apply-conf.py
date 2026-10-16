@@ -88,13 +88,43 @@ def make_subst(state):
                 s,
                 flags=re.M,
             )
-        elif append:
-            # The key exists ONLY inside the example's *commented* block (every
-            # CEPHFS_* field is like this -- the example's live section has no
-            # CEPHFS_FS= line). Append at EOF so the assignment still wins:
-            # cluster.conf is bash-sourced top-down, last assignment wins.
+        elif append or key in state["advanced"]:
+            # Two ways to land here, and both mean the assignment is still LIVE
+            # -- which is the only thing that makes appending honest:
+            #
+            #  * append=True -- the key exists ONLY inside the example's
+            #    *commented* block (every CEPHFS_* field is like this; the
+            #    example's live section has no CEPHFS_FS= line).
+            #  * the key is declared in cluster.defaults.conf instead. The
+            #    2026-10-15 config split moved it there, and check-modules.sh
+            #    now ENFORCES that the two layers declare disjoint variable sets
+            #    (its check 7, "配置双层无同名声明"), so a relocated key is absent
+            #    from the example BY DESIGN rather than gone. load_config loads
+            #    the defaults layer unconditionally, and it declares these as
+            #    ${KEY:-...}, so the appended literal wins whether that layer is
+            #    sourced before or after this file.
+            #
+            # Either way append at EOF: cluster.conf is bash-sourced top-down
+            # and the last assignment wins.
             state["text"] = s.rstrip("\n") + "\n%s=%s\n" % (key, quote(value))
         else:
+            # Absent from BOTH layers -- this installer does not know the key.
+            # That MUST stay loud, and it is the whole reason this branch is not
+            # folded into the append above: it is what catches config written for
+            # a module the installer has since removed. LWS_ENABLED is the live
+            # example -- the 2026-10-15 branch deleted 07_gpu_lws.sh and
+            # 24_verify_lws.sh and dropped the key from both layers, so supplying
+            # it now stops the run here.
+            #
+            # This branch is the SECOND line of defence, not the first. A key the
+            # values file should not carry at all (ENVOY_GATEWAY_ENABLED /
+            # ENVOY_AI_GATEWAY_ENABLED / PROMETHEUS_ENABLED, whose modules
+            # dc4f3d7 removed) is refused by the values lint in scripts/lib/
+            # common.sh before this file is ever spawned, so subst() is never
+            # called with it and this branch never sees it. The failure it does
+            # catch is the one the lint cannot: a key that is still allow-listed
+            # and was therefore still live when that list was last checked, but
+            # has since gone from both layers.
             fail(EXIT_FIELD_MISSING, "field %s not found" % key)
 
     return subst
@@ -111,7 +141,27 @@ def main():
     except OSError as exc:
         fail(1, "cannot read %s: %s" % (conf_path, exc))
 
-    state = {"text": text}
+    # Read the names the SECOND config layer declares. The 2026-10-15 split put
+    # cluster.defaults.conf beside this file, load_config sources it
+    # unconditionally, and check-modules.sh enforces that the two layers declare
+    # DISJOINT key sets -- so a key absent from the example is ambiguous on its
+    # own, and this set is what resolves it into "relocated" (append) or "gone"
+    # (fail loudly). Absence of the file is not an error: images from before the
+    # split have no second layer, and an empty set reproduces the old behaviour
+    # exactly.
+    advanced = set()
+    defaults_path = os.path.join(
+        os.path.dirname(os.path.abspath(conf_path)), "cluster.defaults.conf"
+    )
+    try:
+        with open(defaults_path) as fh:
+            advanced = set(
+                re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)=", fh.read(), flags=re.M)
+            )
+    except OSError:
+        pass
+
+    state = {"text": text, "advanced": advanced}
     subst = make_subst(state)
     applied = []
 
@@ -121,9 +171,6 @@ def main():
     # --- credentials --------------------------------------------------------
     basic = {
         "SSH_DEFAULT_PASSWORD": env("SSH_PW"),
-        "MINIO_ENDPOINT": env("MINIO_EP"),
-        "MINIO_ACCESS_KEY": env("MINIO_AK"),
-        "MINIO_SECRET_KEY": env("MINIO_SK"),
     }
     for key, value in basic.items():
         if not value:
@@ -131,6 +178,35 @@ def main():
             # credential that only surfaces as an auth failure mid-deploy.
             fail(EXIT_MISSING_KEYS, "%s is empty" % key)
         subst(key, value)
+        applied.append(key)
+
+    # --- MinIO creds --------------------------------------------------------
+    # APPENDED, not demanded, and the reason is the image, not a preference.
+    # The 2026-10-15 installer build moved these three out of cluster.conf.example
+    # entirely -- they now appear only in cluster.defaults.conf, as
+    # `MINIO_ENDPOINT="${MINIO_ENDPOINT:-}"` and friends. `subst()` with
+    # append=False hard-fails "field MINIO_ENDPOINT not found" on such an image,
+    # which is how cubestack4 died at Step 4 with E_CONF_FIELD_MISSING. The
+    # CEPHFS_* keys below get the same treatment for the identical reason (they
+    # survive only inside the example's commented block).
+    #
+    # Appending is order-safe against cluster.defaults.conf: `:-` substitutes only
+    # when unset OR empty, so the literal written here survives whether defaults
+    # are sourced before this file (empty -> literal) or after it (set -> kept).
+    #
+    # Nothing in the deploy path reads these -- the offline fetch reads
+    # config/minio.conf, which `fetch-offline` seeds through cubestack-minio-conf.py.
+    # They are written anyway so a run on the older image, and any tool that
+    # sources cluster.conf for MinIO, keeps working unchanged.
+    minio = {
+        "MINIO_ENDPOINT": env("MINIO_EP"),
+        "MINIO_ACCESS_KEY": env("MINIO_AK"),
+        "MINIO_SECRET_KEY": env("MINIO_SK"),
+    }
+    for key, value in minio.items():
+        if not value:
+            fail(EXIT_MISSING_KEYS, "%s is empty" % key)
+        subst(key, value, append=True)
         applied.append(key)
 
     # --- NODES --------------------------------------------------------------

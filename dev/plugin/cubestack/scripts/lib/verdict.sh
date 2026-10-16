@@ -239,6 +239,16 @@ cs_attempt_limit() {
     # because kubespray legitimately did not re-run — has burned an attempt on
     # every resume. 5 covers that recurring loss plus a genuine retry.
     deploy-wait) echo 5 ;;
+    # configure runs ONCE in a healthy run, but the skill's own recovery for its
+    # input errors is `fix-values:<file>:<keys>` - which prescribes re-invoking
+    # the step that failed. At the old catch-all of 2 that survives exactly one
+    # correction: cubestack4 (2026-10-16) needed two in a row (the relocated
+    # MINIO_* keys, then UPSTREAM_DNS_SERVERS after the installer's config split)
+    # and dead-ended at E_RETRY_BUDGET mid-run, turning a recoverable input error
+    # into a stop-report. 4 = the one the flow needs, plus the two its own
+    # recovery prescribes, plus one - the same shape as deploy and env-probe, the
+    # other scripts whose recover verbs point back at themselves.
+    configure)   echo 4 ;;
     preflight|diagnose|pod-down) echo 50 ;;
     # verify is invoked ONCE by a healthy run, but Step 7's operator gate
     # prescribes rerun:verify when there is no verify-ok stamp - so verify now

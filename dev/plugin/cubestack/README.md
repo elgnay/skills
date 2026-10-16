@@ -103,15 +103,21 @@ Three verified installs (8 vCPU / 24 GiB per VM), started from a clean state. Ru
 The optional model-store step was added after these three runs, so it has no column above. Measured separately on a 2-node cluster against the Provider's CephFS: **~20 s** when the nodes already have `ceph-common`, and about **+23 s per node** on the first run, which installs it. It runs in Step 7 and is off unless asked for.
 
 The cubestack-box step (the platform operator) **postdates all three runs**, so it has no column
-either — and no twelve-component bring-up has been timed. What is structural: `operator-up` returns
-in ~30 s (a helm install, an apply, and a Deployment roll), and the time is the operator's own 30 s
-requeue driving the profile's components to `Ready` — twelve for this skill's own manifest, eleven
-on a box where it adopted the deploy's (whose CR also clears `modelBundles` and `bundles`). Those
+either — and no **cold** bring-up has been timed. What is structural: `operator-up` returns in
+~30 s (a helm install, an apply, and a Deployment roll), and the time is the operator's own 30 s
+requeue driving the profile's components to `Ready` — twelve for this skill's own manifest. Those
 are the enabled counts; `exporters.metax` reports `Skipped` on a cluster with no MetaX operator and
-is then counted in neither, which is why `operator-wait` carries its own 1800 s budget. Treat the
-first run as a first-run experiment on capacity too: five components plus the operator on a
-single-node 8 vCPU / 24 GiB VM alongside Rook/Ceph was the tightest shape this skill has been
-exercised on — and it has since been asked to carry twelve.
+is then counted in neither, which is why `operator-wait` carries its own 1800 s budget.
+
+`cubestack4` (2026-10-16) does **not** time that bring-up, and it is worth being explicit about
+why: it *adopted* the CR the deploy had already installed, so `operator-wait` found the components
+already `Ready` and returned in `elapsed=1s`. Its `components=9/9` is therefore a statement about a
+warm, adopted box — and because `Skipped` is excluded from **both** sides of that fraction, it does
+**not** pin how many components the deploy's own CR enables. The twelve-component manifest this
+skill ships remains **unexercised on this image**. Treat a first cold install-path run as a
+first-run experiment on capacity too: five components plus the operator on a single-node 8 vCPU /
+24 GiB VM alongside Rook/Ceph was the tightest shape this skill has been exercised on — and it has
+since been asked to carry twelve.
 **That default has since been raised** — a 1-node box now provisions 24 vCPU / 64 GiB / 200 GiB
 (see *What it asks you* below), so a new single-node run is no longer sized like the one measured
 here. The timings above remain the record of what 8/24 did.
@@ -303,6 +309,10 @@ registry's VIP is settled during the deploy and the gateway takes the block's se
 | `cubestackPortal` | CubeStackPortal (web portal) | on |
 | `observability` | Observability assets (embedded: `PrometheusRule` / `ServiceMonitor` / `PersesDashboard` / grafana dashboards) | on |
 
+This table is the skill's **install** path. On a box where the deploy already installed a CR,
+`operator-up` adopts that one instead and **none of this table is applied** — see the adopt note
+above for why `cubestack4`'s `components=9/9` does not exercise it.
+
 That is the operator chart's **own default set** (`clusterCR.spec` in its `values.yaml`,
 mirrored at commit `083d444` and re-checked unchanged at `90be297`), minus one. The exception is
 `exporters.bmc`, and it is the only default-enabled component that **cannot converge on a fresh
@@ -330,10 +340,12 @@ Install **order** is not in the manifest — each component's `order` comes from
 own catalog, and the operator reconciles on a 30 s requeue. A disabled component **drops out of
 the CR's status** entirely, which is why `operator-wait` derives its total from the status rather
 than from a count here: it polls whatever the CR reports — twelve for this skill's own manifest,
-eleven on a box where it adopted the deploy's — and counts only the phases that can still reach
-`Ready`. A component in the catalog's fifth phase, `Skipped` (`exporters.metax` with no MetaX
-operator present), is counted in neither number, so a "nothing to do here" component cannot
-inflate a total the wait would then never reach.
+or whatever the deploy's own CR enables on a box where it adopted that instead — and counts only
+the phases that can still reach `Ready`. `cubestack4` (2026-10-16) is the measured example of an
+**adopted** box: it reported `components=9/9` while the twelve-component manifest this skill
+ships stayed unexercised. A component in the catalog's fifth phase, `Skipped` (`exporters.metax`
+with no MetaX operator present), is counted in neither number, so a "nothing to do here"
+component cannot inflate a total the wait would then never reach.
 
 **One credential, two jobs.** The robot account pulls the operator chart from
 `harbor.isuanova.com/suanova-private` *and* the component images from `suanova`. Probed
@@ -397,16 +409,12 @@ clobber a released chart. Pass `--version X.Y.Z` once a release is cut.
 
 `helm-push` depends on `helm-package`, which runs `make helm-sync` — so the **published chart
 always carries `crds/`**, even though the repo tree's is absent. That closes the packaging
-question. Two things are still **unverified on a first run**. First, whether the deployed
-**nodes** can reach `harbor.isuanova.com` at all: the installer's own design is the opposite
-shape — the pod pulls to an offline tar, the module pushes into the **in-cluster** registry
-(`registry.cubestack.io:5000`), and the nodes pull from there, so that the cluster "永远不需要
-访问公网" (its `docs/harbor-mirror.md` §2). Every run so far has a `registry` Service and the
-addon modules push to it themselves; this CR is the first thing to ask a node for Harbor
-directly, and `env-probe` only proves Harbor from the pod. If a node has no route it surfaces as
-`E_OPERATOR_IMAGE_PULL`, which reads like a bad credential — tell them apart by curling
-`https://harbor.isuanova.com/v2/` **from the VM**, where any HTTP status (even `401`) means the
-network is fine. Second, capacity: whether a twelve-component bring-up fits inside the 1800 s
+question. Two things are still **unexercised on a first run**. First, the operator's **install**
+path — `cubestack4` (2026-10-16) does **not** settle it: its `operator-up` reported
+`adopted=1 applied=0`, because the deploy had already installed the operator, so no `helm` pull
+against `suanova-private` was made and no twelve-component bring-up ran under `operator-wait` (it
+returned `elapsed=1s` against components that were already `Ready`). That run took the **adopt**
+path. Second, capacity: whether a twelve-component bring-up fits inside the 1800 s
 budget, and whether it fits on one VM alongside Rook/Ceph — a 1-node box used to be the 8 vCPU /
 24 GiB shape this was an open question about, and is now provisioned at 24 vCPU / 64 GiB / 200 GiB
 by default (the 8/24 figure is what the operator bring-up was *first* exercised against, not what

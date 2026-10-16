@@ -10,7 +10,9 @@
 #
 # The model never writes a credential with sed/echo/heredoc (the tool layer
 # redacts those to `***`), never authors the rewriter (it is a repo file now),
-# and never has to read the ~39 KB cluster.conf.example.
+# and never has to read the installer's config: since the 2026-10-15 split that
+# is cluster.conf.example (~11 KB) plus its sibling cluster.defaults.conf, and
+# the rewriter consults both to tell a relocated key from a removed one.
 #
 # Idempotent: an existing cluster.conf is regenerated IN PLACE. It is never
 # re-copied from the example, which would wipe Ceph/MetalLB/NODES written by a

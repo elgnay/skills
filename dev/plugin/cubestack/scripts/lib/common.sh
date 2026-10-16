@@ -356,15 +356,27 @@ cs_rfc3339_epoch() {
 # unquoted line is an injection vector, not merely a typo. Requiring
 # KEY='value' (single quotes, no embedded quote) makes sourcing safe.
 #
-# Every key here must exist in the installer's cluster.conf.example, because
-# the rewriter can only substitute a key the example carries. That invariant is
-# what the list is FOR, and it is worth re-checking against the installer
-# source whenever the image moves: a key the installer has dropped is accepted
-# here and then silently discarded (load_config is a plain `source`, with no
-# unknown-key validation), so the run stays green while the toggle does nothing.
-# Three such keys - ENVOY_GATEWAY_ENABLED, ENVOY_AI_GATEWAY_ENABLED and
+# Every key here must be DECLARED IN ONE OF the installer's two config layers,
+# because the rewriter can only substitute a key the installer still knows. That
+# invariant is what the list is FOR, and it is worth re-checking against the
+# installer source whenever the image moves: a key the installer has dropped is
+# accepted here and then silently discarded (load_config is a plain `source`,
+# with no unknown-key validation), so the run stays green while the toggle does
+# nothing. Three such keys - ENVOY_GATEWAY_ENABLED, ENVOY_AI_GATEWAY_ENABLED and
 # PROMETHEUS_ENABLED - were carried here until 2026-09-28, when the installer
 # had already removed their modules entirely (commit dc4f3d7).
+#
+# "one of the two layers" is not loose wording. Since the 2026-10-15 build the
+# installer's config is cluster.conf.example PLUS cluster.defaults.conf, and
+# check-modules.sh enforces that the two declare DISJOINT key sets - so a key may
+# legitimately be absent from cluster.conf.example and still be live, because it
+# moved to the defaults layer. Six of the entries below are in exactly that state
+# - MINIO_EP / MINIO_AK / MINIO_SK (which the rewriter writes as the installer's
+# MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY), plus REGISTRY_IP,
+# UPSTREAM_DNS_SERVERS and NETSHOOT_ENABLED. Absence from the example alone is
+# therefore NOT evidence of removal; that call belongs to
+# cubestack-apply-conf.py, which reads the sibling defaults file to tell
+# "relocated" from "gone".
 #
 # Kept deliberately narrow: the toggles this skill's profiles and recovery paths
 # actually name, not the installer's whole ~20-toggle surface.

@@ -337,10 +337,15 @@ wait
 # the note line can name addresses the operator may want to set by hand.
 #
 # SPACE-separated, not comma: that is the installer's own format for this key
-# (cluster.conf.example documents "10.66.2.1 223.5.5.5", and
+# (the installer documents it as "10.66.2.1 223.5.5.5", and
 # sync-kubespray-config.sh turns spaces into the YAML list separator). A
 # comma-joined value survives that tool by accident, so getting it wrong here
 # would look right until something else parsed it.
+#
+# That example address is quoted from the installer's docs only - it is NOT a
+# hint about where to look. Since the 2026-10-15 split the key lives in
+# cluster.defaults.conf rather than cluster.conf.example, and the sample subnet
+# it names is not part of this cluster. Detection reads the VMs, never this.
 UPSTREAM_DNS=""
 DNS_SEEN=""
 idx=0
