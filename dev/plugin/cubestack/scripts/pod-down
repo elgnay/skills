@@ -178,6 +178,13 @@ fi
 # it gets removed. It holds the Provider's CSI secrets and RGW keys; deleting
 # the pod without shredding it would be the one credential left behind.
 #
+# /tmp/cubestack-harbor.*.conf is `configure`'s staged copy of the run's Harbor
+# robot password, written only when the run takes the operator's images from
+# Harbor (the default). It is NOT in the values family above - it is its own
+# secret file with its own name - so the glob cannot reach it and it has to be
+# listed here. `configure` shreds it through its own cs_cleanup hook; this is the
+# backstop for a hook that a SIGKILL never ran.
+#
 # /tmp/cubestack-cephfs.* is the mount-models staging directory. That step
 # removes it through its own cs_cleanup hook, but a hook cannot run if the
 # script is SIGKILLed - so this is the backstop, and it matters more than the
@@ -197,6 +204,7 @@ fi
 if cs_pod_ready "$TARGET"; then
   cs_logged kubectl -n "$CS_NS" exec "$TARGET" -- bash -c \
     'for f in /tmp/cubestack-values.conf /tmp/cubestack-values.*.conf \
+              /tmp/cubestack-harbor.*.conf \
               /opt/cubestack-installer/deployments/config/external-ceph.env; do
        [ -f "$f" ] || continue
        shred -u "$f" 2>/dev/null || rm -f "$f"

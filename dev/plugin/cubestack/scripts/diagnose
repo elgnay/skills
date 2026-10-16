@@ -103,8 +103,11 @@ diag_pattern() {
       echo 'ImagePull|ErrImagePull|pull|harbor|Harbor|Unauthorized' ;;
     E_POD_NOT_READY|E_POD_EXEC|E_POD_DELETE_UNSAFE)
       echo 'Ready|ImagePull|Scheduling|Started|Created|pod' ;;
-    E_HARBOR_DNS|E_HARBOR_UNREACHABLE)
-      echo 'harbor|Harbor|resolve|DNS|443|reach' ;;
+    E_HARBOR_DNS|E_HARBOR_UNREACHABLE|E_HARBOR_NODE_UNREACHABLE)
+      # `curl` and `getent` are in the pattern for the NODE-side code: its
+      # evidence is the sentinel that VM's own probe printed, not anything the pod
+      # said about Harbor.
+      echo 'harbor|Harbor|resolve|DNS|443|reach|curl|getent' ;;
     E_MINIO_UNREACHABLE)
       echo 'minio|MinIO|9000|bucket' ;;
     E_SUBNET_UNRESOLVED)
@@ -196,7 +199,8 @@ diag_owner() {
 diag_known_code() {
   case "$1" in
     E_NO_KUBECONFIG|E_SUBNET_UNRESOLVED|E_POD_UNSCHEDULABLE|E_POD_IMAGE_PULL|E_POD_NOT_READY| \
-    E_POD_EXEC|E_POD_DELETE_UNSAFE|E_HARBOR_DNS|E_HARBOR_UNREACHABLE|E_MINIO_UNREACHABLE| \
+    E_POD_EXEC|E_POD_DELETE_UNSAFE|E_HARBOR_DNS|E_HARBOR_UNREACHABLE|E_HARBOR_NODE_UNREACHABLE| \
+    E_MINIO_UNREACHABLE| \
     E_POOL_GATE_OFF|E_NAME_SPACE_EXHAUSTED|E_CONF_FIELD_MISSING|E_DEPLOY_LAUNCH| \
     E_DEPLOY_EXITED_NONZERO|E_DEPLOY_KUBESPRAY_SSH|E_DEPLOY_NO_RECAP|E_DEPLOY_PRECOND_CONF| \
     E_DEPLOY_PRECOND_FETCH|E_DEPLOY_PRECOND_SSHPASS|E_DEPLOY_PRECOND_ENV| \

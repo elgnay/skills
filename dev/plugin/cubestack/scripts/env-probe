@@ -6,8 +6,8 @@
 # verdict line, so the model never reads raw probe output and never mis-reads a
 # "SSH FAIL" string as something else.
 #
-# Four risk classes live in this one step and they have four DIFFERENT recovery
-# verbs, but a verdict carries one code. So the classes are checked in a FIXED
+# Several risk classes live in this one step and they do not share a recovery
+# verb, but a verdict carries one code. So the classes are checked in a FIXED
 # precedence and the first class that fails is the one reported:
 #
 #   1. pod exec works at all ................ E_POD_EXEC       rerun:pod-up
@@ -16,8 +16,18 @@
 #   4. password SSH as the given user ....... E_SSH_AUTH       sibling-vm:rebuild:<names>
 #   4b. upstream DNS (DETECTED, never a check) — see below
 #   5. MinIO TCP ............................ E_MINIO_UNREACHABLE stop-report:admin
-#   6. Harbor DNS then port 443 ............. E_HARBOR_DNS / E_HARBOR_UNREACHABLE
+#   6. Harbor DNS then port 443, FROM THE POD  E_HARBOR_DNS / E_HARBOR_UNREACHABLE
 #                                                            stop-report:admin
+#   7. Harbor from EACH NODE, online images only (see below)
+#                                            E_HARBOR_NODE_UNREACHABLE
+#                                                            stop-report:admin
+#
+# Class 7 is a sibling of class 6 rather than part of it, because it has a
+# different subject: 6 proves the POD can reach Harbor (which is what pulls the
+# installer image), 7 proves each VM can, which is what pulls the cubeStack
+# OPERATOR's images when the run takes them online. The pod runs on the KubeVirt
+# cluster and the VMs are the nodes being installed, so one says nothing about
+# the other.
 #
 # Class 4b is the one entry here that is not a check. `cluster.conf` ships
 # UPSTREAM_DNS_SERVERS=127.0.0.1, which kubespray writes into nodelocaldns as the
@@ -83,7 +93,12 @@ SSH_USER="ubuntu"
 SSH_PW="${CUBESTACK_SSH_PASSWORD:-ubuntu}"
 MINIO_IP=""
 MINIO_PORT="9000"
-HARBOR="$CS_HARBOR_DEFAULT"
+# Empty here, resolved below: --harbor wins, then the endpoint preflight recorded
+# in run.env, then the built-in default. Same order as MINIO_IP, and for the same
+# reason — preflight can be pointed at another Harbor, and both Harbor checks here
+# (the pod's and the nodes') must then test THAT one. Probing the default while
+# the deploy writes a different registry would report ok for a host nobody uses.
+HARBOR=""
 HARBOR_PORT="443"
 
 while [ $# -gt 0 ]; do
@@ -103,6 +118,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$VMS" ] || cs_usage_fail "--vms a@IP,b@IP is required"
+
+if [ -z "$HARBOR" ]; then
+  HARBOR="$(cs_run_env_get HARBOR)"
+fi
+[ -n "$HARBOR" ] || HARBOR="$CS_HARBOR_DEFAULT"
 
 # A password the tool layer redacted to *** is not a wrong password — rebuilding
 # the VM for it would be the wrong recovery. Refuse it here, before any probe.
@@ -425,6 +445,103 @@ if ! cs_probe_tcp "$HARBOR_IP" "$HARBOR_PORT" 3; then
 fi
 CHECKED=$((CHECKED + 1))
 
+# --- 7. Harbor from each NODE (online operator images only) ------------------
+# The operator's images are pulled BY THE NODES, so online mode rests on a path
+# class 6 above does not test: the pod reaching Harbor proves the installer image
+# can be pulled, not that a node's kubelet can. An unverified path here shows up
+# much later and much further away — as an operator that ImagePullBackOffs after
+# a full deploy, while the installer's own module reports success (without the
+# credential it warns and clears the CR's imagePullSecrets rather than failing).
+# That is the failure this step exists to move forward to before anything runs.
+#
+# The mode is READ, never re-derived: preflight resolved it at Step 0 into
+# run.env, and `configure` reads the same key, so the precheck can never be
+# gating a mode the deploy is not using. env-probe takes no values file, which is
+# why run.env is the only possible source. A run dir that predates --operator-images
+# has no such key: it is treated as offline, which is exactly what that run would
+# have deployed, so resuming an old run does not acquire a new way to fail.
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+HARBOR_NODES="skipped"
+if [ "$OPERATOR_IMAGES" = online ]; then
+  # Single-quoted for the reason class 4b's command is (see above): this string
+  # crosses a locally double-quoted `bash -c`, a second `bash -c` inside the pod,
+  # and ssh's own word-splitting, so it must arrive as ONE command and may hold no
+  # `$`, backtick, backslash or quote. $HARBOR is expanded here, before that trip.
+  #
+  # Three sentinels, because "cannot reach it" and "cannot tell" are different
+  # answers and only one of them should stop a run:
+  #   * curl got ANY response, 401 included — a response is the whole proof
+  #     (Harbor answers an anonymous /v2/ with 401; DNS resolved, the port is
+  #     open, TLS verified). This is the success condition, hence no --fail. The
+  #     port is $HARBOR_PORT, the same one class 6 above tests, so the two cannot
+  #     disagree about which endpoint this run depends on.
+  #   * the VM cannot resolve Harbor at all — a failure whether or not curl
+  #     exists, because `getent` always does. Asked separately for that reason.
+  #   * there is no curl on the VM: the check could not run. That is NOT the same
+  #     as failing it — a stock cloud image is not this skill's to provision, and
+  #     refusing every run that starts from one would be a false failure. Reported
+  #     once, on the note line, and it does not stop the run. The deploy still
+  #     fails visibly if such a node really cannot reach Harbor; what is lost is
+  #     only the early warning.
+  HARBOR_NODE_CMD="'command -v curl >/dev/null 2>&1 || echo CS_HARBOR_NODE_NOCURL; getent hosts $HARBOR >/dev/null 2>&1 || echo CS_HARBOR_NODE_NODNS; timeout 10 curl -s -o /dev/null https://$HARBOR:$HARBOR_PORT/v2/ >/dev/null 2>&1 && echo CS_HARBOR_NODE_OK; echo CS_HARBOR_NODE_DONE'"
+  idx=0
+  IFS=,; set -f
+  for vname in $VM_NAMES; do
+    idx=$((idx + 1))
+    vip="$(printf '%s' "$VM_IPS" | cut -d, -f"$idx")"
+    ( out="$(cs_probe_ssh "$vip" "$SSH_USER" "$SSH_PW" 3 "$HARBOR_NODE_CMD")"
+      # Precedence, not an accident: a definite failure (no-dns) outranks "could
+      # not tell" (nocurl), and OK outranks both because it is the only positive
+      # proof. A response with no OK and no DONE is silence, and silence must
+      # never read as success — steps 3 and 4 just proved ssh works on this VM.
+      case "$out" in
+        *CS_HARBOR_NODE_OK*)     state=ok ;;
+        *CS_HARBOR_NODE_NODNS*)  state=no-dns ;;
+        *CS_HARBOR_NODE_NOCURL*) state=nocurl ;;
+        *CS_HARBOR_NODE_DONE*)   state=unreachable ;;
+        *)                       state=probe-silent ;;
+      esac
+      printf '%s %s\n' "$state" "$vname" > "$TMPD/harbor.$idx" ) &
+  done
+  set +f; IFS="$OLDIFS"
+  wait
+  BAD_HARBOR=""
+  NOCURL_VMS=""
+  REASONS=""
+  idx=0
+  IFS=,; set -f
+  for vname in $VM_NAMES; do
+    idx=$((idx + 1))
+    f="$TMPD/harbor.$idx"
+    state="$(awk 'NR==1{print $1}' "$f" 2>/dev/null)"
+    case "$state" in
+      ok) ;;
+      nocurl) NOCURL_VMS="$NOCURL_VMS${NOCURL_VMS:+,}$vname" ;;
+      *)
+        BAD_HARBOR="$BAD_HARBOR${BAD_HARBOR:+,}$vname"
+        case " $REASONS " in
+          *" $state "*) ;;
+          *) REASONS="$REASONS${REASONS:+ }$state" ;;
+        esac ;;
+    esac
+  done
+  set +f; IFS="$OLDIFS"
+  if [ -n "$NOCURL_VMS" ]; then
+    cs_note "no curl on $NOCURL_VMS, so the node-side Harbor check could not run" \
+            "there. In this mode the NODES pull the operator's images, so a VM that" \
+            "cannot reach $HARBOR — or cannot resolve it — fails as an operator" \
+            "ImagePullBackOff after the deploy rather than here. Install curl on" \
+            "those VMs to have it checked; it is not installed for you."
+  fi
+  if [ -n "$BAD_HARBOR" ]; then
+    cs_fail E_HARBOR_NODE_UNREACHABLE "vms=$BAD_HARBOR" "harbor=$HARBOR" \
+      "port=$HARBOR_PORT" "reason=$REASONS" recover=stop-report:admin \
+      hint="$BAD_HARBOR failed the node-side Harbor check ($REASONS): online operator images are pulled by the nodes, not the pod. Fix the node->$HARBOR path, or re-run preflight with --operator-images offline"
+  fi
+  if [ -n "$NOCURL_VMS" ]; then HARBOR_NODES=unverified; else HARBOR_NODES=ok; fi
+  CHECKED=$((CHECKED + VM_COUNT))
+fi
+
 # --- stamp ------------------------------------------------------------------
 # Digest of the VM set + SSH user + password PRESENCE. Never the password, and
 # never a hash of it. Falls back to cksum where no sha is available.
@@ -445,4 +562,4 @@ VMSET_DIGEST="$(digest_of "$VMS|$SSH_USER|$PW_PRESENCE")"
 cs_stamp_write env-ok "vms_digest=$VMSET_DIGEST user=$SSH_USER password=$PW_PRESENCE vms=$VM_COUNT sshpass=$SSHPASS_STATE"
 
 cs_ok "checked=$CHECKED" "sshpass=$SSHPASS_STATE" "vms=$VM_COUNT" "minio=ok" "harbor=ok" \
-  "dns=${DNS_VERDICT:-none}"
+  "dns=${DNS_VERDICT:-none}" "harbor_nodes=$HARBOR_NODES"

@@ -67,8 +67,26 @@ def fail(code, message):
 
 
 def quote(value):
-    """Render a value as a safe double-quoted shell assignment."""
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+    """Render a value as a safe double-quoted shell assignment.
+
+    cluster.conf is SOURCED, not parsed, and this renders into double quotes — so
+    a `$`, a backtick or a `\\` in a value is a shell expansion rather than data
+    unless every one of them is escaped. That is not hypothetical: the Harbor
+    robot accounts this skill uses are named `robot$<project>+<name>`, and
+    unescaped they render as `"robot$cubestack+installer"`, which the installer's
+    `source` expands to `robot+installer` — a wrong credential in a
+    docker-registry Secret, a 401 on every node's pull, and an operator that
+    ImagePullBackOffs while the module that created the Secret reports success.
+    A password containing `$` fails the same way, wherever it is used.
+    Escaping can only turn a mangled value back into the literal the caller
+    passed: nothing here is ever meant to be expanded.
+    """
+    return '"%s"' % (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
 
 
 def make_subst(state):
@@ -352,6 +370,58 @@ def main():
     ):
         if env(key):
             subst(key, env(key))
+            applied.append(key)
+
+    # --- operator image source ----------------------------------------------
+    # ONLINE_DEPLOY_CUBESTACK_OPERATOR chooses WHERE the cubeStack operator's
+    # images come from — never whether an operator is installed. That is
+    # CUBESTACK_OPERATOR_ENABLED, ON by default, and it is why a deploy nowadays
+    # hands Step 7 a CR to adopt. `true` = each node pulls them straight from
+    # Harbor, the chart's own configuration; `false` = the offline tar is pushed
+    # into the in-cluster registry and the nodes pull from there.
+    #
+    # Written ALWAYS when the run states a mode, `false` included, for the same
+    # reason REGISTRY_ENABLED above is pinned explicitly: the key is declared in
+    # cluster.defaults.conf as ${ONLINE_DEPLOY_CUBESTACK_OPERATOR:-false}, so
+    # writing nothing defers to whatever that default becomes, and a run that
+    # asked for offline must stay offline if a later image flips it.
+    #
+    # NOT folded into the toggle loop above, deliberately: that loop is gated on
+    # truthy(), so the off case would write nothing — exactly the deferral this
+    # avoids.
+    #
+    # And NOT a values-file key — it is absent from CS_VALUES_ALLOWED on purpose,
+    # so the lint refuses a values file that carries it. The mode has to be the
+    # one env-probe checked the NODES against at Step 3, and env-probe takes no
+    # values file at all; a second place to set it is a second answer.
+    online_mode = env("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
+    if online_mode:
+        subst("ONLINE_DEPLOY_CUBESTACK_OPERATOR",
+              "true" if truthy(online_mode) else "false")
+        applied.append("ONLINE_DEPLOY_CUBESTACK_OPERATOR")
+
+    # --- and the credential online mode cannot run without --------------------
+    # Both keys live in the example's LIVE section, so the in-place branch above
+    # rewrites them — there is no relocated-key or commented-block case to work
+    # around here. The mapping is the same shape as SSH_PW -> SSH_DEFAULT_PASSWORD
+    # at the top of this file: the RUN's name for a credential on the left, the
+    # INSTALLER's on the right.
+    #
+    # It is not cosmetic. The operator's own image lives in the private project
+    # suanova-private, and the module that consumes these does not fail when they
+    # are empty: it warns and clears the CR's imagePullSecrets, so the operator
+    # ImagePullBackOffs while the module reports success. `configure` refuses an
+    # online run with no credential, so an empty value here should be
+    # unreachable — it is checked anyway, because the alternative is planting a
+    # broken credential that only surfaces twelve minutes into a deploy.
+    if truthy(online_mode):
+        for key, value in (
+            ("CUBESTACK_OPERATOR_HARBOR_USER", env("HARBOR_RO_USER")),
+            ("CUBESTACK_OPERATOR_HARBOR_PASSWORD", env("HARBOR_RO_PW")),
+        ):
+            if not value:
+                fail(EXIT_MISSING_KEYS, "%s is empty" % key)
+            subst(key, value)
             applied.append(key)
 
     # --- registry storage backend -------------------------------------------

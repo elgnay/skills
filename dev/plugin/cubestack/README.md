@@ -47,7 +47,7 @@ A Claude Code skill for building a **cubestack box** on KubeVirt VMs in the SUAN
 | **Step 1** | Provision VMs via the sibling `suanova-dev-vm` skill, then confirm by exact name | `vm-ready` |
 | **Step 1b** | *(metallb runs — the default)* Reserve the box's VIP block from the host's cubestack-ipam, **before** the deploy | `reserve-vips` |
 | **Step 2** | Create the installer pod, named for this run *(runs concurrently with Step 1)* | `pod-up` |
-| **Step 3** | Verify the environment from the pod — VM SSH, MinIO, Harbor, `sshpass` | `env-probe` |
+| **Step 3** | Verify the environment from the pod — VM SSH, MinIO, Harbor, `sshpass`, and (online runs) Harbor from each node | `env-probe` |
 | **Step 4** | Generate and byte-verify `cluster.conf` | `configure` |
 | **Step 5** | Fetch the offline package set from MinIO (tens of GiB; the script's own floor decides) | `fetch-offline` |
 | **Step 6** | Deploy — kubespray plus the enabled addon modules, then wait | `deploy` + `deploy-wait` |
@@ -259,6 +259,14 @@ the file turns it on, and `--no-operator` without one leaves a k8s box that ends
 `verify`. Neither flag is a separate "install the operator?" question — ask the user for the
 credential, or don't.
 
+Where the images come from is a **separate** question, and it has its own default:
+`--operator-images online` is what a run gets without asking, so the nodes pull the operator and
+every component image from `harbor.isuanova.com` using that same robot account. It is not a
+values-file key — `preflight` is the only place it is decided, and the `CONFIRM` block prints it.
+`preflight --operator-images offline` reverts to the installer's own shape (an offline tar pushed
+into the box's in-cluster registry) and is the answer when the nodes have no route to Harbor.
+Step 3 checks that route and stops the run before the deploy rather than after it.
+
 Then, in Step 7 — after `verify`, alongside `mount-models`, before `pod-down`:
 
 ```bash
@@ -422,6 +430,19 @@ a new 1-node box gets). `operator-up` asserts
 the CRD reached `Established` anyway, so a packaging surprise fails loudly rather than as
 `no matches for kind "CubeStackCluster"`.
 
+**The nodes must reach Harbor.** `--operator-images online` is this skill's default, so the CR
+does ask a node for `harbor.isuanova.com` directly. The installer's own default is the opposite
+shape — the pod pulls to an offline tar, the module pushes into the **in-cluster** registry
+(`registry.cubestack.io:5000`), and the nodes pull from there, so that the cluster "永远不需要
+访问公网" (its `docs/harbor-mirror.md` §2) — and `--operator-images offline` restores it. That is
+why `env-probe` grew a node-side check: it already proved Harbor **from the pod**, and the pod is
+not the box being installed. It now reports `harbor_nodes=ok|skipped|unverified` and fails
+`E_HARBOR_NODE_UNREACHABLE` → `stop-report:admin` **before** the deploy, naming the VMs, rather
+than letting the operator `ImagePullBackOff` twenty minutes later. If you meet that failure
+anyway, it reads like a bad credential: tell them apart by curling
+`https://harbor.isuanova.com/v2/` **from the VM**, where any HTTP status (even `401`) means the
+network is fine.
+
 ---
 
 ## Prerequisites
@@ -429,7 +450,7 @@ the CRD reached `Established` anyway, so a packaging surprise fails loudly rathe
 - **kubectl** and a kubeconfig that can reach the SUANOVA KubeVirt cluster
 - The CubeStack installer image reachable from the cluster (`harbor.isuanova.com/cubestack/cubestack-installer-cli:latest`)
 - Access to the internal **MinIO** endpoint holding the offline packages (tens of GiB)
-- **Cubestack box only (on by default):** a **Harbor robot account with pull scope** — it pulls the operator chart from `suanova-private`, which is private and the one project that strictly needs the credential (`suanova` and `mirrors` answer anonymously). If the account has 2FA, use the **CLI Secret** from the Harbor user profile, not the login password. Put the username and token in a `Write`-authored file and pass it as `--harbor-ro-values`; `--no-operator` skips both the account and the step.
+- **Cubestack box only (on by default):** a **Harbor robot account with pull scope** — it pulls the operator chart from `suanova-private`, which is private and the one project that strictly needs the credential (`suanova` and `mirrors` answer anonymously), and it is passed on to the operator so that the deployed **nodes** can pull the component images from Harbor too, which is this skill's default (`--operator-images offline` opts out). If the account has 2FA, use the **CLI Secret** from the Harbor user profile, not the login password. Put the username and token in a `Write`-authored file and pass it as `--harbor-ro-values`; `--no-operator` skips both the account and the step.
 - **Multi-node only:** the alpha `VMPool` feature gate enabled — otherwise pool creation is rejected. This is cluster-admin scope and the skill stops and reports rather than falling back to N separate VMs.
 - Claude Code (the host for this skill)
 
@@ -501,6 +522,7 @@ else is a cubestack box.
 | Model store on the nodes | **Disabled** (opt-in) — when enabled, supply the path to the Provider's CephFS Linux-host mount guide; Step 7 then mounts its `/models` read-only at `/models` on every node host |
 | Which box | **cubestack box** — Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen** components (the operator chart's own default set; `exporters.bmc` ships `enabled: false` because it needs an admin-created Secret), or adopts the platform the deploy installed if it installed one. `--no-operator` builds **only a k8s box**, which ends at `verify` |
 | Harbor robot credential | **Required while the operator is on** — the `Write`-authored file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Write it **before** the `preflight` call, so `preflight` lints it while you are still there |
+| Operator image source | **`online`** — the operator and its component images come from `harbor.isuanova.com`, pulled by the **nodes**, which is what makes the robot credential load-bearing. Not the switch for whether a platform is installed (that is *Which box*, above); only where its images come from. `--operator-images offline` opts out and takes the installer's own default — an offline tar pushed into the box's in-cluster registry. Step 3 checks the node→Harbor path unless the run opted out |
 
 Answer only what you care about — anything you skip uses the default. You get **one** confirmation, and then it runs to completion.
 

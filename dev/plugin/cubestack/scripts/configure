@@ -41,6 +41,9 @@ EXT_ENV=""
 # of these, and under `set -u` an unset read is fatal rather than empty.
 EXT_ENV_FLAG=0
 EXT_ENV_POD=""
+# Same rule: HARBOR_RO is only assigned on an online run, and the dry-run report
+# names it. Empty here means "no credential in play", which is the offline case.
+HARBOR_RO=""
 DRY_RUN=0
 
 usage() {
@@ -63,6 +66,18 @@ configure --values <file> [--pod NAME] [--run ID] [--conf-name cluster.conf]
                   a live pod: a real run rewrites the pod's config in place and
                   will clobber real credentials with whatever the values file
                   carries.
+
+Two kinds of images can come from Harbor. The ADDON images always come from the
+in-cluster registry (or straight from Harbor when the registry is off). The
+cubeStack OPERATOR's own images are separate, and where they come from is decided
+by `preflight --operator-images` (online by default), which this step passes
+through unchanged. On an online run the operator's images are pulled by the
+NODES, so this step also writes the run's Harbor robot credential into
+cluster.conf as CUBESTACK_OPERATOR_HARBOR_USER/PASSWORD — the operator's image
+lives in the private project suanova-private, and without it the installer warns,
+clears the pull secret, and leaves an operator that never starts. The credential
+is read from the path preflight recorded (HARBOR_RO_VALUES_FILE) and is moved the
+same way the values file is: kubectl cp, sourced in the pod, shredded on exit.
 USAGE
 }
 
@@ -212,6 +227,58 @@ else
   UPSTREAM_DNS_SRC="default"
 fi
 
+# --- operator image source --------------------------------------------------
+# Where the operator's images come from is decided ONCE, by preflight, and this
+# step neither re-decides it nor lets the values file carry it. That is narrower
+# than every other resolved value above, and deliberately so: the mode is what
+# env-probe gated the NODES on at Step 3, and env-probe reads run.env only (it
+# takes no values file — it cannot see one). A values-file override here would
+# therefore be a mode the precheck never saw, and the two would be free to
+# disagree silently: a node check that passed for a run that deployed offline, or
+# worse, none run for one that did not. One resolution, one answer.
+#
+# Absent means the run never stated a mode — a run dir from before this key
+# existed — and that resolves to offline, the installer's own default and exactly
+# what such a run would have deployed.
+#
+# INJECTED either way, including the false case. Writing nothing would defer to
+# cluster.defaults.conf's ${ONLINE_DEPLOY_CUBESTACK_OPERATOR:-false}, so a run that
+# asked for offline would silently follow a later image that flipped that default
+# — the same reasoning that pins REGISTRY_ENABLED explicitly.
+OPERATOR_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+if [ "$OPERATOR_IMAGES" = online ]; then
+  INJECT="$INJECT ONLINE_DEPLOY_CUBESTACK_OPERATOR='true'"
+else
+  INJECT="$INJECT ONLINE_DEPLOY_CUBESTACK_OPERATOR='false'"
+fi
+
+# The credential the online mode cannot run without, and the last gate before a
+# deploy that would otherwise look successful. The installer's operator module
+# does not fail on a missing credential: it warns and clears the CR's
+# imagePullSecrets, so the operator itself ImagePullBackOffs while every verdict
+# stays green. preflight refuses this combination at Step 0, so reaching here
+# means the file moved or run.env was edited — both worth stopping for.
+if [ "$OPERATOR_IMAGES" = online ]; then
+  HARBOR_RO="$(cs_run_env_get HARBOR_RO_VALUES_FILE)"
+  if [ -z "$HARBOR_RO" ]; then
+    cs_fail E_CONF_VALUES_MISSING "images=online" recover=stop-report:user \
+      hint="this run takes the operator's images from Harbor but no Harbor robot credential is recorded, and without it the installer clears the pull secret and the operator never starts; re-run preflight with --harbor-ro-values, or with --operator-images offline"
+  fi
+  # Same two-key lint preflight applies, re-applied here: a file that was fine at
+  # Step 0 can be rotated, truncated or moved into the third hour of a run.
+  #
+  # CS_VALUES_KEYS is saved and restored around it because cs_values_lint
+  # PUBLISHES the key list it just validated into that variable. This is a SECOND
+  # lint of a DIFFERENT file, so without the restore the rest of this script would
+  # go on asking "does the values file carry SERVICE_EXPOSE_MODE / GPU_OPERATOR_ENABLED"
+  # about the Harbor credential file, and every `case " $CS_VALUES_KEYS " in` test
+  # below would answer no. The dry run is what caught it: its `keys` line named
+  # HARBOR_RO_USER/HARBOR_RO_PW for a values file that carries neither.
+  _keys_save="$CS_VALUES_KEYS"
+  cs_values_lint "$HARBOR_RO" HARBOR_RO_USER HARBOR_RO_PW
+  CS_VALUES_KEYS="$_keys_save"
+fi
+
 # --- budget -----------------------------------------------------------------
 # Deliberately AFTER the validation above, for the same reason pod-up validates
 # its subnet first: a rejected input file cannot be fixed by re-invoking, so
@@ -245,8 +312,13 @@ if [ "$DRY_RUN" -eq 1 ]; then
   cs_note "  keys       ${CS_VALUES_KEYS# }"
   cs_note "  ext env    ${EXT_ENV:-none}${EXT_ENV:+ -> $CONF_DIR/$CEPH_ENV_DEST}"
   cs_note "  dns        ${UPSTREAM_DNS_EFF:-none} [$UPSTREAM_DNS_SRC]"
+  if [ "$OPERATOR_IMAGES" = online ]; then
+    cs_note "  operator   images from Harbor, pulled by the nodes (robot credential: $(basename "$HARBOR_RO"))"
+  else
+    cs_note "  operator   images from the offline tar via the in-cluster registry"
+  fi
   cs_ok "dry_run=1" "conf=$CONF_NAME" "conf_state=$CONF_STATE" "pod=$CS_POD" \
-        "ext_env=$EXT_ENV_FLAG" "dns=$UPSTREAM_DNS_SRC"
+        "ext_env=$EXT_ENV_FLAG" "dns=$UPSTREAM_DNS_SRC" "images=$OPERATOR_IMAGES"
 fi
 
 # Regenerate in place; seed from the example ONLY when absent. Re-copying the
@@ -276,12 +348,33 @@ cs_logged kubectl -n "$CS_NS" cp "$VALUES" \
   "$CS_NS/$CS_POD:$POD_VALUES" || \
   cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the values file into the pod"
 
-# Shred the pod-side values file on ANY exit path, including failure. This is a
-# cs_cleanup hook rather than a `trap ... EXIT` because installing a second EXIT
-# trap would replace the verdict trap that cs_init installed.
+# The Harbor robot credential, on the same terms, when the run takes the
+# operator's images from Harbor. It is a SECOND secret file and it is copied
+# rather than folded into the values file, because the values file is the user's
+# and this one is the run's: appending a token to it would put the robot password
+# in the copy `fetch-offline` sources as well, for no gain. Script-scoped for the
+# same reason as POD_VALUES, and pod-down shreds it too — its glob cannot reach
+# this name, so the path is listed there explicitly.
+POD_HARBOR=""
+if [ "$OPERATOR_IMAGES" = online ]; then
+  POD_HARBOR="/tmp/cubestack-harbor.$CS_SCRIPT.conf"
+  chmod 600 "$HARBOR_RO" 2>/dev/null || true
+  cs_logged kubectl -n "$CS_NS" cp "$HARBOR_RO" \
+    "$CS_NS/$CS_POD:$POD_HARBOR" || \
+  cs_fail E_POD_EXEC "pod=$CS_POD" recover="rerun:pod-up" hint="could not copy the Harbor robot credential into the pod"
+fi
+
+# Shred the pod-side credential files on ANY exit path, including failure. This
+# is a cs_cleanup hook rather than a `trap ... EXIT` because installing a second
+# EXIT trap would replace the verdict trap that cs_init installed.
 cs_cleanup() {
   [ -n "${CS_POD:-}" ] || return 0
-  kubectl -n "$CS_NS" exec "$CS_POD" -- rm -f "$POD_VALUES" >/dev/null 2>&1 || true
+  # ${POD_HARBOR:+"$POD_HARBOR"} rather than "$POD_HARBOR": an offline run has no
+  # second file, and a quoted empty string would ask rm to delete a file literally
+  # named "" — which fails, and a failing cleanup on the success path is worse
+  # than no cleanup.
+  kubectl -n "$CS_NS" exec "$CS_POD" -- rm -f "$POD_VALUES" \
+    ${POD_HARBOR:+"$POD_HARBOR"} >/dev/null 2>&1 || true
 }
 
 # --- external Ceph env file (official import path) --------------------------
@@ -318,8 +411,17 @@ fi
 
 
 # --- rewrite ----------------------------------------------------------------
+# Both secret files are sourced with `set -a`, so the rewriter reads the run's
+# credentials from the ENVIRONMENT — SSH_PW as SSH_DEFAULT_PASSWORD, and the
+# Harbor robot pair as the installer's CUBESTACK_OPERATOR_HARBOR_USER/PASSWORD.
+# Nothing secret is ever a shell literal here: an INJECT'd key is part of the
+# command line, which is exactly the surface the values file exists to avoid.
+SOURCE_CMD="set -a; . $POD_VALUES; set +a"
+if [ -n "$POD_HARBOR" ]; then
+  SOURCE_CMD="set -a; . $POD_VALUES; . $POD_HARBOR; set +a"
+fi
 out="$(cs_pod_exec "$CS_POD" bash -c "
-  set -a; . $POD_VALUES; set +a
+  $SOURCE_CMD
   $INJECT CS_EXT_CEPH_ENV=$EXT_ENV_FLAG python3 /tmp/cubestack-apply-conf.py $CONF_DIR/$CONF_NAME $POD_VALUES")"
 rc=$?
 
@@ -491,6 +593,13 @@ cs_stamp_write conf-ok "$CONF_NAME"
 
 cs_note "applied: $applied"
 cs_note "byte-gate: clean (no *** artifacts)"
+if [ "$OPERATOR_IMAGES" = online ]; then
+  cs_note "operator images: online — the nodes pull the operator's images from Harbor," \
+          "so the robot credential is in cluster.conf as CUBESTACK_OPERATOR_HARBOR_USER/PASSWORD" \
+          "(Step 3 proved each node can reach Harbor)"
+else
+  cs_note "operator images: offline — from the offline tar via the in-cluster registry"
+fi
 [ "$EXT_ENV_FLAG" = 1 ] && cs_note "external Ceph: official import path ($CEPH_ENV_DEST hash-verified, left in place for the deploy)"
 if [ "$UPSTREAM_DNS_SRC" = default ]; then
   # Scoped to "first configure" on purpose: an injection is what puts a value IN
@@ -505,4 +614,5 @@ else
 fi
 cs_ok "conf=$CONF_NAME" "pod=$CS_POD" "applied=$(printf '%s' "$applied" | tr ' ' ',')" \
       "ext_env=$EXT_ENV_FLAG" "cephfs=$CEPHFS_REQ" "registry=$REGISTRY_REQ" \
-      "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ" "dns=$UPSTREAM_DNS_SRC"
+      "metallb=$METALLB_REQ" "gpu=$GPU_REQ" "rdma=$RDMA_REQ" "dns=$UPSTREAM_DNS_SRC" \
+      "images=$OPERATOR_IMAGES"

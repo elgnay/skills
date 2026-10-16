@@ -194,6 +194,7 @@ Ask **once, in a single message**, for any of these the user cares about. Silenc
 | 10 | Model store on the nodes | off unless the user asks for it — then ask for the Provider's CephFS Linux-host mount guide path (`--cephfs-mount-guide`). Independent of #9: a run can import external Ceph without wanting `/models` on the hosts, and a guide alone does not import anything |
 | 11 | Which box | **cubestack box** — after the k8s box verifies, Step 7 installs `cubestack-operator` and applies a `CubeStackCluster` CR enabling **twelve of the catalog's thirteen components** (all but `exporters.bmc`, which needs an admin-created Secret — see Step 7), *or adopts the platform the deploy already installed if it installed one* (see Step 7). `--no-operator` builds **only a k8s box**: the run ends at `verify` |
 | 12 | Harbor read-only robot credential | **required while #11 is on** — a file with `HARBOR_RO_USER` / `HARBOR_RO_PW`, passed as `--harbor-ro-values`. Author it with `Write` **before running `preflight`**, like the two Provider files above, so `preflight` can lint it while the user is still in the room |
+| 13 | Operator image source | **`online`** — the operator and every component image come from `harbor.isuanova.com`, pulled by the **nodes**, which is what makes #12 load-bearing. Not the switch for whether a platform is installed (that is #11, and it is on); only where its images come from. `--operator-images offline` opts out and takes the installer's own default — an offline tar pushed into the box's in-cluster registry, needing neither the credential nor a node→Harbor path. **Step 3 checks** the path this needs — see *The operator's images* under the values file |
 
 Then resolve everything with one read-only call and confirm the printed plan:
 
@@ -213,6 +214,13 @@ reads that key. Omit it and `env-probe` fails `E_USAGE` with
 rather than a silent k8s-box-only install. The two flags interact in one direction only —
 passing the credential with `--no-operator` turns the step back **on**, because the file
 is the thing the step cannot run without.
+
+`--operator-images` is the third flag, and it defaults to `online` — **you pass it only to opt
+out**, and mostly only once Step 3 has said the node→Harbor path is closed. `preflight` refuses
+`--operator-images online` when no `--harbor-ro-values` is given, because online is the path that
+needs the credential for the images themselves; with no flag and `--no-operator`, the mode
+derives to `offline` on its own. The `CONFIRM` block prints which one the run resolved to, so it
+is visible before the green light rather than at the rewriter.
 
 > The requirement is `preflight`'s, and it is checked there. `operator-up` asks for the file
 > separately, and only on its **install** path — an ADOPT run (see Step 7) touches Harbor not
@@ -359,6 +367,40 @@ component, and the operator reports that as `Degraded` on the component and nowh
 If the account has **2FA enabled**, the password is the **CLI Secret** from the Harbor user
 profile, not the account's login password — a login password authenticates to the web UI and
 fails against the registry.
+
+#### The operator's images — `online` by default
+
+`ONLINE_DEPLOY_CUBESTACK_OPERATOR` picks where the operator's **images** come from. It is not the
+switch for whether a platform is installed — that is #11, and it is on — so a run of this skill
+always ends with an operator; this key only answers who serves its bytes.
+
+| | `online` — **this skill's default** | `offline` — the installer's default, and the opt-out |
+|---|---|---|
+| images | the **nodes** pull them from `harbor.isuanova.com` per the chart | the pod's offline tar is pushed into the box's own **in-cluster** registry (`registry.cubestack.io:5000`) and the nodes pull only from there |
+| `pullPolicy` | `Always` — the chart's rolling `-latest` tag can move under a live box | digest-pinned |
+| CR `spec.global` | the chart's defaults — `harbor.isuanova.com/suanova`, prefix `/mirrors`, `imagePullSecrets=[harbor-credentials]` | `imageRegistry=<in-cluster>/suanova`, `imagePullSecrets=[]` |
+| needs | #12's credential **and** a node→Harbor path | neither |
+| chart | the local tarball either way — the mode moves images, not the chart | same |
+
+**The credential is the part that fails quietly.** With no
+`CUBESTACK_OPERATOR_HARBOR_USER`/`_PASSWORD` the installer's operator module does *not* fail: it
+warns and **clears the pull secret**, so the operator itself sits `ImagePullBackOff` while the
+module reports success and the run stays green. The run closes that trap. When the mode is
+online, Step 4 renders `HARBOR_RO_USER`/`HARBOR_RO_PW` into the config under exactly those two
+installer key names, in the environment the rewriter already reads — **the same robot account,
+renamed**, not a second credential to go and obtain, and never a shell literal.
+
+**The mode is not a values-file key, deliberately.** `preflight` decides it once and records it
+in `run.env` as `OPERATOR_IMAGES`; `env-probe` and `configure` only read it. The opt-out is
+`preflight --operator-images offline`. A values file that carries the key is **refused** like any
+other key outside the allow-list — `E_CONF_VALUES_MISSING` with
+`recover="fix-values:<file>:ONLINE_DEPLOY_CUBESTACK_OPERATOR"`, whose remedy is to *remove* it,
+not to widen the list. One place decides the mode, and a step's precheck can never disagree with
+the deploy it precedes.
+
+**A mode change mid-run re-probes, and that is free.** `configure` clears the `env-ok` stamp and
+Step 3 runs again before every deploy, so re-running `preflight --operator-images offline` and
+continuing from Step 3 is enough — there is no digest to re-pin.
 
 #### The config is two layers, and "absent" does not mean "removed"
 
@@ -567,6 +609,7 @@ you reach for either:
 `cubestack4` (2026-10-16) the **default** profile — MetalLB *and* the registry on together, with
 the operator — has been measured end to end as well, so the old "measured, but not in this
 combination" caveat is gone.
+One dimension has moved since that run, and the paragraph after the table accounts for it.
 
 | evidence | covers | build |
 |---|---|---|
@@ -574,6 +617,21 @@ combination" caveat is gone.
 | `cubestack1` (2026-09-29) | the **opt-out**: `nodeport`, registry off, `--no-operator` — the addon keys, `K8S_ENABLED`, the Ceph import, a full deploy through `verify` | current |
 | `cubestack5` (2026-09-18), `cubestack9` (2026-09-24) | the metallb module and the registry behind it | superseded |
 | Step 1b, against the live host (2026-09-29, 2026-10-16) | the `IPRangeRequest` reservation | **current** |
+
+**One half of this profile is code-path-verified but run-unexercised: the online operator
+images.** `--operator-images online` became the default *after* `cubestack4`, so every run in
+the table above pulled the operator's images from the **in-cluster registry** (the installer's
+own default). What is verified about the online path is its parts, not the path: the
+node→Harbor **precondition**, measured from the box — `harbor.isuanova.com → 113.31.103.207`,
+`GET /v2/` → `401` three times, which is the registry answering correctly — the installer's
+module read at source (`25_cubestack_operator.sh`, all nine `ONLINE_DEPLOY_CUBESTACK_OPERATOR`
+sites), and the run's own half end to end: the new Step 3 check passes against a live VM
+(`harbor_nodes=ok`) and fails correctly when pointed at a host the node cannot reach, and the
+rewriter round-trip of the renamed robot credential was proven on a fixture built from the
+image's own config bytes. What no run has done is complete a **deploy and a twelve-component
+bring-up with the nodes pulling from Harbor**. Treat the first such run as the experiment it is,
+and expect Step 7 to look different from `cubestack4`'s adopt (`adopted=1 applied=0`,
+`components=9/9`) precisely because the image source moved.
 
 `cubestack4` is 1 node at 32 vCPU / 64 GiB / **200 GiB** root — the single-node default shape —
 with `SERVICE_EXPOSE_MODE='metallb'`, `REGISTRY_ENABLED='1'`, the external-Ceph import, the GPU
@@ -1192,9 +1250,20 @@ VMs, so the image pull overlaps provisioning. Step 3 is the join point.
 ```
 
 One call covers, in fixed order: pod exec, `sshpass` (installing it if missing), VM port
-22, password SSH per VM, MinIO, Harbor. Failing VMs are batched into a single verdict, and
+22, password SSH per VM, MinIO, Harbor **from the pod**, and — when the run is `online` —
+Harbor **from each node**. Failing VMs are batched into a single verdict, and
 the verdict reports `checked=<n>` so "0 of 3 probes ran" can never look like OK. On success
 it writes the `env-ok` stamp.
+
+The last of those is the one the image path depends on, and it is a separate check because the
+pod and the nodes are different hosts: `harbor=ok` on the pod proves nothing about whether the
+box being installed can reach the registry it is about to pull from. The verdict carries both —
+`harbor=ok` (pod) and `harbor_nodes=ok|skipped|unverified`. A node that cannot resolve or connect
+is `E_HARBOR_NODE_UNREACHABLE` → `stop-report:admin`, naming the VMs, which is honest: nothing
+this run can do fixes a missing route. The hint names both remedies — open the path, or re-run
+`preflight --operator-images offline` and continue from Step 3. A VM with no `curl` is a note and
+`harbor_nodes=unverified` rather than a failure, since that is a missing tool and not a missing
+route; on an `offline` run the whole check is `skipped` and charges nothing.
 
 It also **detects** (it does not check) the VMs' own upstream resolvers and records them in
 `run.env` for Step 4 to inject — the `dns=<csv>` (or `dns=none`) pair on the verdict line
@@ -1232,6 +1301,13 @@ author nor edit it.
 > one injected key that is *optional*: with neither source holding a value, `cluster.conf` keeps its
 > `127.0.0.1` sentinel and the verdict reports `dns=default`. Unlike an empty MetalLB pool that is
 > the right answer rather than a missing one — see *Upstream DNS* under the values file.
+
+> **`ONLINE_DEPLOY_CUBESTACK_OPERATOR` is written on every run, from `run.env` — never from the
+> values file.** `configure` reads Step 0's `OPERATOR_IMAGES` and renders the key as `true`/`false`
+> accordingly, which is how it reaches the module that consumes it. On an `online` run it also
+> copies the robot credential into the pod and sources it alongside the values file, purely to give
+> the rewriter the two `CUBESTACK_OPERATOR_HARBOR_USER`/`_PASSWORD` keys; the pod-side copy is
+> shredded on every exit path, the same as the values file. The verdict reports `images=online|offline`.
 
 When Step 0 was given `--external-ceph-env`, `configure` also places that file — it reads the
 path from the run dir, so **you do not pass it again** — and hash-verifies the copy. It is left
@@ -1374,8 +1450,11 @@ only host that can reach it.
 > **`operator-up` ADOPTS a platform the deploy already installed.** The installer now has its
 > own `cubestack_operator` module, which installs this same chart under this same release name
 > with the chart's optional `clusterCR` path **enabled** — so its release manifest carries a
-> `CubeStackCluster` of its own, pinned to the chart's defaults *minus two* (`deletePolicy:
-> uninstall`, images from the in-cluster registry). The two it drops are `exporters.bmc` — the
+> `CubeStackCluster` of its own, pinned to the chart's defaults *minus two* overrides
+> (`deletePolicy: uninstall`, and an image-registry override that follows
+> `ONLINE_DEPLOY_CUBESTACK_OPERATOR` — the in-cluster registry when offline, the chart's own
+> `harbor.isuanova.com` defaults when online, which is this run's default). The two components it
+> drops are `exporters.bmc` — the
 > same admin-Secret reason this skill drops it — and `modelBundles` + `spec.bundles`, which it
 > clears on the grounds that model bundles are inference profiles rather than platform
 > services. On such a box an unconditional
@@ -1546,21 +1625,26 @@ What the pair does, in order, and why the order is not negotiable:
   means the stamp predates the roll and the binary may predate the fix, and a mismatch between the
   two means the operator has since been replaced.
 
-> **Unverified, and the first thing to check if a component cannot pull: whether the deployed
-> *nodes* can reach Harbor at all.** The installer's own design has the opposite shape — the pod
-> pulls an image, the module pushes it into the **in-cluster** registry
+> **Whether the deployed *nodes* can reach Harbor is checked before the deploy, not discovered
+> after it.** The installer's own default shape is the opposite of online mode — the pod pulls to
+> an offline tar, the module pushes it into the **in-cluster** registry
 > (`registry.cubestack.io:5000`), and the nodes pull from there, so that "集群永远不需要访问公网"
-> (`docs/harbor-mirror.md` §2). Every run so far follows it: `verify` lists a `registry` Service,
-> and the addon modules push to it themselves (`skopeo copy docker-archive:… → docker://…`,
-> `07_gpu_lws.sh` step 1). This CR is the first thing that asks a **node** for
-> `harbor.isuanova.com` directly — and `env-probe` only proves Harbor **from the pod**
-> (`env-probe:268`, both the DNS and the TCP probe). If a node has no route, the symptom is
-> `E_OPERATOR_IMAGE_PULL` with an `ImagePullBackOff` message that reads exactly like a bad
-> credential. **Tell the two apart before re-`Write`ing anything**: SSH to the run's VM
-> (`ubuntu@<vm-ip>`, the run's SSH_PW) and
+> (`docs/harbor-mirror.md` §2). Under `--operator-images offline` this CR asks a node for nothing.
+> Under the **default**, `online`, this CR is the first thing in the run to ask a **node** for
+> `harbor.isuanova.com` directly, and that is why Step 3 grew a node-side check: the pod and the
+> nodes are different hosts, and the pod-side `harbor=ok` says nothing about the box being
+> installed. Step 3 now reports `harbor_nodes=ok|skipped|unverified` alongside it, and fails
+> `E_HARBOR_NODE_UNREACHABLE` → `stop-report:admin` — naming the VMs — rather than letting the
+> run reach a two-minute deploy and a twenty-minute wait before the operator `ImagePullBackOff`s.
+>
+> **If you are looking at that failure anyway** (an older run dir, or a route that changed under a
+> live box), the symptom is `E_OPERATOR_IMAGE_PULL` with an `ImagePullBackOff` message that reads
+> exactly like a bad credential — and the two have different fixes. Tell them apart **before**
+> re-`Write`ing anything: SSH to the run's VM (`ubuntu@<vm-ip>`, the run's SSH_PW) and
 > `curl -sS -o /dev/null -w '%{http_code}\n' https://harbor.isuanova.com/v2/` — *any* status,
 > `401` included, means the node reaches Harbor and the credential is the real problem; a
-> resolution or connect failure means it does not, and no new password will fix it.
+> resolution or connect failure means it does not, and no new password will fix it (re-run
+> `preflight --operator-images offline` instead).
 
 > Add `--dry-run` to `operator-up` to lint the credential, assert the CR manifest and print the
 > resolved plan **without** a pod or a cluster. It is local and read-only, so it never spends a
@@ -1673,3 +1757,9 @@ longer binds to this box.
     deliberate and safe *only* because every address in it is already ledger-bound to this box.
     Widening the pool, pinning a Service, or replacing the pool all restore the collision this
     design removes. `reserve-vips --release` is the only supported way to give an address back.
+12. **Never hand-edit `ONLINE_DEPLOY_CUBESTACK_OPERATOR` in `cluster.conf`, and never hand-write
+    the operator's pull Secret.** The mode is decided at Step 0 and written by `configure` on every
+    run; the credential is a rename of the file you already supplied, moved by `kubectl cp` and
+    shredded on exit. Patching either one by hand produces a box whose image source nothing in the
+    run dir records — and the failure it papers over is the node→Harbor path, which a config edit
+    cannot fix. Re-run `preflight --operator-images offline` instead.
