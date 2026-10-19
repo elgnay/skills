@@ -398,9 +398,10 @@ other key outside the allow-list — `E_CONF_VALUES_MISSING` with
 not to widen the list. One place decides the mode, and a step's precheck can never disagree with
 the deploy it precedes.
 
-**A mode change mid-run re-probes, and that is free.** `configure` clears the `env-ok` stamp and
-Step 3 runs again before every deploy, so re-running `preflight --operator-images offline` and
-continuing from Step 3 is enough — there is no digest to re-pin.
+**A mode change mid-run re-probes.** `env-probe` records the mode in the `env-ok` stamp (that is
+what decides whether the node→Harbor check ran), and `deploy` refuses a stamp that attests a
+different mode. So re-running `preflight --operator-images offline` and continuing from Step 3 is
+the whole procedure — `configure` does not need to invalidate anything, and no digest is re-pinned.
 
 #### The config is two layers, and "absent" does not mean "removed"
 
@@ -1255,6 +1256,12 @@ Harbor **from each node**. Failing VMs are batched into a single verdict, and
 the verdict reports `checked=<n>` so "0 of 3 probes ran" can never look like OK. On success
 it writes the `env-ok` stamp.
 
+> **Pass the same password the values file carries for `SSH_PW`.** The stamp attests the
+> password SSH the deploy will use, and `configure` now keeps it rather than clearing it. If
+> you edit `SSH_PW` after this step, re-run `env-probe`; if you flip
+> `--operator-images`, re-run it too (the stamp records the mode and `deploy` refuses a
+> mismatched one).
+
 The last of those is the one the image path depends on, and it is a separate check because the
 pod and the nodes are different hosts: `harbor=ok` on the pod proves nothing about whether the
 box being installed can reach the registry it is about to pull from. The verdict carries both —
@@ -1318,13 +1325,14 @@ in place deliberately: the installer sources it mid-deploy. `pod-down` removes i
 > without mutating it, add `--dry-run`: it validates and prints the resolved plan, then
 > stops before any write. A dry run is read-only and never spends a retry; the real one does.
 
-> **`configure` invalidates `env-ok`, so `env-probe` must run a second time before Step 6.**
-> The stamp attests the SSH password and VM digest the deploy will actually use, and a
-> config change can invalidate the password env-probe already proved — so `configure` clears
-> it on purpose. `deploy` refuses to launch without a current stamp
-> (`E_DEPLOY_PRECOND_ENV`), so the real order is **Step 3 → 4 → 3 again → 6**. The second
-> `env-probe` is expected, not a recovery: re-issue the identical command. Budget for it —
-> a healthy run invokes `env-probe` twice.
+> **`configure` keeps the `env-ok` stamp; there is no second `env-probe`.** It used to clear
+> the stamp "because a config change can invalidate the SSH password", which made the first
+> `deploy` of every fresh run fail `E_DEPLOY_PRECOND_ENV` and forced Step 3 to run twice (its
+> retry budget had been raised to 4 to tolerate that). The stamp attests password SSH for this
+> VM set, and `configure` changes nothing about that: it writes the `SSH_PW` the values file
+> already carried. The one way to invalidate it is editing `SSH_PW` **after** Step 3; run
+> Step 3 with the password the values file carries, and re-run `env-probe` if you change it
+> later.
 
 Steps 4 and 5 are independent — issue them as parallel tool calls. Each copies its values
 file to its own pod-side temp path (`/tmp/cubestack-values.<script>.conf`), so neither
@@ -1344,9 +1352,11 @@ returns `skipped=1`. A partial tree is `E_FETCH_PARTIAL`, never silently accepte
 
 **The floor is the operative number, not any GiB figure in this document.** `deploy` refuses to
 launch below **15360 MiB** (`CS_FETCH_FLOOR_MB`); the fetch script carries its own `--floor`
-(15000 MiB). The ~26 GiB this document used to quote was measured on a build whose tree still
-contained the envoy and observability image groups, which no longer exist — so treat it as an
-upper bound, not a target, and check the actual size with
+(15000 MiB). The size this document quoted before (22–26 GiB) was stale by more than 5×: on
+2026-10-19 the fetch landed **157,532 MiB (~154 GiB)** in about 9 minutes. The helper's "default"
+is every bucket subdirectory except `virtual-machine` — that includes the `model-collection` and
+`dev-lab` groups, and `dev-lab` is enabled by default, so it is not optional here. Budget the
+disk and the time; check the actual size with
 `kubectl exec <pod> -- du -sh deployments/offline-files` rather than comparing against a number
 here.
 
@@ -1361,7 +1371,8 @@ The per-component layout is worth knowing when one addon is missing rather than 
 `rdma/`, and `kubespray/images/` for the base **and** the Ceph images (those two share a
 directory deliberately: both are preloaded into the nodes' containerd) — so
 `ls offline-files/multus/` answers directly whether the Multus images are present.
-`fetch-offline-from-minio.sh` defaults to the deployment-necessary subset.
+`fetch-offline-from-minio.sh` defaults to "everything except `virtual-machine`", not to a curated
+deployment-only subset — see the size note above.
 
 ## Step 6 — Deploy
 
@@ -1374,6 +1385,12 @@ cheap preconditions first (no `***` in `cluster.conf`, offline files above the f
 `sshpass` present, `env-ok` current), turning a 12-minute `local_path` death into a
 1-second failure. It refuses to launch if a deploy is already running
 (`E_DEPLOY_ALREADY_RUNNING` → `recover="rerun:deploy-wait"`).
+
+> **`kubectl exec` does not return while the detached deploy lives** — measured 2026-10-19,
+> even with `setsid` + `nohup` + full redirection. The script therefore waits only for the
+> pod's `launched pid` line, then releases the local exec client (which does not touch the
+> deploy process). If a launcher ever reports `E_INTERRUPTED`, the deploy is still running:
+> re-invoke `deploy-wait`, **not** `deploy` (which would answer `E_DEPLOY_ALREADY_RUNNING`).
 
 Then wait for it **as a background task**:
 
@@ -1420,7 +1437,12 @@ replaced after the fact.
 **When the run enabled the device addons it asserts those too** — `gpu=` / `rdma=` in the verdict,
 where `rdma=placeholder` means the RDMA plugin came up without registering anything. The rules are
 under *The device addons* above; the short version is that a missing GPU is reported, an unhealthy
-`metax-driver` pod fails, and placeholder RDMA is reported rather than failed.
+`metax-driver` pod fails, and placeholder RDMA is reported rather than failed. `gpu=` is now
+emitted **even when it is 0**: on a run that requested a GPU, `gpu=0` is the silent CPU fast path,
+not a pass worth ignoring. When the operator's driver pods are present but the node has not yet
+advertised the resource, `verify` waits up to ~2 minutes (reported as `gpu_wait=`), because the
+device plugin registers a few seconds after its DaemonSet pod starts and the deploy can finish
+first (measured on `cubestack5`, 2026-10-19: 41 s).
 
 **Only if Step 0 was given `--cephfs-mount-guide`** — mount `/models` on every node, *here*,
 after the k8s box is proven and before the pod goes away:

@@ -587,8 +587,13 @@ RDMA_REQ="$(device_req RDMA_ENABLED)"
 cs_run_env_set "GPU_OPERATOR_REQUESTED=$(cs_q "$GPU_REQ")"
 cs_run_env_set "RDMA_REQUESTED=$(cs_q "$RDMA_REQ")"
 
-# A config change can invalidate the SSH password env-probe already proved.
-cs_stamp_clear env-ok
+# env-ok is deliberately KEPT here. It attests that password SSH worked for
+# this VM set, and configure does not change that: it writes the SSH_PW the
+# run's values file already carried at Step 3. Clearing it (as this used to)
+# made the FIRST deploy of every fresh run fail E_DEPLOY_PRECOND_ENV — nothing
+# re-wrote the stamp until the operator re-ran env-probe by hand. The only way
+# to invalidate it is editing SSH_PW *after* Step 3, and that is a Step 3
+# mistake: env-probe must be run with the password the values file carries.
 cs_stamp_write conf-ok "$CONF_NAME"
 
 cs_note "applied: $applied"

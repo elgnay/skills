@@ -137,9 +137,20 @@ if [ "$SSHPASS" != "1" ]; then
   cs_fail E_DEPLOY_PRECOND_SSHPASS "pod=$CS_POD" recover=rerun:env-probe \
     hint="sshpass is missing in the pod; kubespray needs it for the initial password SSH to the VMs"
 fi
-if [ -z "$(cs_stamp_read env-ok)" ]; then
+ENV_STAMP="$(cs_stamp_read env-ok)"
+if [ -z "$ENV_STAMP" ]; then
   cs_fail E_DEPLOY_PRECOND_ENV "pod=$CS_POD" recover=rerun:env-probe \
     hint="no env-ok stamp in the run dir; the environment probe has not passed for this run"
+fi
+# The stamp records the operator image mode env-probe ran under, because that is
+# what decides whether the node->Harbor check happened. A mode flipped by
+# re-running preflight mid-run makes the stamp stale even though it exists.
+WANT_IMAGES="$(cs_run_env_get OPERATOR_IMAGES)"
+STAMP_IMAGES="$(printf '%s\n' "$ENV_STAMP" | sed -n 's/.*operator_images=\([a-z]*\).*/\1/p')"
+if [ -n "$WANT_IMAGES" ] && [ -n "$STAMP_IMAGES" ] && [ "$STAMP_IMAGES" != "$WANT_IMAGES" ]; then
+  cs_fail E_DEPLOY_PRECOND_ENV "pod=$CS_POD" "stamp_images=$STAMP_IMAGES" "want_images=$WANT_IMAGES" \
+    recover=rerun:env-probe \
+    hint="env-probe passed under operator_images=$STAMP_IMAGES, but this run is now $WANT_IMAGES; re-run it so the node-side Harbor check matches the path the deploy takes"
 fi
 
 # The Provider's env file is sourced by the Ceph module ~12 minutes in. It lives
@@ -206,14 +217,39 @@ LAUNCH_CMD="./deployments/scripts/deploy-cluster.sh"
 # path in its argv, so pid= is the deploy's pid and not the launcher's.
 LAUNCH_SCRIPT='cd /opt/cubestack-installer && setsid nohup '"$LAUNCH_CMD"' > '"$CS_DEPLOY_LOG"' 2>&1 < /dev/null & disown; sleep 1; pid=$(pgrep -f "[d]eploy-cluster.sh" | grep -v -x "$$" | head -1); if [ -n "$pid" ]; then echo "launched pid $pid"; else echo "LAUNCH FAILED"; fi'
 
-# Through a file + cs_wait_cmd rather than `$( )`: this exec is the one place a
-# broken detach shows up as a hang, and a foreground child would defer the EXIT
-# trap (and therefore the verdict) for as long as it hangs. The redirect is on
-# the backgrounded child, not on the cs_wait_cmd call, so a signal during the
-# exec still writes its verdict to stderr instead of into the capture file.
+# Through a file, and WITHOUT waiting for the exec to return. Measured on
+# 2026-10-19: `kubectl exec` does not return while the detached deploy lives —
+# setsid + nohup + full redirection still leave the exec stream attached to the
+# process tree. So "wait for the exec" means "wait for the whole deploy": the
+# Bash tool's ceiling then kills the launcher and writes E_INTERRUPTED while the
+# deploy keeps running on the node side (that is exactly what happened on
+# cubestack5). The `launched pid` line is the confirmation that matters; once
+# it is on disk, release the local client. Killing the client does not touch
+# the pod-side process — it has its own session and its own log.
 LAUNCH_OUT_FILE="$(cs_run_dir)/deploy.launch.out"
-launch_capture() { "$@" > "$LAUNCH_OUT_FILE" 2>&1; }
-cs_wait_cmd launch_capture cs_pod_exec "$CS_POD" bash -c "$LAUNCH_SCRIPT"
+: > "$LAUNCH_OUT_FILE"
+kubectl -n "$CS_NS" exec "$CS_POD" -- bash -c "$LAUNCH_SCRIPT" > "$LAUNCH_OUT_FILE" 2>&1 &
+LAUNCH_PID=$!
+LAUNCH_WAIT="${CS_LAUNCH_WAIT:-30}"
+_launch_i=0
+PID=""
+while [ "$_launch_i" -lt "$LAUNCH_WAIT" ]; do
+  PID="$(sed -n 's/^launched pid \([0-9][0-9]*\).*/\1/p' "$LAUNCH_OUT_FILE" 2>/dev/null | tail -1)"
+  [ -n "$PID" ] && break
+  kill -0 "$LAUNCH_PID" 2>/dev/null || break
+  sleep 1
+  _launch_i=$((_launch_i + 1))
+done
+if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+  kill "$LAUNCH_PID" 2>/dev/null || true
+  sleep 1
+  kill -9 "$LAUNCH_PID" 2>/dev/null || true
+  # disown before reaping: without it bash prints "Terminated: 15" to stderr,
+  # which would sit above the verdict line for no reason.
+  disown "$LAUNCH_PID" 2>/dev/null || true
+  [ -n "$PID" ] && cs_note "launch exec stayed attached to the detached deploy; released the local client (the deploy keeps running)"
+fi
+wait "$LAUNCH_PID" 2>/dev/null || true
 LAUNCH_OUT="$(cat "$LAUNCH_OUT_FILE" 2>/dev/null)"
 PID="$(printf '%s\n' "$LAUNCH_OUT" | sed -n 's/^launched pid \([0-9][0-9]*\).*/\1/p' | tail -1)"
 

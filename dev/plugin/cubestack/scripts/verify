@@ -380,7 +380,36 @@ if [ "$GPU_REQ" = "1" ]; then
     cs_fail E_VERIFY_GPU "gpu=$GPU_TOTAL" "unhealthy=$GPU_BAD" recover=rerun:verify \
       hint="MetaX driver pods exist but are not Running/Ready, so the node registers no metax-tech.com/gpu; the driver ships prebuilt modules per kernel under kernel_module/<uname -r>/, so the guest's kernel is the usual cause - rebuild the VM on a golden image whose kernel it carries, then re-run verify"
   fi
-  [ "$GPU_TOTAL" -gt 0 ] && GPU_REPORT="$GPU_TOTAL"
+
+  # The device plugin registers metax-tech.com/gpu a few seconds after its
+  # DaemonSet pod starts, and `deploy` returns when kubespray finishes — not
+  # when the operator has finished settling. Measured on cubestack5
+  # (2026-10-19): verify ran 41 s before metax-gpu-device came up and reported
+  # no GPU for a node that was about to advertise one. So wait, bounded, and
+  # only when the operator's pods are actually present and the driver is
+  # healthy: a box with no GPU and no metax pods does not wait at all, and a
+  # healthy driver whose plugin never registers still reports its real answer
+  # after the budget.
+  GPU_WAIT=0
+  if [ "$GPU_TOTAL" -eq 0 ] \
+     && kget get pods -A --no-headers 2>/dev/null | awk '$2 ~ /^metax-(driver|gpu-device)-/ {f=1} END {exit !f}'; then
+    GPU_WAIT_MAX="${CS_VERIFY_GPU_WAIT:-120}"
+    while [ "$GPU_WAIT" -lt "$GPU_WAIT_MAX" ]; do
+      sleep 5
+      GPU_WAIT=$((GPU_WAIT + 5))
+      GPU_TOTAL="$(node_resource_total 'metax-tech\.com/gpu')"
+      [ "$GPU_TOTAL" -gt 0 ] && break
+    done
+    if [ "$GPU_TOTAL" -gt 0 ]; then
+      cs_note "GPU registered after ${GPU_WAIT}s (metax-gpu-device was still settling)"
+    else
+      cs_note "waited ${GPU_WAIT}s and no node advertises metax-tech.com/gpu; reporting gpu=0 (not a failure, but on a run that requested a GPU this is the silent CPU fast path - check the driver pod's kernel)"
+    fi
+  fi
+  # Report the count even when it is zero. The verdict used to omit the field
+  # on zero, which made "this box has no GPUs" indistinguishable from "this
+  # run never checked" - and on a GPU-requested run it hid the fast path.
+  GPU_REPORT="$GPU_TOTAL"
 fi
 
 RDMA_REPORT=""
@@ -534,11 +563,13 @@ set -- "nodes=$NODE_TOTAL" "namespaces=$NS_COUNT" "services=$SERVICES_REPORT"
 # default, so emitting `metallb=on` would churn the verdict string for the
 # ordinary case and invalidate the verbatim verdicts recorded in the skill doc.
 [ "$METALLB_REQ" != "1" ] && set -- "$@" "metallb=off"
-# The two device addons, and by the same non-default-only rule: a box that runs
-# neither, or whose GPU count is zero because it has no GPUs, keeps the verdict
-# string it had. What is new is that a placeholder RDMA pool is now visible at
-# all - `rdma=placeholder` is the one token a green run could never show before.
+# The two device addons. `gpu=` is now reported even when it is zero: a
+# GPU-requested run that comes up with no GPU resource is exactly the silent
+# CPU fast path, and omitting the field made it indistinguishable from "this
+# run never checked". `rdma=placeholder` is the other token a green run could
+# never show before.
 [ -n "$GPU_REPORT" ] && set -- "$@" "gpu=$GPU_REPORT"
+[ "${GPU_WAIT:-0}" -gt 0 ] && set -- "$@" "gpu_wait=${GPU_WAIT}s"
 [ -n "$RDMA_REPORT" ] && set -- "$@" "rdma=$RDMA_REPORT"
 # The reserved block, only when this run has one — so the verdict records the
 # reservation the assertions above checked, and a reader can see which block the

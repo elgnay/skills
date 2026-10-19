@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fetch-offline — seed minio.conf, then pull ~22 GiB of offline packages.
+# fetch-offline — seed minio.conf, then pull the offline tree.
 #
 # Two things this owns that used to be prose (and both cost real minutes when
 # the model got them wrong):
@@ -11,6 +11,14 @@
 #   2. minio.conf holds the MinIO secret, so it takes the same redaction hazard
 #      as cluster.conf. It is written in the pod from the example via a repo
 #      helper, never with sed/echo/heredoc, and byte-gated afterwards.
+#
+# Size, measured not guessed: the helper's "default" is every bucket subdirectory
+# except `virtual-machine`, which on 2026-10-19 came to 157,532 MiB (~154 GiB,
+# about 9 minutes on the dev network). That includes the model-collection and
+# dev-lab tar groups — dev-lab is enabled by default in cluster.conf, so it is
+# not optional, and the helper offers no "only these groups" selector. Budget
+# the disk and the time; the floor below is a completeness gate, not a size
+# estimate.
 #
 # Idempotent and resumable: `du` on offline-files/ is the only evidence a prior
 # fetch completed, so a re-run that already has the bytes skips the download
@@ -125,7 +133,7 @@ if [ "$before" -ge "$FLOOR_MIB" ]; then
 fi
 
 # --- fetch ------------------------------------------------------------------
-cs_note "fetching offline packages (${before} MiB present) — this takes a few minutes"
+cs_note "fetching offline packages (${before} MiB present) — ~154 GiB / ~9 min on the dev network"
 fetch_out="$(cs_pod_exec "$CS_POD" bash -c \
   "cd $REPO && ./deployments/scripts/tools/offline/fetch-offline-from-minio.sh --yes 2>&1")"
 rc=$?

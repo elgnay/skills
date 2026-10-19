@@ -128,9 +128,12 @@ Three things in run 3 worth reading rather than skimming:
   import is the reason: the Rook operator, the CSI drivers, the `CephConnection` /
   `ClientProfile` and the seven StorageClasses are all real work that scales with the
   *import*, not with the node count. A single-node cluster is not a cheaper Ceph consumer.
-- **S3 runs twice.** `configure` deliberately invalidates the `env-ok` stamp (a config change
-  can move the SSH password the stamp attests), so the probe is re-run before the deploy.
-  9 s here is the two probes together.
+- **S3 ran twice.** At the time of this measurement `configure` deliberately invalidated the
+  `env-ok` stamp (a config change can move the SSH password the stamp attests), so the probe
+  was re-run before the deploy; 9 s here is the two probes together. *(Fixed 2026-10-19: that
+  clear made the first deploy of every fresh run fail `E_DEPLOY_PRECOND_ENV`; `configure` now
+  keeps the stamp and the probe runs once. The measurement above is the record of the old
+  behaviour.)*
 - **S7 + S8 are lopsided against runs 1–2** because they were a single hand-run call there.
   `verify` spends a 30 s node-settling re-pass — kubelet is routinely not `Ready` in the
   seconds after the deploy exits, and failing on that would be a false negative.
@@ -449,7 +452,8 @@ network is fine.
 
 - **kubectl** and a kubeconfig that can reach the SUANOVA KubeVirt cluster
 - The CubeStack installer image reachable from the cluster (`harbor.isuanova.com/cubestack/cubestack-installer-cli:latest`)
-- Access to the internal **MinIO** endpoint holding the offline packages (tens of GiB)
+- Access to the internal **MinIO** endpoint holding the offline packages (~154 GiB measured
+  2026-10-19, including the model-collection and dev-lab groups)
 - **Cubestack box only (on by default):** a **Harbor robot account with pull scope** — it pulls the operator chart from `suanova-private`, which is private and the one project that strictly needs the credential (`suanova` and `mirrors` answer anonymously), and it is passed on to the operator so that the deployed **nodes** can pull the component images from Harbor too, which is this skill's default (`--operator-images offline` opts out). If the account has 2FA, use the **CLI Secret** from the Harbor user profile, not the login password. Put the username and token in a `Write`-authored file and pass it as `--harbor-ro-values`; `--no-operator` skips both the account and the step.
 - **Multi-node only:** the alpha `VMPool` feature gate enabled — otherwise pool creation is rejected. This is cluster-admin scope and the skill stops and reports rather than falling back to N separate VMs.
 - Claude Code (the host for this skill)

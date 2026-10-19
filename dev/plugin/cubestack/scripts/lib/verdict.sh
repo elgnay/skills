@@ -256,14 +256,12 @@ cs_attempt_limit() {
     # has a caller that re-invokes it, the same way deploy and env-probe do.
     # 3 = the one the flow needs plus the recovery its own caller prescribes.
     verify)      echo 3 ;;
-    # env-probe is invoked TWICE by a healthy run, not once: Step 3 proves the
-    # environment, then `configure` clears the env-ok stamp ("a config change can
-    # invalidate the SSH password env-probe already proved") and deploy refuses to
-    # launch without it, so the probe must run again. At a ceiling of 2 that
-    # leaves no slack at all, and the second mandatory invocation is the run's
-    # last — one transient failure anywhere turns a healthy run into
-    # E_RETRY_BUDGET with a stale-but-destroyed stamp. 4 = the two the flow
-    # requires, plus the rerun:env-probe its own E_SSHPASS_INSTALL recovery needs.
+    # env-probe is invoked ONCE by a healthy run since 2026-10-19: `configure`
+    # used to clear the env-ok stamp, which forced a mandatory second probe and
+    # pushed this budget to 4. The clear is gone, but the budget stays at 4 -
+    # env-probe is side-effect-free, its E_SSHPASS_INSTALL recovery is
+    # `rerun:env-probe`, and a sibling-vm rebuild sends the run back here too.
+    # 4 = the one the flow needs plus three, and it still bounds a loop.
     env-probe)   echo 4 ;;
     # mount-models is invoked once by a healthy run, but its failure mode is a
     # flaky ssh or a transient mon timeout rather than a deterministic input

@@ -559,7 +559,12 @@ digest_of() {
 PW_PRESENCE="absent"
 [ -n "$SSH_PW" ] && PW_PRESENCE="present"
 VMSET_DIGEST="$(digest_of "$VMS|$SSH_USER|$PW_PRESENCE")"
-cs_stamp_write env-ok "vms_digest=$VMSET_DIGEST user=$SSH_USER password=$PW_PRESENCE vms=$VM_COUNT sshpass=$SSHPASS_STATE"
+# The operator image mode decides whether the node->Harbor check ran at all, so
+# record it: `deploy` refuses a stamp that attests a different mode. Without
+# this, switching `--operator-images` mid-run would silently carry a probe that
+# never tested the path the deploy is about to take.
+OPERATOR_IMAGES_STAMP="$(cs_run_env_get OPERATOR_IMAGES)"
+cs_stamp_write env-ok "vms_digest=$VMSET_DIGEST user=$SSH_USER password=$PW_PRESENCE vms=$VM_COUNT sshpass=$SSHPASS_STATE operator_images=${OPERATOR_IMAGES_STAMP:-unrecorded}"
 
 cs_ok "checked=$CHECKED" "sshpass=$SSHPASS_STATE" "vms=$VM_COUNT" "minio=ok" "harbor=ok" \
   "dns=${DNS_VERDICT:-none}" "harbor_nodes=$HARBOR_NODES"
